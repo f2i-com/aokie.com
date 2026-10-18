@@ -183,7 +183,11 @@ impl GatewaySession {
                 // radio reports actual negotiated/observed evidence.
                 carrier_hold_evidence: CarrierHoldEvidence::Unknown,
                 secondary_call_observation: SecondaryCallObservation::Unknown,
-                voice_consult: remote.consent.consult_enabled,
+                // A private consult has Aokie speak the question to the
+                // Companion user and transcribe the answer: speech Aokie no
+                // longer has (OAIY Voice hears and speaks for calls). It is
+                // never offered, whatever consent says.
+                voice_consult: PRIVATE_CONSULT_AVAILABLE && remote.consent.consult_enabled,
                 takeover: remote.consent.takeover_enabled,
             },
             secondary_call_policy: SecondaryCallPolicy::Normal,
@@ -468,7 +472,11 @@ impl GatewaySession {
                     && remote.consent.acknowledged
                     && match mode {
                         LeaseMode::Monitor => remote.consent.monitor_enabled,
-                        LeaseMode::Consult => remote.consent.consult_enabled && consult_available,
+                        LeaseMode::Consult => {
+                            PRIVATE_CONSULT_AVAILABLE
+                                && remote.consent.consult_enabled
+                                && consult_available
+                        }
                         LeaseMode::Takeover => remote.consent.takeover_enabled,
                     };
                 if !permitted {

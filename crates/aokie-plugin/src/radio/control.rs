@@ -88,24 +88,17 @@ pub enum RadioControl {
         call_id: String,
         op: Option<String>,
     },
-    /// Live-reconfigure the in-plugin voice agent without a reconnect. Each
-    /// field is `Some` only when it changed; `None` leaves the current value
-    /// alone. A flow (or `settings.set`) pushes this so the receptionist's
-    /// persona/greeting/voice/model can be edited from FormLogic and take
-    /// effect on the very next caller turn (or the next call's greeting).
+    /// Live-reconfigure the receptionist without a reconnect. Each field is
+    /// `Some` only when it changed; `None` leaves the current value alone. A
+    /// flow (or `settings.set`) pushes this so the persona and greeting (the
+    /// brief and first line a call to OAIY carries) can be edited from
+    /// FormLogic and take effect on the next call; the model and endpoint
+    /// are the older in-plugin agent's.
     Configure {
         persona: Option<String>,
         greeting: Option<String>,
-        voice: Option<String>,
         model: Option<String>,
         endpoint: EndpointUpdate,
-        stt_endpoint: EndpointUpdate,
-        tts_endpoint: EndpointUpdate,
-        /// The `ttsEngine`/`ttsModelDir` selection changed: the connector
-        /// re-stamped AOKIE_TTS_ENGINE / AOKIE_TTS_MODEL_DIR before sending
-        /// this, so the radio just tells the synth worker to reload its
-        /// in-process engine from the new env.
-        reload_tts_engine: bool,
     },
     /// §9.3 call-scoped agent config (`call.configureAgent`): persona /
     /// greeting for ONE named call, wiped at the call boundary. The

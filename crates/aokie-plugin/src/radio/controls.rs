@@ -26,7 +26,6 @@ pub(super) fn service_controls(
     pending_controls: &mut std::collections::VecDeque<RadioControl>,
     idle: &mut bool,
     #[cfg(feature = "voice")] synth: &crate::synth::SynthHandle,
-    #[cfg(feature = "voice")] stt_tx: &std::sync::mpsc::Sender<SttWork>,
     #[cfg(feature = "voice")] stt_buf: &mut Vec<f32>,
     #[cfg(feature = "voice")] stt_had_speech: &mut bool,
     #[cfg(feature = "voice")] stt_silence: &mut std::time::Duration,
@@ -820,16 +819,12 @@ pub(super) fn service_controls(
             Ok(RadioControl::Configure {
                 persona,
                 greeting: g,
-                voice,
                 model,
                 endpoint,
-                stt_endpoint,
-                tts_endpoint,
-                reload_tts_engine,
             }) => {
                 // Live-reconfigure the agent from a flow / settings.set push. Each
                 // field is Some only when it changed. Greeting applies to the NEXT
-                // call; persona/voice/model take effect on the next caller turn.
+                // call; persona/model take effect on the next caller turn.
                 #[cfg(feature = "voice")]
                 {
                     // The Desktop's two reserved ChatGPT/Codex adapters
@@ -873,9 +868,6 @@ pub(super) fn service_controls(
                             *agent_persona = p;
                         }
                     }
-                    if let Some(v) = voice {
-                        std::env::set_var("AOKIE_TTS_VOICE", v.trim());
-                    }
                     let mut client_stale = false;
                     if let Some(m) = model {
                         let m = m.trim().to_string();
@@ -901,42 +893,11 @@ pub(super) fn service_controls(
                         // Force a reconnect with the new endpoint/model next turn.
                         *agent_client = None;
                     }
-                    match stt_endpoint {
-                        EndpointUpdate::Unchanged => {}
-                        EndpointUpdate::Clear => {
-                            let _ = stt_tx.send(SttWork::Configure { endpoint: None });
-                        }
-                        EndpointUpdate::Set(e) => {
-                            let _ = stt_tx.send(SttWork::Configure {
-                                endpoint: normalize_endpoint(Some(e)),
-                            });
-                        }
-                    }
-                    match tts_endpoint {
-                        EndpointUpdate::Unchanged => {}
-                        EndpointUpdate::Clear => synth.configure(None),
-                        EndpointUpdate::Set(e) => synth.configure(normalize_endpoint(Some(e))),
-                    }
-                    if reload_tts_engine {
-                        // Env already re-stamped by the connector; the
-                        // worker reloads eagerly so a bad ttsModelDir
-                        // shows up in the log now, not on the next call.
-                        synth.reload_engine();
-                    }
-                    eprintln!("[aokie-plugin] agent reconfigured (persona/greeting/voice/model/endpoints)");
+                    eprintln!("[aokie-plugin] agent reconfigured (persona/greeting/model/endpoint)");
                 }
                 #[cfg(not(feature = "voice"))]
                 {
-                    let _ = (
-                        persona,
-                        g,
-                        voice,
-                        model,
-                        endpoint,
-                        stt_endpoint,
-                        tts_endpoint,
-                        reload_tts_engine,
-                    );
+                    let _ = (persona, g, model, endpoint);
                 }
             }
             Ok(RadioControl::StartPairing { seconds }) => {

@@ -218,7 +218,7 @@
     "externalInventory": [
       {
         "path": "%APPDATA%/com.aokie.app",
-        "label": "Aokie radio data (phone pairing keys, models, call database, logs)"
+        "label": "Aokie radio data (phone pairing keys, call database, logs, and any speech models an older Aokie downloaded)"
       },
       {
         "credential": "Aokie/*",

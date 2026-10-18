@@ -36,11 +36,11 @@ phone keeps its number: there is nothing to port and no SIP.
 - **Hands the conversation to OAIY.** On the OAIY route the call's audio streams to
   OAIY's voice gateway: OAIY Voice hears and speaks, and OAIY's Front desk agent
   answers from your business notes. Aokie's own lines (a screened caller's message,
-  hold announcements) are said in the same voice.
-- **Keeps the conversation natural.** Callers can interrupt, and the receptionist
-  yields; echo cancellation and speech pre-roll keep quiet words. Transcripts keep
-  only the part of a reply the caller actually heard, and mark interruptions and
-  corrections.
+  hold announcements) are said in the same voice. Aokie has no speech of its own.
+- **Keeps the conversation natural.** Callers can interrupt, and OAIY Voice yields;
+  Aokie's echo cancellation takes OAIY's own voice out of what the caller says before it
+  goes back to OAIY. Transcripts keep only the part of a reply the caller actually heard,
+  and mark interruptions and corrections.
 - **Texts and contacts.** Receives and sends SMS over MAP and reads the phone book over
   PBAP. A text marked sent means the phone accepted it, not that the carrier delivered
   it; a send that is refused is reported back as failed, never left queued.
@@ -71,11 +71,11 @@ phone keeps its number: there is nothing to port and no SIP.
 | Route | Who hears, decides and speaks |
 |---|---|
 | **OAIY** (the setup wizard's last step turns it on) | OAIY Voice hears and speaks; OAIY's Front desk agent answers, with the model loaded in OAIY's Engines. |
-| **Aokie's own speech** (the `voice` build) | Parakeet speech recognition and Pocket TTS or sherpa voices inside the plugin, with any OpenAI-compatible language model (tested with Qwen3.5-9B GGUF, Q4, on a local server). |
-| **Flows only** | No AI receptionist: your flows, or you through the screen, speak to the caller. |
+| **Not OAIY** | Nobody: Aokie has no speech of its own, so the call rings through to you. The Settings tab says so and offers to send calls to OAIY. |
 
-Model and hardware requirements depend on what you choose. Remote providers receive only
-the text or audio the enabled operation needs.
+Aokie itself runs no speech or language model and downloads none: OAIY's do the
+hearing, speaking and answering. Remote providers receive only the text or audio the
+enabled operation needs.
 
 ## Supported hardware
 
@@ -210,31 +210,27 @@ You need Windows 10/11 x64 with:
 - Rust 1.88 or later (MSVC toolchain) and the Visual Studio 2022 C++ build tools.
 - LLVM, for `bindgen`: `.cargo/config.toml` points `LIBCLANG_PATH` at
   `C:\Program Files\LLVM\bin`.
-- For the `voice` feature: CMake for the sherpa-onnx build (or `SHERPA_LIB_PATH` pointing
-  at an existing build; see [dependency maintenance](docs/dependency-maintenance.md)), and
-  at run time ONNX Runtime and the speech models.
 - Node.js 22 for the Companion app and the screen checks.
 
 The plugin is left out of the workspace's `default-members`, so a bare `cargo build`
 builds only five library crates. Name the package:
 
 ```powershell
-cargo build -p aokie-plugin                                     # the light plugin
-cargo build -p aokie-plugin --features voice                    # with Aokie's own speech
+cargo build -p aokie-plugin                                     # texts, contacts, calls ring through
+cargo build -p aokie-plugin --features voice                    # call audio: the OAIY route
 cargo build -p aokie-plugin --features voice,managed-beta-driver
-cargo build -p aokie-voice-server                               # loopback speech service
 ```
 
+`voice` is call audio: the realtime lane that streams a call to OAIY's voice gateway and
+the echo canceller that takes OAIY's voice out of the caller's audio. Aokie has no speech of
+its own: no ONNX Runtime, speech engine, voice server or model, and nothing to download.
 `voice,managed-beta-driver` is the combination the managed pilots ship. Debug builds need
-no pinned hashes; release builds do, as below. If a voice build fails because Windows no
-longer has `wmic`, run `scripts/repair-sherpa-cmake.ps1` and build again. Run with
-`-CargoRegistry` after `cargo fetch`, it repairs the crate's source before any build, which
-is what CI does (GitHub's Windows runners have no `wmic` either).
+no pinned hashes; release builds do, as below.
 
 ### Release build
 
 Build the elevated driver helper first, pin its final SHA-256 into the plugin, then build
-the voice-enabled plugin:
+the plugin:
 
 ```powershell
 $env:AOKIE_EXPECTED_HELPER_SHA256 = 'helper-build-placeholder'
@@ -287,12 +283,11 @@ Windows' own Bluetooth stack.
 ### The release bundle
 
 The `plugin-release` job in [.github/workflows/ci.yml](.github/workflows/ci.yml) builds,
-signs and packages the bundle: `aokie-plugin.exe`, `aokie-driver-helper.exe` and
-`aokie-voice-server.exe`, `manifest.json`, `definitions/`, `ui/`, the driver package, ONNX
-Runtime and sherpa-onnx DLLs, `models-manifest.json` and `MODEL_LICENSES.md`, then
+signs and packages the bundle: `aokie-plugin.exe` and `aokie-driver-helper.exe`,
+`manifest.json`, `definitions/`, `ui/`, the driver package and the Realtek firmware, then
 `SHA256SUMS.txt`, `release-manifest.json` and a `package-manifest.json` signed by
-`package-signer`. `scripts/verify-bundle-assets.ps1 -Bundle <dir> -Voice` checks that
-every file the manifest names is present.
+`package-signer`. `scripts/verify-bundle-assets.ps1 -Bundle <dir>` checks that every file
+the manifest names is present.
 
 Until the Microsoft-signed catalog and the Authenticode certificate exist, the
 `plugin-release-managed-beta` job builds the managed-beta flavour instead: run the workflow
@@ -368,16 +363,13 @@ the connected app.
 | `crates/aokie-dongle` | Dongle discovery, the guarded WinUSB driver install and restore with its elevated helper, and the radio's event bridge. |
 | `crates/aokie-winbt` | The native Windows Bluetooth backend (WinRT Calls, WASAPI, RFCOMM); built only when asked for. |
 | `crates/aokie-core` | The Tauri-free foundation the other crates share: policy, the dongle catalog, contracts and security. |
-| `crates/aokie-ai` | Language, speech-recognition and speech providers: the OpenAI-compatible client and the in-process ONNX, Candle and sherpa engines. |
-| `crates/aokie-audio` | Echo cancellation, voice activity detection, recording and audio buffers. |
+| `crates/aokie-audio` | Echo cancellation, recording and audio buffers. |
 | `crates/aokie-db` | The SQLite schema for calls, transcripts, contacts and texts, with search and retention. |
-| `crates/aokie-voice-server` | A loopback-only, OpenAI-compatible speech service for Aokie's own models. |
 | `crates/aokie-receptionist` | Appointment calendar and orders logic, prompt building and spoken-date parsing. |
 | `crates/aokie-protocol` | Companion snapshot and command models, revision fences and shared fixtures. |
 | `crates/aokie-realtime` | The self-hostable Companion signalling gateway. |
 | `crates/aokie-media` | The native WebRTC media bridge shared by the desktop and Companion. |
 | `crates/package-signer` | Ed25519 signing and verification of release bundles. |
-| `crates/transcribe-rs` | A vendored fork of transcribe-rs: ONNX speech-recognition engines. |
 | `apps/aokie-mobile` | Aokie Companion (Tauri 2, React and TypeScript). |
 | `deploy/companion-self-host` | Docker Compose for the Companion gateway, Traefik and a TURN relay. |
 | `drivers/winusb` | The production WinUSB driver package. |
@@ -410,11 +402,8 @@ in the subject. Do not open a public issue for a security report.
 - Aokie is **proprietary software** (`LicenseRef-Proprietary`) and is not open source.
   The workspace is pre-1.0 and is not published to crates.io. Contact FormLogic for
   licensing terms.
-- The speech models are downloaded at pinned revisions under their own licences: the
-  NVIDIA Open Model License for Parakeet, and CC BY 4.0 (model) with Apache 2.0 (export
-  code) for Pocket TTS. See [MODEL_LICENSES.md](docs/MODEL_LICENSES.md).
-- Vendored code keeps its licence: `crates/transcribe-rs` is MIT (a fork of
-  andrewleech/transcribe-rs), and `vendor/glib` is MIT (see
+- Aokie downloads no model: OAIY's own notices cover the models OAIY runs.
+- Vendored code keeps its licence: `vendor/glib` is MIT (see
   [vendor/README.md](vendor/README.md)).
 
 FormLogic is maintained separately in

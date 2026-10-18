@@ -1,6 +1,6 @@
 [package]
 name = "aokie-receptionist"
-description = "Tauri-free receptionist business logic: appointment calendar + orders (typed CRUD, prompt building, verbal date/intent parsing, tool-call envelopes) and the EventSink-driven call-orchestration scaffolding. Depends on aokie-core, aokie-db, aokie-ai."
+description = "Tauri-free receptionist business logic: appointment calendar + orders (typed CRUD, prompt building, verbal date/intent parsing, tool-call envelopes) and the EventSink-driven call-orchestration scaffolding. Depends on aokie-core, aokie-db."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,7 +9,6 @@ publish.workspace = true
 [dependencies]
 aokie-core = { path = "../aokie-core" }
 aokie-db = { path = "../aokie-db" }
-aokie-ai = { path = "../aokie-ai" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }

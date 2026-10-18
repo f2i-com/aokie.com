@@ -20,7 +20,6 @@ pub(super) fn drain_bluetooth_events(
     ctx: &mut CallVoiceContext,
     idle: &mut bool,
     #[cfg(feature = "voice")] realtime_selected: bool,
-    #[cfg(feature = "voice")] synth: &crate::synth::SynthHandle,
     #[cfg(feature = "voice")] stt_tx: &std::sync::mpsc::Sender<SttWork>,
     #[cfg(feature = "voice")] stt_result_rx: &std::sync::mpsc::Receiver<SttResult>,
     #[cfg(feature = "voice")] stt_buf: &mut Vec<f32>,
@@ -107,8 +106,6 @@ pub(super) fn drain_bluetooth_events(
         if matches!(ev, aokie_dongle::bluetooth::BluetoothEvent::CallIncoming)
             && should_prepare_local_speech(realtime_selected, false)
         {
-            let _ = stt_tx.send(SttWork::Warm);
-            synth.warm();
             // LLM warm-up runs OFF-THREAD (an on-loop HTTP call delayed
             // the ANSWER once): discover + prime llama's prompt cache with
             // the BASE reply prefix, so the first token of the first reply

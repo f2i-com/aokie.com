@@ -588,8 +588,6 @@ pub(super) fn service_realtime_lane(
     realtime_selected: bool,
     oaiy_route: bool,
     realtime_config: &Option<RealtimeRuntimeConfig>,
-    synth: &crate::synth::SynthHandle,
-    stt_tx: &std::sync::mpsc::Sender<SttWork>,
     agent_persona: &String,
     answer_hold_started: &mut Option<std::time::Instant>,
     screen_policy: &crate::screen::ScreenPolicy,
@@ -755,10 +753,6 @@ pub(super) fn service_realtime_lane(
                 ) {
                     *realtime_legacy_call = Some(call_id);
                     ctx.desktop_realtime_responder = false;
-                    if should_prepare_local_speech(realtime_selected, true) {
-                        let _ = stt_tx.send(SttWork::Warm);
-                        synth.warm();
-                    }
                 } else {
                     let overlay_ready = ctx
                         .call_agent_overlay
@@ -809,10 +803,6 @@ pub(super) fn service_realtime_lane(
                         if legacy {
                             *realtime_legacy_call = Some(call_id);
                             ctx.desktop_realtime_responder = false;
-                            if should_prepare_local_speech(realtime_selected, true) {
-                                let _ = stt_tx.send(SttWork::Warm);
-                                synth.warm();
-                            }
                         } else if let Some(config) = realtime_config.as_ref() {
                             ctx.desktop_realtime_responder = true;
                             let persona = ctx
@@ -906,10 +896,6 @@ pub(super) fn service_realtime_lane(
                                         Some(error.clone());
                                     *realtime_legacy_call = Some(call.id.clone());
                                     ctx.desktop_realtime_responder = false;
-                                    if should_prepare_local_speech(realtime_selected, true) {
-                                        let _ = stt_tx.send(SttWork::Warm);
-                                        synth.warm();
-                                    }
                                 }
                                 Err(error) => {
                                     eprintln!(
@@ -925,10 +911,6 @@ pub(super) fn service_realtime_lane(
                             // their proven legacy responder.
                             *realtime_legacy_call = Some(call.id.clone());
                             ctx.desktop_realtime_responder = false;
-                            if should_prepare_local_speech(realtime_selected, true) {
-                                let _ = stt_tx.send(SttWork::Warm);
-                                synth.warm();
-                            }
                         } else {
                             let error = status
                                 .realtime_error
@@ -1039,8 +1021,6 @@ pub(super) fn service_realtime_lane(
                 ctx.pending_turn = None;
                 *realtime_legacy_call = Some(call_id.clone());
                 ctx.desktop_realtime_responder = false;
-                let _ = stt_tx.send(SttWork::Warm);
-                synth.warm();
                 status.realtime_ready.store(false, Ordering::Relaxed);
                 if let Some(current) = tracker.current_mut().filter(|s| s.id == call_id) {
                     current.greeted = manager_error.is_some();
@@ -1791,14 +1771,6 @@ pub(super) fn service_realtime_lane(
                                         "[aokie-plugin] Desktop realtime voice begun for active call {} at {sr}Hz SCO",
                                         lane.call_id
                                     );
-                                    // Warm the LOCAL engine in the
-                                    // background: the hold ceremony and
-                                    // switchboard announcements speak
-                                    // locally even on realtime calls, and
-                                    // a cold engine load must not delay
-                                    // the first "please hold" (no-op when
-                                    // already loaded).
-                                    synth.warm();
                                 }
                                 Err(error) => {
                                     realtime_failure =

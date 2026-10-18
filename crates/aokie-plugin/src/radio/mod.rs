@@ -72,7 +72,7 @@ mod turn_flush;
 mod turns;
 mod interjections;
 mod spawn;
-mod http_speech;
+mod stt_work;
 mod juggle;
 mod oaiy_speak;
 mod playback;
@@ -92,7 +92,7 @@ mod event_handler;
 pub use self::control::*;
 pub use self::handle::*;
 #[allow(unused_imports)]
-pub(crate) use self::http_speech::*;
+use self::stt_work::*;
 pub use self::prompts::*;
 pub use self::spawn::*;
 pub use self::status::*;

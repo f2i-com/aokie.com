@@ -18,16 +18,13 @@ Usage: plugin_check.py [--no-dongle] PATH/TO/aokie-plugin
 
 --no-dongle is for a machine with no dongle and no stand-in (a build
 machine): the plugin is started from its folder, answers, lists no dongle,
-and shuts down cleanly. No consent is recorded, so the radio never starts
-and no speech model is fetched: it is the check that a bundle laid out by
+and shuts down cleanly. No consent is recorded, so the radio never starts:
+it is the check that a bundle laid out by
 scripts/bundle-unix.sh runs from its folder alone, and nothing more.
 
 AOKIE_PLUGIN_CHECK_WAIT: how many seconds to wait for the radio (default
-30). A plugin built with voice fetches its speech models before its radio
-thread looks at the dongle's events, on a first start: give it minutes. And
-give this a plugin from a folder scripts/bundle-unix.sh laid out, which has
-ONNX Runtime 1.25.0 beside it: without that runtime a plugin that has its
-models aborts on its way out (the README says why).
+30). The plugin has no speech of its own and fetches nothing, so the radio
+reports the dongle within seconds.
 AOKIE_PLUGIN_CHECK_LOG: how many of the last lines of the plugin's own log
 to print when all went well (they are printed anyway when something did not).
 """

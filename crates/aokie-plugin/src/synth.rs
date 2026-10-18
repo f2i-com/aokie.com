@@ -1,386 +1,114 @@
-//! Speech-synthesis worker (voice feature): synthesis runs OFF the radio
-//! thread.
+//! The synthesis lane of the voice feature, with no voice behind it.
 //!
-//! Phase 2 of the full-duplex plan. Before this, `tts_speak` synthesized on
-//! the radio thread and queued WHOLE sentences into the SCO TX queue — so a
-//! cancel had to wait out local Pocket-TTS's ~1.2 s decode chunks, the AEC
-//! reference could lead real playout by seconds (and overflow its 3 s FIFO on
-//! long sentences), and the mic went undrained during synthesis stalls.
+//! Aokie has no text-to-speech of its own: on the OAIY route OAIY Voice
+//! speaks the replies and OAIY's speak mode says Aokie's fixed lines. The
+//! radio's own speaking path (`radio::tts_speak`, which paces PCM into the
+//! SCO link while it keeps draining the mic and honouring controls) is still
+//! the one every line Aokie might say goes through, so it keeps this handle:
+//! each span it begins fails at once with [`crate::voice::NO_OWN_SPEECH`],
+//! which `tts_speak` reports as a span that produced no audio, exactly as a
+//! failed engine did.
 //!
-//! Now ONE worker thread owns the TTS engines (in-process Pocket-TTS and the
-//! HTTP endpoint with its sticky per-call fallback) and streams small PCM
-//! blocks — already rated (WSOLA) and resampled to the SCO rate — over a
-//! bounded channel. The radio thread paces those blocks into the SCO TX
-//! queue (~200 ms ahead of playout) while it keeps draining the mic; see
-//! `radio::tts_speak`.
-//!
-//! Cancellation is an EPOCH: [`SynthHandle::begin`] bumps a shared counter
-//! and every output block is tagged with the epoch it belongs to. Bumping
-//! the epoch again ([`SynthHandle::cancel`]) makes the worker abort at its
-//! next chunk boundary and the radio side discard anything stale — audio
-//! stops within the ~200 ms the TX queue holds, never a whole sentence.
+//! Cancellation is an EPOCH: [`SynthHandle::begin`] bumps a counter and the
+//! outcome is tagged with the epoch it belongs to; bumping it again
+//! ([`SynthHandle::cancel`]) makes the radio side discard anything stale.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
 
-use crate::radio::HttpTtsRuntime;
-
-/// One job for the worker. `Span` carries the epoch it was minted under —
-/// the worker skips it if the epoch has already moved on.
-enum SynthJob {
-    Span {
-        epoch: u64,
-        text: String,
-        voice: String,
-        rate: f32,
-        target_rate: u32,
-    },
-    Configure {
-        endpoint: Option<String>,
-    },
-    ResetCall,
-    /// Ring-time pre-warm (2026-07-14): load the in-process TTS engine NOW —
-    /// while the phone is still ringing — so the greeting synthesizes hot.
-    /// A cold engine after a plugin restart cost seconds on a live call.
-    Warm,
-    /// Live engine reselection (settings.set `ttsEngine`/`ttsModelDir`): the
-    /// connector re-stamped the AOKIE_TTS_ENGINE / AOKIE_TTS_MODEL_DIR env
-    /// BEFORE queueing this; drop the loaded engine and reload from the new
-    /// selection now, so a config mistake surfaces in the log immediately
-    /// instead of as a dead span on the next call.
-    ReloadEngine,
-}
-
-/// Worker → radio: epoch-tagged PCM blocks and the span's terminal outcome.
+/// The outcome of a span, tagged with its epoch.
 pub enum SynthOut {
-    Frames {
-        epoch: u64,
-        pcm: Vec<i16>,
-    },
-    /// Synthesis finished (all frames sent). Also sent after an epoch abort —
-    /// the radio discards it as stale.
-    Done {
-        epoch: u64,
-    },
-    Failed {
-        epoch: u64,
-        error: String,
-    },
+    /// PCM at the SCO rate. Nothing produces it any more: the radio side
+    /// that plays it is the same path a failed span takes.
+    #[allow(dead_code)]
+    Frames { epoch: u64, pcm: Vec<i16> },
+    /// The span finished (all frames sent). Never, now.
+    #[allow(dead_code)]
+    Done { epoch: u64 },
+    Failed { epoch: u64, error: String },
 }
 
-/// Block size the worker slices output into (~240 ms at the SCO rate): small
-/// enough that backpressure and epoch aborts are responsive, large enough
-/// that channel overhead is negligible.
-fn block_samples(target_rate: u32) -> usize {
-    (target_rate as usize / 4).max(160)
-}
-
-/// Bounded output-channel depth in blocks (~10 s of audio): synthesis may run
-/// ahead of playout, but never unboundedly.
-const OUT_CHANNEL_BLOCKS: usize = 40;
+/// Outcomes held at most (a span has one): a full channel only drops a stale
+/// outcome, never blocks the radio thread.
+const OUT_CHANNEL_DEPTH: usize = 8;
 
 pub struct SynthHandle {
-    job_tx: mpsc::Sender<SynthJob>,
+    out_tx: mpsc::SyncSender<SynthOut>,
     pub out_rx: mpsc::Receiver<SynthOut>,
-    epoch: Arc<AtomicU64>,
+    epoch: AtomicU64,
+    /// Tests that drive the radio loop: nothing is ever answered.
+    inert: bool,
 }
 
 impl SynthHandle {
-    /// A handle with no worker behind it: every job is dropped and nothing is
-    /// ever synthesized. For tests that drive the radio loop, which asks the
-    /// engine to warm up when a call begins.
+    /// A handle that answers nothing at all, not even a failure. For tests
+    /// that drive the radio loop.
     #[cfg(test)]
     pub(crate) fn inert() -> Self {
-        let (job_tx, _job_rx) = mpsc::channel::<SynthJob>();
-        let (_out_tx, out_rx) = mpsc::sync_channel::<SynthOut>(1);
-        Self {
-            job_tx,
-            out_rx,
-            epoch: Arc::new(AtomicU64::new(0)),
-        }
+        let mut handle = Self::spawn();
+        handle.inert = true;
+        handle
     }
 
-    /// Spawn the worker. The HTTP TTS endpoint is seeded from
-    /// `AOKIE_TTS_ENDPOINT` exactly as the old in-loop runtime was.
     pub fn spawn() -> Self {
-        let (job_tx, job_rx) = mpsc::channel::<SynthJob>();
-        let (out_tx, out_rx) = mpsc::sync_channel::<SynthOut>(OUT_CHANNEL_BLOCKS);
-        let epoch = Arc::new(AtomicU64::new(0));
-        let worker_epoch = epoch.clone();
-        let spawned = std::thread::Builder::new()
-            .name("aokie-tts-synth".to_string())
-            .spawn(move || worker(job_rx, out_tx, worker_epoch));
-        if let Err(e) = spawned {
-            // The radio side degrades naturally: begin() jobs go nowhere and
-            // every span reads as a synthesis failure (dur 0 → TTS error slot).
-            eprintln!("[aokie-plugin] TTS synth worker failed to start: {e}");
-        }
+        let (out_tx, out_rx) = mpsc::sync_channel::<SynthOut>(OUT_CHANNEL_DEPTH);
         Self {
-            job_tx,
+            out_tx,
             out_rx,
-            epoch,
+            epoch: AtomicU64::new(0),
+            inert: false,
         }
     }
 
-    /// Start synthesizing one span; returns its epoch. Implicitly cancels
-    /// whatever came before (the epoch moves) and drains stale output so the
-    /// caller starts clean — this also unblocks a worker parked on a full
-    /// channel from an abandoned span.
-    pub fn begin(&self, text: &str, voice: &str, rate: f32, target_rate: u32) -> u64 {
+    /// Start a span; returns its epoch. Implicitly cancels whatever came
+    /// before (the epoch moves) and drains stale output, then fails at once:
+    /// there is no voice to say it with.
+    pub fn begin(&self) -> u64 {
         let epoch = self.epoch.fetch_add(1, Ordering::SeqCst) + 1;
         while self.out_rx.try_recv().is_ok() {}
-        let _ = self.job_tx.send(SynthJob::Span {
-            epoch,
-            text: text.to_string(),
-            voice: voice.to_string(),
-            rate,
-            target_rate,
-        });
+        if !self.inert {
+            let _ = self.out_tx.try_send(SynthOut::Failed {
+                epoch,
+                error: crate::voice::NO_OWN_SPEECH.to_string(),
+            });
+        }
         epoch
     }
 
-    /// Abort the current span: the worker stops at its next chunk boundary
-    /// and everything still in flight reads as stale.
+    /// Abort the current span: everything still in flight reads as stale.
     pub fn cancel(&self) {
         self.epoch.fetch_add(1, Ordering::SeqCst);
     }
 
-    /// Live TTS-endpoint reconfiguration (settings.set / flow push).
-    pub fn configure(&self, endpoint: Option<String>) {
-        let _ = self.job_tx.send(SynthJob::Configure { endpoint });
-    }
-
-    /// Ring-time pre-warm: load the in-process TTS engine while the phone is
-    /// still ringing (no-op when already loaded or when the queue is busy —
-    /// the worker just services it in order).
-    pub fn warm(&self) {
-        let _ = self.job_tx.send(SynthJob::Warm);
-    }
-
-    /// Live engine reselection: reload the in-process engine from the freshly
-    /// stamped AOKIE_TTS_ENGINE / AOKIE_TTS_MODEL_DIR env. Send AFTER the env
-    /// is updated — jobs are serviced in order.
-    pub fn reload_engine(&self) {
-        let _ = self.job_tx.send(SynthJob::ReloadEngine);
-    }
-
-    /// Call boundary: clear the HTTP endpoint's sticky per-call fallback and
-    /// invalidate any in-flight span.
+    /// Call boundary: invalidate any in-flight span.
     pub fn reset_call(&self) {
         self.cancel();
-        let _ = self.job_tx.send(SynthJob::ResetCall);
         while self.out_rx.try_recv().is_ok() {}
     }
 }
 
-fn worker(
-    job_rx: mpsc::Receiver<SynthJob>,
-    out_tx: mpsc::SyncSender<SynthOut>,
-    epoch: Arc<AtomicU64>,
-) {
-    let mut tts: Option<crate::voice::TtsEngine> = None;
-    let mut http = HttpTtsRuntime::from_env("AOKIE_TTS_ENDPOINT");
-    while let Ok(job) = job_rx.recv() {
-        match job {
-            SynthJob::Configure { endpoint } => http.configure(endpoint),
-            SynthJob::ResetCall => http.reset_call(),
-            SynthJob::Warm => {
-                if tts.is_none() {
-                    match crate::voice::TtsEngine::load() {
-                        Ok(engine) => {
-                            eprintln!(
-                                "[aokie-plugin] TTS engine pre-warmed: {}",
-                                engine.engine_name()
-                            );
-                            tts = Some(engine);
-                        }
-                        Err(err) => eprintln!("[aokie-plugin] TTS pre-warm failed: {err}"),
-                    }
-                }
-            }
-            SynthJob::ReloadEngine => {
-                tts = None;
-                match crate::voice::TtsEngine::load() {
-                    Ok(engine) => {
-                        eprintln!(
-                            "[aokie-plugin] TTS engine reselected: {}",
-                            engine.engine_name()
-                        );
-                        tts = Some(engine);
-                    }
-                    Err(err) => eprintln!(
-                        "[aokie-plugin] TTS engine reload failed: {err} (will retry on the next span)"
-                    ),
-                }
-            }
-            SynthJob::Span {
-                epoch: e,
-                text,
-                voice,
-                rate,
-                target_rate,
-            } => {
-                if epoch.load(Ordering::SeqCst) != e {
-                    continue; // superseded before we even started
-                }
-                match synth_span(
-                    &mut tts,
-                    &mut http,
-                    &text,
-                    &voice,
-                    rate,
-                    target_rate,
-                    &epoch,
-                    e,
-                    &out_tx,
-                ) {
-                    Ok(()) => {
-                        let _ = out_tx.send(SynthOut::Done { epoch: e });
-                    }
-                    Err(err) => {
-                        let _ = out_tx.send(SynthOut::Failed {
-                            epoch: e,
-                            error: err,
-                        });
-                    }
-                }
-            }
-        }
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// Slice `pcm` into bounded blocks and ship them, aborting between blocks
-/// when the epoch moves on. Returns false when aborted.
-fn ship_blocks(
-    pcm: &[i16],
-    target_rate: u32,
-    epoch: &AtomicU64,
-    e: u64,
-    out_tx: &mpsc::SyncSender<SynthOut>,
-) -> bool {
-    for block in pcm.chunks(block_samples(target_rate)) {
-        if epoch.load(Ordering::SeqCst) != e {
-            return false;
-        }
-        if out_tx
-            .send(SynthOut::Frames {
-                epoch: e,
-                pcm: block.to_vec(),
-            })
-            .is_err()
-        {
-            return false;
-        }
-    }
-    true
-}
-
-#[allow(clippy::too_many_arguments)]
-fn synth_span(
-    tts: &mut Option<crate::voice::TtsEngine>,
-    http: &mut HttpTtsRuntime,
-    text: &str,
-    voice: &str,
-    rate: f32,
-    target_rate: u32,
-    epoch: &AtomicU64,
-    e: u64,
-    out_tx: &mpsc::SyncSender<SynthOut>,
-) -> Result<(), String> {
-    let rated = (aokie_core::time_stretch::clamp_rate(rate) - 1.0).abs() >= 0.01;
-    // HTTP endpoint first (sticky per-call fallback semantics unchanged).
-    if let Some(endpoint) = http.endpoint_for_call() {
-        // VOX-404 streaming-PCM lane: ask for response_format:"pcm" and ship
-        // blocks AS THEY ARRIVE. Rated spans skip it — WSOLA stretching wants
-        // the whole utterance, and they're short (slowed digit runs) anyway.
-        if !rated && http.pcm_streaming_enabled_for_call() {
-            match crate::radio::http_tts_stream_pcm_at(&endpoint, text, voice, target_rate, |pcm| {
-                if epoch.load(Ordering::SeqCst) != e {
-                    return false;
-                }
-                out_tx.send(SynthOut::Frames { epoch: e, pcm }).is_ok()
-            }) {
-                crate::radio::HttpTtsStream::Streamed | crate::radio::HttpTtsStream::Aborted => {
-                    // Aborted = epoch moved; the trailing Done/Failed the
-                    // caller sends reads as stale, same as ship_blocks.
-                    return Ok(());
-                }
-                crate::radio::HttpTtsStream::Unsupported(reason) => {
-                    // Spec-compliant third parties land here (no PCM
-                    // streaming): remember for the rest of the call and use
-                    // the whole-utterance wav request below.
-                    eprintln!(
-                        "[aokie-plugin] HTTP TTS streaming unavailable at {endpoint}: {reason}; using whole-utterance requests for this call"
-                    );
-                    http.mark_pcm_stream_unsupported();
-                }
-                crate::radio::HttpTtsStream::FailedMidStream(err) => {
-                    // Audio already reached the caller — re-synthesizing the
-                    // span would double-speak its prefix, so the span FAILS
-                    // (existing failed-span semantics) and later spans take
-                    // the sticky in-process fallback.
-                    http.mark_failed_for_call();
-                    eprintln!(
-                        "[aokie-plugin] HTTP TTS stream failed at {endpoint}: {err}; falling back to in-process TTS for this call"
-                    );
-                    return Err(format!("HTTP TTS stream failed mid-span: {err}"));
-                }
+    /// Every span fails at once, saying why, and a later span's outcome is
+    /// never mistaken for an earlier one's.
+    #[test]
+    fn a_span_fails_at_once_with_no_voice_of_its_own() {
+        let synth = SynthHandle::spawn();
+        let first = synth.begin();
+        let second = synth.begin();
+        assert!(second > first);
+        match synth.out_rx.try_recv() {
+            Ok(SynthOut::Failed { epoch, error }) => {
+                assert_eq!(epoch, second);
+                assert!(error.contains("no speech of its own"));
             }
+            _ => panic!("the span did not fail"),
         }
-        match crate::radio::http_tts_synthesize_at(&endpoint, text, voice) {
-            Ok(wav) => {
-                // Stretch at the provider's native rate (full quality), then
-                // resample to SCO. Applied HERE, never asked of the provider,
-                // so every endpoint behaves identically.
-                let samples = if rated {
-                    aokie_core::time_stretch::stretch_i16(&wav.samples, wav.sample_rate, rate)
-                } else {
-                    wav.samples
-                };
-                let pcm =
-                    crate::speech_wire::resample_i16_mono(&samples, wav.sample_rate, target_rate);
-                ship_blocks(&pcm, target_rate, epoch, e, out_tx);
-                return Ok(());
-            }
-            Err(err) => {
-                if http.mark_failed_for_call() {
-                    eprintln!(
-                        "[aokie-plugin] HTTP TTS failed at {endpoint}: {err}; falling back to in-process TTS for this call"
-                    );
-                }
-            }
-        }
+        assert!(synth.out_rx.try_recv().is_err(), "the first span's outcome was drained");
+        let inert = SynthHandle::inert();
+        inert.begin();
+        assert!(inert.out_rx.try_recv().is_err());
     }
-    if tts.is_none() {
-        match crate::voice::TtsEngine::load() {
-            Ok(engine) => {
-                eprintln!("[aokie-plugin] TTS engine loaded: {}", engine.engine_name());
-                *tts = Some(engine);
-            }
-            Err(err) => return Err(format!("TTS load failed: {err}")),
-        }
-    }
-    let engine = tts
-        .as_mut()
-        .ok_or_else(|| "TTS engine unavailable".to_string())?;
-    if rated {
-        // Rated spans are short (a slowed phone number): synthesize whole,
-        // stretch at the model's native rate, then ship.
-        let (native_pcm, native_rate) = engine
-            .synthesize_native(text, voice)
-            .map_err(|err| format!("TTS synthesis failed: {err}"))?;
-        let stretched = aokie_core::time_stretch::stretch_i16(&native_pcm, native_rate, rate);
-        let pcm = crate::speech_wire::resample_i16_mono(&stretched, native_rate, target_rate);
-        ship_blocks(&pcm, target_rate, epoch, e, out_tx);
-        return Ok(());
-    }
-    // Streaming path: ship each synthesized chunk as it lands so the caller
-    // hears the first ~0.3 s chunk while the rest still decodes.
-    engine
-        .synthesize_streaming(text, voice, target_rate, |pcm| {
-            ship_blocks(pcm, target_rate, epoch, e, out_tx)
-        })
-        .map_err(|err| format!("TTS synthesis failed: {err}"))?;
-    Ok(())
 }

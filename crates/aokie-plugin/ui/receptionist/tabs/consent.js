@@ -33,8 +33,6 @@
   var CODEX_DESTINATION = 'OpenAI ChatGPT via Codex';
   var CODEX_ID_NONE = 'openai-codex-agent-none';
   var CODEX_ID_LOW = 'openai-codex-agent-low';
-  var CODEX_PROVIDER_NONE = 'provider:' + CODEX_ID_NONE;
-  var CODEX_PROVIDER_LOW = 'provider:' + CODEX_ID_LOW;
 
   function isLoopbackUrl(raw) {
     try {
@@ -122,10 +120,6 @@
     } catch (e) {
       return value;
     }
-  }
-
-  function isCodexProviderSource(source) {
-    return !!source && (source.id === CODEX_PROVIDER_NONE || source.id === CODEX_PROVIDER_LOW);
   }
 
   // ---- SCOPE_ROWS — copy VERBATIM from ConsentWizard.tsx ------------------
@@ -264,22 +258,10 @@
         settingsBag = {};
       }
     );
-    var sourcesP = HOST.aiSources().then(
-      function (list) {
-        var sources = Array.isArray(list) ? list : [];
-        for (var i = 0; i < sources.length; i++) {
-          if (isCodexProviderSource(sources[i])) {
-            codexProviderAvailable = true;
-            break;
-          }
-        }
-      },
-      function () {
-        // A source-list outage must not hide an already configured or granted
-        // disclosure choice; the reconciliation below preserves those.
-      }
-    );
-    return Promise.all([consentP, settingsP, sourcesP]).then(function () {
+    // The Codex choice is offered only where it is already set or granted:
+    // only Aokie's own older speech path sent text there, and Aokie has no
+    // speech of its own now (calls go to OAIY), so nothing new is offered.
+    return Promise.all([consentP, settingsP]).then(function () {
       if (isCodexLiveCallEndpoint(settingsBag.aiEndpoint)) {
         codexProviderAvailable = true;
         codexDestinationOptIn = true;
@@ -294,10 +276,10 @@
    *  to. Generic loopback processing is local; the two exact Codex broker
    *  routes disclose their stable OpenAI destination instead of a local URL. */
   function uniqueDestinations() {
+    // (sttEndpoint and ttsEndpoint were Aokie's own speech servers: nothing
+    // is sent to them now.)
     var keys = [
       'aiEndpoint',
-      'sttEndpoint',
-      'ttsEndpoint',
       'audioTranscriptEndpoint',
       'realtimeVoiceEndpoint',
       'realtimeVoiceDestination',

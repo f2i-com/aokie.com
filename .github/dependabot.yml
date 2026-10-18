@@ -7,7 +7,7 @@
 # and ungrouped by Dependabot regardless of the schedule.
 version: 2
 updates:
-  # Root Rust workspace (plugin, bluetooth, dongle, voice server, realtime…).
+  # Root Rust workspace (plugin, bluetooth, dongle, realtime…).
   - package-ecosystem: cargo
     directory: /
     schedule:

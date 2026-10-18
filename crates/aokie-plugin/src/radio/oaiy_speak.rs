@@ -43,22 +43,24 @@ pub(super) struct LineVoice<'a> {
     /// OAIY's voice. `None` off the OAIY route (and when its config failed).
     pub(super) oaiy: Option<&'a RealtimeRuntimeConfig>,
     /// Whether Aokie's own TTS may say it (when OAIY's voice is not used or
-    /// could not). Always true off the OAIY route, as before.
+    /// could not). Aokie has none: it is never there.
     pub(super) own_tts: bool,
 }
 
 #[cfg(all(aokie_radio, feature = "voice"))]
 impl<'a> LineVoice<'a> {
-    /// Off the OAIY route: Aokie's own TTS, exactly as before.
+    /// Off the OAIY route there is no voice for a fixed line: OAIY's speak
+    /// mode is the OAIY route's, and Aokie has none of its own. The line is
+    /// not said.
     pub(super) fn own() -> Self {
         Self {
             oaiy: None,
-            own_tts: true,
+            own_tts: false,
         }
     }
 
     /// The route's voice for fixed lines. On the OAIY route OAIY's speak
-    /// mode first, then Aokie's own TTS only when its preflight found it.
+    /// mode, then Aokie's own TTS were its preflight to find one (never).
     pub(super) fn for_route(
         oaiy_route: bool,
         realtime_config: Option<&'a RealtimeRuntimeConfig>,

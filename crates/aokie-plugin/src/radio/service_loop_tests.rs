@@ -107,9 +107,6 @@ struct Loop {
     bt: FakeBackend,
     sink: crate::event_bridge::VecSink,
     status: Arc<RadioStatus>,
-    synth: crate::synth::SynthHandle,
-    stt_tx: std::sync::mpsc::Sender<SttWork>,
-    _stt_rx: std::sync::mpsc::Receiver<SttWork>,
     screen: crate::screen::ScreenPolicy,
     tracker: crate::call_session::SessionTracker,
     config: Option<RealtimeRuntimeConfig>,
@@ -143,15 +140,11 @@ impl Loop {
         tracker.answered();
         let status = Arc::new(RadioStatus::default());
         status.transfer_ready.store(true, std::sync::atomic::Ordering::Relaxed);
-        let (stt_tx, stt_rx) = std::sync::mpsc::channel();
         Self {
             rig,
             bt: FakeBackend { rate: 8_000 },
             sink: crate::event_bridge::VecSink::default(),
             status,
-            synth: crate::synth::SynthHandle::inert(),
-            stt_tx,
-            _stt_rx: stt_rx,
             screen: crate::screen::ScreenPolicy::permissive(),
             tracker,
             config: Some(RealtimeRuntimeConfig {
@@ -222,8 +215,6 @@ impl Loop {
             true,
             true,
             &self.config,
-            &self.synth,
-            &self.stt_tx,
             &self.persona,
             &mut self.answer_hold_started,
             &self.screen,

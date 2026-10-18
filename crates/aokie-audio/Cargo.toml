@@ -1,6 +1,6 @@
 [package]
 name = "aokie-audio"
-description = "Aokie call-audio processing: SpeexDSP echo cancellation, Silero VAD (optional sherpa backend), WAV recording, streaming buffers, and the call notepad. Tauri-free; depends on aokie-core."
+description = "Aokie call-audio processing: SpeexDSP echo cancellation, WAV recording, streaming buffers, and the call notepad. Tauri-free; depends on aokie-core."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -21,22 +21,5 @@ aec-rs = "1.0"
 # streaming.rs uses parking_lot::Mutex; recording.rs uses rand.
 parking_lot = "0.12"
 rand = "0.8"
-# Only the async channel + mutex types are used (streaming/vad state).
+# Only the async channel type is used (streaming).
 tokio = { version = "1.0", features = ["sync"] }
-# VAD model downloader (vad::ensure_vad_model). Pulled only by the
-# `sherpa` feature — the model it fetches is only loaded by the
-# sherpa-backed VAD. rustls-tls keeps it off system OpenSSL.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
-
-# Silero VAD via sherpa-rs. Optional + off by default: the heavy
-# `sherpa-rs-sys` CMake build only runs with `--features sherpa`. The
-# feature-off path is the stub `StreamingVad` in vad/mod.rs.
-[dependencies.sherpa-rs]
-version = "0.6"
-default-features = false
-features = ["tts"]
-optional = true
-
-[features]
-default = []
-sherpa = ["dep:sherpa-rs", "dep:reqwest"]

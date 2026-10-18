@@ -120,8 +120,10 @@
   /** Where the saved settings send calls:
    *  'oaiy'     — OAIY's voice gateway (the Front desk agent answers);
    *  'realtime' — another Desktop realtime provider;
-   *  'local'    — Aokie's own older speech stack on this computer;
-   *  'flows'    — no AI receptionist: flows or the operator speak;
+   *  'local'    — Aokie's older in-plugin receptionist, which has no speech
+   *               now: nobody answers, calls ring through;
+   *  'flows'    — no AI receptionist: nobody answers either (flows and the
+   *               operator spoke with Aokie's own voice, which is gone);
    *  'unknown'  — settings not loaded. */
   function callRoute(bag) {
     if (!bag || typeof bag !== 'object') return 'unknown';
@@ -174,6 +176,10 @@
     return (status && status.voice && status.voice.chosen) || '';
   }
 
+  /** Said wherever a route or a setting would need Aokie's own speech,
+   *  which it does not have: OAIY Voice hears and speaks for calls. */
+  var NO_OWN_SPEECH = 'Aokie has no speech of its own: OAIY Voice hears and speaks for calls that go to OAIY';
+
   var OAIY = {
     providerId: OAIY_PROVIDER_ID,
     endpoint: OAIY_REALTIME_ENDPOINT,
@@ -184,6 +190,7 @@
     readStatus: readOaiyStatus,
     modelText: modelText,
     voiceText: voiceText,
+    noOwnSpeech: NO_OWN_SPEECH,
   };
 
   // ---- links to the dashboard's own pages ---------------------------------
@@ -893,12 +900,16 @@
         });
         return;
       }
-      var agent = responder.mode === 'agent';
-      var value = agent ? (responder.ready ? 'LLM ready' : 'LLM down') : 'Flow replies';
-      var note =
-        responder.llmError ||
-        (agent ? 'Aokie’s own speech and model, not OAIY' : 'no AI receptionist: flows or you reply');
-      items.push({ icon: ICONS.server, label: label, value: value, note: note, ok: responder.ready !== false });
+      // Off the realtime route the receptionist would be Aokie's own, and
+      // flow or operator replies would be said in its voice: Aokie has no
+      // speech of its own, so nobody answers and calls ring through.
+      items.push({
+        icon: ICONS.server,
+        label: label,
+        value: 'Nobody',
+        note: NO_OWN_SPEECH + '. Calls ring through to you until you send them to OAIY in Settings.',
+        ok: false,
+      });
     })();
 
     // Radio & dongle (dongle.diagnostics)
@@ -913,27 +924,19 @@
         return;
       }
       var consentPaused = !!radio.paused && radio.blockedBy === 'consent';
-      // Aokie's own speech models (and their stale results) only serve calls
-      // its older local speech answers; on the realtime route OAIY Voice
-      // hears and speaks, so a missing local model is not a radio fault.
-      var responder = health && health.components && health.components.responder;
-      var localSpeech = !(responder && responder.mode === 'desktop_realtime');
-      var voiceErr = localSpeech ? radio.voiceSttError || radio.voiceTtsError || '' : '';
-      var stale = localSpeech ? Number(radio.staleSttResults) || 0 : 0;
+      // (Its voice slots always say Aokie has no speech of its own: that is
+      // not a radio fault, and "Calls answered by" says what it means.)
       var value = consentPaused ? 'Paused for consent' : radio.initialized ? 'Ready' : 'Not initialised';
       var note =
         (consentPaused ? radio.reason : '') ||
         radio.error ||
-        voiceErr ||
-        (radio.initialized
-          ? 'radio up' + (stale > 0 ? ' · ' + stale + ' stale STT result' + (stale === 1 ? '' : 's') : '')
-          : 'connect a supported dongle');
+        (radio.initialized ? 'radio up' : 'connect a supported dongle');
       items.push({
         icon: ICONS.radio,
         label: 'Radio & dongle',
         value: value,
         note: note,
-        ok: !consentPaused && !!radio.initialized && !radio.error && !voiceErr,
+        ok: !consentPaused && !!radio.initialized && !radio.error,
       });
     })();
 
@@ -1097,12 +1100,15 @@
     // theirs: the receptionist neither speaks nor listens.
     var taken = call.leftToOwner === 'taken';
     var owner = taken ? 'owner' : replyOwner();
+    // What is typed here would be said in Aokie's own voice, which it does
+    // not have: OAIY Voice speaks on calls that go to OAIY.
+    var voiceless = owner === 'operator';
     var note = taken
       ? 'You answered this call on the phone — the receptionist stays out of it'
       : owner === 'agent'
         ? 'The AI receptionist owns this conversation — operator speech is muted'
-        : owner === 'operator'
-          ? 'Operator mode — you can speak to the caller'
+        : voiceless
+          ? NO_OWN_SPEECH + ', so nothing can be said to the caller from here'
           : 'Checking who owns replies…';
     setHtml(
       body,
@@ -1114,9 +1120,13 @@
         '</div>'
     );
     speakRow.hidden = taken;
-    var muted = owner !== 'operator';
+    var muted = owner !== 'operator' || voiceless;
     input.disabled = state.busyCall || muted;
-    input.placeholder = muted ? 'Disabled while the AI receptionist replies' : 'Say something to the caller…';
+    input.placeholder = voiceless
+      ? 'Aokie has no voice of its own'
+      : muted
+        ? 'Disabled while the AI receptionist replies'
+        : 'Say something to the caller…';
     send.disabled = state.busyCall || muted;
   }
 
@@ -1273,8 +1283,8 @@
   var ROUTE_LABEL = {
     oaiy: 'OAIY Front desk',
     realtime: 'Another realtime provider',
-    local: 'Aokie’s own speech (not OAIY)',
-    flows: 'Flows or you',
+    local: 'Nobody: calls ring through',
+    flows: 'Nobody: calls ring through',
     unknown: '—',
   };
 

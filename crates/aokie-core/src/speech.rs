@@ -1,5 +1,6 @@
-//! Text normalization for speech synthesis, shared by the Aokie plugin's
-//! in-call TTS and the aokie-voice-server HTTP service.
+//! Text normalization for speech synthesis: the Aokie plugin's lines are
+//! normalized once at its speaking path (the plugin has no voice of its own
+//! now; OAIY Voice speaks for calls that go to OAIY).
 
 /// Normalize text for speech synthesis. Real-world TTS failure modes drive
 /// this (all heard on live receptionist calls with pocket-tts):

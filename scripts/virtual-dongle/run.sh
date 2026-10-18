@@ -15,9 +15,8 @@
 # WITH_PLUGIN=1 also builds the plugin and runs it whole against the stand-in (plugin_check.py): started as OAIY
 # Desktop starts it, its radio up on the dongle, its setup commands answered, shut down, the dongle given back.
 # That build is the heavy one (it links libwebrtc, which on Linux asks for clang 21: the Dockerfile has it).
-# AOKIE_PLUGIN=PATH runs a plugin that is already built instead (the one in a folder scripts/bundle-unix.sh made);
-# for a plugin built with voice set AOKIE_PLUGIN_CHECK_WAIT to some minutes, since a first start fetches the speech
-# models before the radio reports the dongle. A plugin with voice has to be a bundle's: see the README.
+# AOKIE_PLUGIN=PATH runs a plugin that is already built instead (the one in a folder scripts/bundle-unix.sh made,
+# with call audio and no speech of its own: it fetches nothing).
 set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)

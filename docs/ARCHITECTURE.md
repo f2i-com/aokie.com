@@ -12,14 +12,12 @@ the moving parts and the two state machines that matter for correctness.
 OAIY Desktop or FormLogic Desktop (Tauri host)
   └─ spawns  aokie-plugin.exe  (stdio JSON-RPC 2.0, NDJSON)
                 ├─ radio thread            (WinUSB HCI/ACL/SCO, HFP, MAP, PBAP)
-                ├─ STT worker               (Parakeet, generation-stamped jobs)
                 ├─ outbox replay thread     (durable delivery, heartbeat)
-                └─ (voice feature) in-plugin agent: STT → LLM → TTS
+                └─ (voice feature) call audio: the realtime lane to OAIY and
+                     the echo canceller (no speech of Aokie's own)
   └─ runs the services the plugin calls:
        OAIY Desktop       its gateway on 127.0.0.1:17872 (the realtime voice
                           route), OAIY Voice and its model engines
-       FormLogic Desktop  aokie-voice-server.exe (:17920 loopback OpenAI-compatible
-                          STT/TTS) and llama-server.exe (:8080 local LLM)
 ```
 
 The plugin also ships its own screen, `crates/aokie-plugin/ui/receptionist`
@@ -83,12 +81,25 @@ Key invariants (each pinned by a test):
   rows replay immediately), so crash recovery needs a dedicated persistent
   delayed-work ledger rather than reusing the delivery outbox.
 
-## Aokie's own voice pipeline (voice feature)
+## No speech of Aokie's own (voice feature)
 
-Per caller turn: energy-VAD segments speech → generation-stamped STT job →
-stream the local LLM (first sentence starts TTS immediately) → per-sentence
-TTS → SCO out. Barge-in: AEC cancels Aokie's own voice from the mic; sustained
-caller speech flushes the queued TTS tail and aborts the LLM.
+Aokie has no speech-to-text or text-to-speech of its own: OAIY Voice hears
+and speaks for calls that go to OAIY (below). The `voice` feature is call
+audio: the realtime lane, the echo canceller (aec-rs, speexdsp), the
+resampling and pacing of the PCM. There is no ONNX Runtime, no speech engine,
+no voice server and no model to download (they left the workspace in October
+2026). The radio starts with both of its voice slots saying so
+(`voice::preflight`): a call that does not go to OAIY is never answered into
+silence (auto-answer stays off and it rings through), and a fixed line OAIY
+cannot say is not said. Settings that only shaped Aokie's own speech
+(`ttsVoice`, `ttsEngine`, `ttsModelDir`, `sttEndpoint`, `ttsEndpoint`) are
+accepted with any value and kept, and nothing reads them.
+
+The older in-plugin receptionist (energy VAD → STT job → the local LLM → TTS →
+SCO out, with barge-in) is still in the radio loop it shares with the realtime
+lane, but it is never given a voice: its STT lane answers no job and every
+synthesis span fails at once (`synth.rs`). A private voice consult with a
+Companion user needed the same speech, so it is never offered.
 
 Truthfulness rules the transcript: a barged or errored reply records only the
 sentences that **actually played** (`[caller interrupted]` / `[reply cut short
@@ -104,14 +115,17 @@ With `realtimeVoiceMode=desktop_realtime` and the provider `oaiy`, the call's
 audio streams to OAIY's voice gateway
 (`ws://127.0.0.1:17872/api/ai/providers/oaiy/v1/realtime/stream`). OAIY Voice
 hears and speaks, and OAIY's Front desk agent decides, with the saved persona
-(or the call's `configureAgent` overlay) as its brief. No path counts on
-Aokie's own speech stack, which is normally not downloaded on this route.
+(or the call's `configureAgent` overlay) as its brief. Aokie has no speech of
+its own. What the route uses of the plugin's own is call audio alone: the SCO
+link, the resampling and pacing of the PCM, a caller-activity level gate, and
+the echo canceller (aec-rs, speexdsp) that takes OAIY's own voice out of the
+caller's audio before it is sent.
 
 Aokie's fixed lines (a screened caller's message, the hold and queue
 announcements, the mid-call failure apology) are said in OAIY's voice through
 its speak mode: a `formlogic.realtime.start` with `"mode": "speak"` and the line
 as its greeting, said once with no agent listening. Where OAIY cannot say a
-line, Aokie's own TTS says it if present. Screened callers are never given to
+line, it is not said (Aokie has no voice of its own). Screened callers are never given to
 OAIY's agent. A mid-call OAIY failure ends in a hangup and
 `aokie.hardware.error {code: "realtime_failed", route: "oaiy", apologized,
 apologizedWith?}`. The full rules are in

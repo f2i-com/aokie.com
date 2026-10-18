@@ -5,9 +5,8 @@
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]
 
-# sherpa-rs-sys runs bindgen at build time (its SHERPA_SKIP_GENERATE_BINDINGS
-# fallback is broken in 0.6.8 — src/bindings.rs isn't packaged in the published
-# crate), so point bindgen at the installed LLVM's libclang.
+# aec-rs-sys (the speexdsp echo canceller) runs bindgen at build time, so point
+# bindgen at the installed LLVM's libclang.
 #
 # This is Windows' folder, and cargo's [env] has no target scope: it reaches a
 # build on any system that has not set LIBCLANG_PATH itself, where it names a

@@ -4,8 +4,6 @@ use std::collections::VecDeque;
 
 #[derive(Default)]
 pub(super) struct CaptureActivity {
-    vad: Option<aokie_audio::vad::StreamingVad>,
-    vad_checked: bool,
     levels: VecDeque<f32>,
     noise: f32,
     frames: usize,
@@ -15,43 +13,16 @@ pub(super) struct CaptureActivity {
 }
 
 impl CaptureActivity {
-    pub fn detect(&mut self, samples: &[i16], samples_16k: &[f32], continuing: bool) -> bool {
-        if !self.vad_checked {
-            self.vad_checked = true;
-            let path = aokie_core::paths::app_data_dir().map(|dir| dir.join("models/vad/silero_vad.onnx"));
-            if let Some(path) = path.filter(|path| path.is_file()) {
-                let config = aokie_audio::vad::VadConfig {
-                    model_path: path.to_string_lossy().into_owned(),
-                    min_silence_duration: 0.064,
-                    min_speech_duration: 0.064,
-                    max_speech_duration: 15.0,
-                    threshold: 0.4,
-                    ..Default::default()
-                };
-                match aokie_audio::vad::StreamingVad::new(config) {
-                    Ok(vad) => { self.vad = Some(vad); eprintln!("[aokie-plugin] capture detector: local Silero VAD, Parakeet transcription, 200ms pre-roll"); }
-                    Err(error) => eprintln!("[aokie-plugin] Silero unavailable; using adaptive energy detector: {error}"),
-                }
-            } else {
-                eprintln!("[aokie-plugin] Silero model absent; using adaptive energy detector");
-            }
-        }
-        // Keep content-free level telemetry even when the neural detector owns
-        // the decision, so real hardware problems can be diagnosed without WAVs.
-        let energy = self.is_speech(samples, continuing);
-        if let Some(vad) = self.vad.as_mut() {
-            vad.accept_f32_samples(samples_16k);
-            let speech = vad.is_speech();
-            while vad.pop_segment().is_some() {}
-            return speech;
-        }
-        energy
+    /// Whether this frame is the caller speaking, by the adaptive energy
+    /// detector (the frame's 16 kHz copy is the pre-roll's, not its).
+    pub fn detect(&mut self, samples: &[i16], _samples_16k: &[f32], continuing: bool) -> bool {
+        self.is_speech(samples, continuing)
     }
 
     fn is_speech(&mut self, samples: &[i16], continuing: bool) -> bool {
         if samples.is_empty() { return false; }
         // DC offsets in a telephone stream are not speech. Measure the
-        // alternating component without altering the PCM sent to Parakeet.
+        // alternating component without altering the PCM itself.
         let mean = samples.iter().map(|&s| s as f64).sum::<f64>() / samples.len() as f64;
         let rms = (samples.iter().map(|&s| (s as f64 - mean).powi(2)).sum::<f64>() / samples.len() as f64).sqrt() as f32;
         self.levels.push_back(rms);

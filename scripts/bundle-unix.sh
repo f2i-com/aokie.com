@@ -4,14 +4,13 @@
 #
 #     sh scripts/bundle-unix.sh
 #
-# It builds the plugin (with voice; AOKIE_FEATURES="" for a build that only texts and rings) and the voice server,
-# and writes OUT (default: target/aokie-plugin-bundle) with the programs, the manifest, the screens, the service
-# definitions, the model list, and the speech libraries the build made. The manifest is the repository's own with
-# one change: its entry names this system's program (`aokie-plugin`, where Windows has `aokie-plugin.exe`).
-#
-# With voice it also fetches ONNX Runtime 1.25.0 for this system, the one the speech engines load by that exact
-# name from beside the plugin: Microsoft's release, checked against the digest it publishes (AOKIE_FETCH_ORT=0 to
-# skip; there is no 1.25.0 for an Intel Mac).
+# It builds the plugin with call audio (the `voice` feature: the realtime lane that streams a call to OAIY's voice
+# gateway, and the echo canceller) and writes OUT (default: target/aokie-plugin-bundle) with the program, the
+# manifest, the screens and the service definitions. Aokie has no speech of its own: OAIY Voice hears and speaks for
+# calls, so there is no ONNX Runtime, no speech engine, no voice server and no model in the bundle, and the plugin
+# downloads none. The manifest is the repository's own with one change: its entry names this system's program
+# (`aokie-plugin`, where Windows has `aokie-plugin.exe`). AOKIE_FEATURES names other features instead ("" for a
+# build that only texts and rings).
 #
 # On a Mac, libusb goes beside the plugin as a library of its own (libusb-1.0.0.dylib), built here from libusb's
 # release, with its licence and that source in third-party/libusb-<version>: libusb is LGPL-2.1, and a plugin given
@@ -22,8 +21,8 @@
 # will ask you to trust this one, as it asks for any plugin that is not signed.
 #
 # Run on a Mac (Apple silicon, macOS 27; cmake from PyPI will do, with CMAKE_POLICY_VERSION_MINIMUM=3.5 for cmake 4).
-# What it does there that Linux cannot check: the speech libraries are .dylib files, found by the plugin through its
-# own folder (crates/aokie-plugin/build.rs gives the programs that run path).
+# What it does there that Linux cannot check: libusb is a .dylib, found by the plugin through its own folder
+# (crates/aokie-plugin/build.rs gives the program that run path).
 set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -33,16 +32,16 @@ features=${AOKIE_FEATURES-voice}
 target=${CARGO_TARGET_DIR:-"$repo/target"}
 
 case "$(uname -s)" in
-  Darwin) lib=dylib; ort=libonnxruntime.1.25.0.dylib; data="$HOME/Library/Application Support/com.oaiy.app" ;;
-  Linux)  lib=so;    ort=libonnxruntime.so.1.25.0;    data="${XDG_DATA_HOME:-$HOME/.local/share}/com.oaiy.app" ;;
+  Darwin) data="$HOME/Library/Application Support/com.oaiy.app" ;;
+  Linux)  data="${XDG_DATA_HOME:-$HOME/.local/share}/com.oaiy.app" ;;
   *) echo "bundle-unix.sh is for macOS and Linux (Windows: the release job in .github/workflows/ci.yml)"; exit 1 ;;
 esac
 command -v cargo > /dev/null || { echo "bundle-unix.sh needs cargo (https://rustup.rs)"; exit 1; }
 
-# The speech stack's build reads C headers with bindgen, which loads libclang from where LIBCLANG_PATH says. The
-# repository's cargo configuration names Windows' LLVM folder there for every system that has not set its own
-# (.cargo/config.toml: [env] has no target scope), so on a Mac or on Linux the build finds no libclang at all and
-# stops minutes in. This system's own is looked for here and named to the build: a Mac has one inside Xcode's
+# The echo canceller's build (aec-rs, in call audio) reads C headers with bindgen, which loads libclang from where
+# LIBCLANG_PATH says. The repository's cargo configuration names Windows' LLVM folder there for
+# every system that has not set its own (.cargo/config.toml: [env] has no target scope), so on a Mac or on Linux the
+# build finds no libclang at all and stops minutes in. This system's own is looked for here and named to the build: a Mac has one inside Xcode's
 # toolchain (or the command line tools', or Homebrew's llvm), Linux in its LLVM packages' folders.
 if [ -n "$features" ] && [ -z "${LIBCLANG_PATH:-}" ]; then
   if [ "$(uname -s)" = Darwin ]; then
@@ -64,7 +63,7 @@ if [ -n "$features" ] && [ -z "${LIBCLANG_PATH:-}" ]; then
     echo "libclang: $LIBCLANG_PATH"
   else
     echo "no libclang was found. $missing."
-    echo "The speech stack's build needs it; set LIBCLANG_PATH to the folder it is in."
+    echo "The echo canceller's build needs it; set LIBCLANG_PATH to the folder it is in."
     exit 1
   fi
 fi
@@ -120,46 +119,16 @@ EOF
 fi
 
 cd "$repo"
-build() {
-  echo "building the plugin${features:+ (features: $features)}"
-  if [ -n "$features" ]; then
-    cargo build --release -p aokie-plugin --features "$features" ${libusb_config:+--config "$libusb_config"}
-  else
-    cargo build --release -p aokie-plugin ${libusb_config:+--config "$libusb_config"}
-  fi
-  voice_server=""
-  if [ -n "$features" ] && [ "${AOKIE_VOICE_SERVER:-1}" = 1 ]; then
-    echo "building the voice server"
-    if cargo build --release -p aokie-voice-server; then
-      voice_server="$target/release/aokie-voice-server"
-    else
-      echo "the voice server did not build here: the bundle goes on without it (the plugin's own speech stack stays)"
-    fi
-  fi
-}
-speech_libraries_built() {
-  ls "$target/release"/libsherpa-onnx*."$lib"* > /dev/null 2>&1
-}
-build
-
-# The speech libraries are put beside the programs by sherpa-onnx's build script, and only when that script runs.
-# A build folder that came back from a cache without them (CI's cache keeps what cargo tracks, and cargo does not
-# track these) gives a plugin that links and cannot start: it asks for a library that is nowhere. So that script
-# is made to run again, and a bundle that would still be without them is not laid out.
-case ",$features," in
-  *,voice,*)
-    if ! speech_libraries_built; then
-      echo "the speech libraries are not beside the build: building sherpa-onnx's part again"
-      cargo clean --release -p sherpa-rs-sys
-      build
-      speech_libraries_built || { echo "the speech libraries are still not in $target/release: the plugin could not start from a bundle of this build"; exit 1; }
-    fi ;;
-esac
+echo "building the plugin${features:+ (features: $features)}"
+if [ -n "$features" ]; then
+  cargo build --release -p aokie-plugin --features "$features" ${libusb_config:+--config "$libusb_config"}
+else
+  cargo build --release -p aokie-plugin ${libusb_config:+--config "$libusb_config"}
+fi
 
 rm -rf "$out"
 mkdir -p "$out"
 cp "$target/release/aokie-plugin" "$out/"
-[ -z "$voice_server" ] || cp "$voice_server" "$out/"
 
 # libusb beside the plugin (a Mac): the plugin must load it from there and have none of it built in, or the bundle
 # is not laid out. Its licence and the source it was built from go with it, and what may be done with them.
@@ -200,49 +169,21 @@ sed 's/"command": "aokie-plugin.exe"/"command": "aokie-plugin"/' "$manifest" > "
 
 cp -R "$repo/crates/aokie-plugin/definitions" "$out/definitions"
 cp -R "$repo/crates/aokie-plugin/ui" "$out/ui"
-cp "$repo/docs/models-manifest.json" "$repo/docs/MODEL_LICENSES.md" "$out/"
 
-# The speech libraries the build left beside the programs (sherpa-onnx and the ONNX Runtime it brings). A build
-# without voice has none. A link among them (libonnxruntime.dylib, naming the versioned file) goes in as a copy of
-# the file it names: OAIY Desktop installs and trusts a plugin made of files only, and refuses one with a link in it.
-libs=0
-for file in "$target/release"/libsherpa-onnx*."$lib"* "$target/release"/libonnxruntime*."$lib"*; do
-  [ -e "$file" ] || continue
-  cp -L "$file" "$out/"
-  libs=$((libs + 1))
-done
-
-# ONNX Runtime 1.25.0 for the engines that run on it (Parakeet, Pocket TTS). sherpa-onnx brings an older one of
-# its own under the unversioned name; the versioned name is the one those engines look for first (voice.rs).
-if [ -n "$features" ] && [ "${AOKIE_FETCH_ORT:-1}" = 1 ]; then
-  case "$(uname -s)-$(uname -m)" in
-    Darwin-arm64)  ort_pack=onnxruntime-osx-arm64-1.25.0;     ort_sum=65405dc8793c86cadb98b5e07f6d3bdde84f8300f1b030d4736b41c17610d6c1 ;;
-    Linux-x86_64)  ort_pack=onnxruntime-linux-x64-1.25.0;     ort_sum=e0a8998e70416801f9a634a8ea1d369a255ff109741469f9d99cf369a46a1492 ;;
-    Linux-aarch64) ort_pack=onnxruntime-linux-aarch64-1.25.0; ort_sum=849c04634e76446bbe0a92f67955a9641415c37f11930804066057bf9eadbd03 ;;
-    *) ort_pack=""; echo "ONNX Runtime 1.25.0 has no release for $(uname -s) $(uname -m): the engines that run on it stay off" ;;
-  esac
-  if [ -n "$ort_pack" ]; then
-    work="$target/onnxruntime-1.25.0"
-    mkdir -p "$work"
-    archive="$work/$ort_pack.tgz"
-    if [ ! -s "$archive" ]; then
-      echo "fetching $ort_pack.tgz"
-      curl -fsSL -o "$archive" "https://github.com/microsoft/onnxruntime/releases/download/v1.25.0/$ort_pack.tgz" || rm -f "$archive"
-    fi
-    if [ -s "$archive" ]; then
-      got=$(sha256_of "$archive")
-      if [ "$got" != "$ort_sum" ]; then
-        rm -f "$archive"
-        echo "$ort_pack.tgz is not the published release (sha256 $got): not used, and removed"
-        exit 1
-      fi
-      tar -xzf "$archive" -C "$work" "$ort_pack/lib/$ort"
-      cp "$work/$ort_pack/lib/$ort" "$out/"
-      libs=$((libs + 1))
-    else
-      echo "ONNX Runtime 1.25.0 could not be fetched (no network?): the bundle goes on without it"
-    fi
+# The libraries the program asks for from beside it: the @rpath names in its load commands on a Mac, the NEEDED
+# names on Linux. Aokie has no speech of its own, so none of them may be a speech library (ONNX Runtime,
+# sherpa-onnx): a plugin that asked for one could not start from a folder that has none.
+linked_libraries() {
+  if [ "$(uname -s)" = Darwin ]; then
+    otool -L "$1" | sed -n 's|^[[:space:]]*@rpath/\([^ ]*\) (.*|\1|p'
+  elif command -v readelf > /dev/null; then
+    readelf -d "$1" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p'
+  else
+    objdump -p "$1" | awk '$1 == "NEEDED" { print $2 }'
   fi
+}
+if linked_libraries "$out/aokie-plugin" | grep -i -e onnxruntime -e sherpa; then
+  echo "the plugin links a speech library above: Aokie has no speech of its own, and the bundle carries none"; exit 1
 fi
 
 # Realtek's RTL8761B (USB) firmware, its config and their licence (pinned, as scripts/fetch-realtek-firmware.ps1
@@ -280,17 +221,7 @@ links=$(find "$out" -type l)
 
 echo
 echo "the bundle: $out"
-echo "  $(find "$out" -type f | wc -l | tr -d ' ') files, $libs speech libraries${voice_server:+, the voice server}"
-if [ -n "$features" ] && [ "$libs" = 0 ]; then
-  echo "  NOTE: a voice build with no speech library beside it: the plugin will not find sherpa-onnx when it starts."
-fi
-if [ -n "$features" ]; then
-  if [ ! -e "$out/$ort" ]; then
-    echo "  NOTE: $ort is not in the bundle. The speech engines that run on ONNX Runtime 1.25.0"
-    echo "  look for it beside the plugin; without it Aokie says so in its health and lets calls ring through"
-    echo "  instead of answering them itself (a call OAIY's voice answers does not need it)."
-  fi
-fi
+echo "  $(find "$out" -type f | wc -l | tr -d ' ') files, $(du -sh "$out" | cut -f1 | tr -d ' '): no speech of Aokie's own (OAIY Voice hears and speaks), nothing to download"
 if [ "$(uname -s)" = Linux ]; then
   echo "  On Linux the plugin uses the system's libusb (libusb-1.0.so.0: Debian and Ubuntu's libusb-1.0-0, which a"
   echo "  desktop install has). Where it is missing the plugin does not start, and its log says which library."

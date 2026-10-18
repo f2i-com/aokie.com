@@ -32,3 +32,10 @@ pub(super) const ADMISSION_SAFETY_MARGIN_SECONDS: u64 = 10;
 pub(super) const RELAY_TRANSPORT: &str = "relay";
 pub(super) const MIN_TURN_CREDENTIAL_TTL_SECONDS: u64 = 30;
 pub(super) const MAX_TURN_CREDENTIAL_TTL_SECONDS: u64 = 24 * 60 * 60;
+
+/// A private voice consult has Aokie speak the question to a Companion user
+/// and transcribe their answer, with speech of its own that Aokie no longer
+/// has (OAIY Voice hears and speaks for calls). The gateway never offers one
+/// (`voiceConsult: false`, no consult offer), so a claim for one is refused
+/// as `mode_unavailable`, and the radio ends at once any that still opens.
+pub(super) const PRIVATE_CONSULT_AVAILABLE: bool = false;

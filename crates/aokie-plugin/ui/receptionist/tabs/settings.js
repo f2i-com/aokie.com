@@ -8,7 +8,10 @@
  * offers Aokie's own speech engines, voices, model or endpoint pickers — the
  * call voice, the model and the replies are set in OAIY, and the form says
  * where. What Aokie still owns is here: whether it answers, the greeting and
- * brief it sends with each call, conversation handling and the hardware.
+ * brief it sends with each call, who is answered and the hardware. Aokie has
+ * no speech of its own, so nothing here needs it: a call that does not go to
+ * OAIY is answered by nobody (it rings through), and the form says to send
+ * calls to OAIY.
  *
  * Reads via `settings.get`, writes ONLY the fields the operator changed via
  * `settings.set` (the plugin merges per key, so untouched safety keys like
@@ -439,15 +442,17 @@
           '</p>'
       );
     } else {
+      // Off OAIY's route the receptionist would be Aokie's own, and flows and
+      // you would speak in its voice: it has none. Another realtime provider
+      // answers ordinary callers, but the lines Aokie says itself need a voice.
       var where =
         route === 'realtime'
-          ? 'another realtime provider (' + esc(OAIY.realtimeProviderId(baseline.realtimeVoiceEndpoint) || 'unknown') + ')'
-          : route === 'local'
-            ? 'Aokie’s own older speech and model on this computer'
-            : 'no AI receptionist — your flows or you speak to callers';
+          ? 'They are answered by another realtime provider (' + esc(OAIY.realtimeProviderId(baseline.realtimeVoiceEndpoint) || 'unknown') + '). ' +
+            'Aokie has no voice of its own there, so its own lines (a screened caller’s message, the hold announcements) are not said and manager numbers ring through.'
+          : esc(OAIY.noOwnSpeech) + ', so nobody answers them: they ring through to you.';
       html.push(
         '<p class="rcp-notice rcp-notice--warn" role="status"><strong>Calls do not go to OAIY.</strong> ' +
-          'They are answered by ' + where + '. Sending them to OAIY lets the Front desk agent answer in the OAIY voice; ' +
+          where + ' Sending them to OAIY lets the Front desk agent answer in the OAIY voice; ' +
           'it applies after the receptionist restarts.</p>' +
           '<div class="rcp-actions">' +
           '<button type="button" class="rcp-button is-primary" data-act="set-route-oaiy"' +
@@ -466,7 +471,7 @@
           );
         }).join('') +
         '</div>' +
-        hint('These are set in OAIY Desktop, on the pages linked here. Aokie’s older speech engines, voices and model settings are not used for calls that go to OAIY.')
+        hint('These are set in OAIY Desktop, on the pages linked here. Aokie has no speech engines, voices or model of its own: all of these are OAIY’s.')
     );
     return html.join('');
   }
@@ -475,24 +480,31 @@
    *  plugin refuses Desktop realtime without it), and OAIY Voice does the
    *  turn-taking, so Aokie's own pause and interruption settings step aside. */
   function answeringHtml(route) {
-    var toOaiy = route === 'oaiy';
-    var receptionist = toOaiy
+    var viaRealtime = route === 'oaiy' || route === 'realtime';
+    // Off the realtime routes the receptionist would be Aokie's own, which
+    // has no speech: nobody answers there, so there is no switch for it.
+    var receptionist = viaRealtime
       ? '<label class="rcp-check"><input type="checkbox" checked disabled /><span>The AI receptionist answers calls</span></label>' +
-        hint('Always on while calls go to OAIY. To stop the Front desk answering, turn off Answer phone calls in ' + U.navLink('agent', 'Agent') + ' › Phone.')
-      : check('aiReceptionist', 'The AI receptionist answers calls') +
-        hint('When off, Aokie only bridges the call: your flows or you (Speak, on the Overview) talk to the caller.');
+        hint(
+          route === 'oaiy'
+            ? 'Always on while calls go to OAIY. To stop the Front desk answering, turn off Answer phone calls in ' + U.navLink('agent', 'Agent') + ' › Phone.'
+            : 'Always on while calls go to a realtime provider.'
+        )
+      : hint(esc(OAIY.noOwnSpeech) + ', so nobody answers calls here. Send calls to OAIY, above, and the Front desk answers them.', true);
     return section(
       'Answering',
       receptionist +
         check('autoAnswer', 'Auto-answer incoming calls') +
         hint(
-          toOaiy
+          route === 'oaiy'
             ? 'The phone rings until OAIY is ready to answer. If OAIY cannot be reached, it keeps ringing through to you.'
-            : 'Aokie picks up as soon as a call rings.'
+            : viaRealtime
+              ? 'Aokie picks up once the provider is ready.'
+              : 'Applies once calls go to OAIY: until then they ring through to you.'
         ) +
         check('agentHangup', 'The receptionist can end the call') +
         hint('Lets the receptionist hang up once the caller is done and the goodbye is said. When off, it leaves the line open for the caller to hang up. Applies after the receptionist restarts.') +
-        (toOaiy
+        (route === 'oaiy'
           ? hint('OAIY Voice decides when the caller has finished and stops a reply when the caller talks over it.')
           : '')
     );
@@ -615,32 +627,6 @@
     );
   }
 
-  /** Aokie's own turn-taking — used only when Aokie's older speech answers. */
-  function tuningHtml() {
-    return section(
-      'Conversation tuning',
-      hint('These apply to calls Aokie’s own speech answers, not to calls that go to OAIY.') +
-        field(
-          'Wait after the caller pauses (ms)',
-          '<input type="number" data-num="sttEndpointMs" min="150" max="2000" step="50" value="' +
-            esc(settings.sttEndpointMs) + '" />'
-        ) +
-        hint(
-          'How long the caller must pause before Aokie treats their turn as finished. Lower = snappier, but risks cutting off mid-sentence pauses.'
-        ) +
-        check('bargeIn', 'Listen while speaking and allow interruptions') +
-        hint('Keep the caller’s words while Aokie talks. Sustained speech or “stop” makes Aokie yield; brief interjections are kept for the next turn. Requires live call transcription. Applies after reconnecting.') +
-        check('conversationAcknowledgements', 'Let Aokie briefly acknowledge longer explanations') +
-        hint('A short “Mm-hm” at a brief pause lets the caller know Aokie is listening. Their turn stays open, and they can interrupt the acknowledgement. Requires listening while speaking; applies after reconnecting.') +
-        field(
-          'Interruption threshold',
-          '<input type="number" data-num="bargeSensitivity" min="100" max="2000" step="25" value="' +
-            esc(settings.bargeSensitivity) + '" />'
-        ) +
-        hint('Lower = easier to interrupt; too low may react to background noise. Start around 550–650. With listening off, caller recognition is muted during replies.')
-    );
-  }
-
   /** Hardware: the Bluetooth link. */
   function advancedHtml(viaRealtime) {
     var codecOpts = [];
@@ -701,7 +687,6 @@
       answeringHtml(route) +
       allowedHtml() +
       greetingHtml(route) +
-      (viaRealtime ? '' : tuningHtml()) +
       advancedHtml(viaRealtime) +
       // ---- Actions ---------------------------------------------------------
       // ⚠️ NOT type="submit": the sandboxed iframe (allow-scripts only, CSP

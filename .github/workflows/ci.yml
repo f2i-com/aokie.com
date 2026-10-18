@@ -49,24 +49,16 @@ jobs:
       - name: Cargo cache
         uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
 
-      # Windows runners have no wmic, which sherpa-onnx's CMake reads the OS name from, and the voice build fails
-      # without it. The repair script makes that probe optional in the crate's registry copy, before any build.
-      - name: sherpa-onnx without wmic
-        shell: pwsh
-        run: |
-          cargo fetch
-          ./scripts/repair-sherpa-cmake.ps1 -CargoRegistry
-
       # The WHOLE shipping workspace (audit AOK-CI-001): core, bluetooth, db,
-      # audio, ai, dongle, voice-server, receptionist AND the plugin — the
+      # audio, dongle, receptionist AND the plugin — the
       # radio/recovery logic lives in crates the old plugin-only run never
       # touched. Contract drift gates, call lifecycle, outbox, endpoint
       # classification and truthful health all ride along.
       - name: Tests (workspace)
-        run: cargo test --workspace --features transcribe-rs/openai
+        run: cargo test --workspace
 
   plugin-voice:
-    name: aokie-plugin (test + clippy, voice features)
+    name: aokie-plugin (test + clippy, voice feature)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -79,21 +71,13 @@ jobs:
       - name: Cargo cache
         uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
 
-      # Windows runners have no wmic, which sherpa-onnx's CMake reads the OS name from, and the voice build fails
-      # without it. The repair script makes that probe optional in the crate's registry copy, before any build.
-      - name: sherpa-onnx without wmic
-        shell: pwsh
-        run: |
-          cargo fetch
-          ./scripts/repair-sherpa-cmake.ps1 -CargoRegistry
-
-      # The voice build compiles a distinct cfg surface (agent, AEC, TTS/STT
-      # runtimes) that the default build never touches. Audit AK-15: the
-      # SHIPPING feature set is now TESTED and clippy-linted here, not merely
-      # cargo-checked — a failing #[cfg(feature = "voice")] test or deny-level
-      # lint blocks the release chain (plugin-release depends on this job).
-      # --test-threads=2: the synthetic-audio/QuickJS timing tests are a
-      # documented flake class under full parallel load.
+      # The voice build compiles a distinct cfg surface (the realtime lane to
+      # OAIY, AEC, the call loop) that the default build never touches. Audit
+      # AK-15: the SHIPPING feature set is TESTED and clippy-linted here, not
+      # merely cargo-checked — a failing #[cfg(feature = "voice")] test or
+      # deny-level lint blocks the release chain (plugin-release depends on
+      # this job). --test-threads=2: the synthetic-audio/QuickJS timing tests
+      # are a documented flake class under full parallel load.
       - name: Tests (voice)
         run: cargo test -p aokie-plugin --features voice -- --test-threads=2
 
@@ -112,13 +96,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
 
-      # Windows runners have no wmic, which sherpa-onnx's CMake reads the OS name from, and the voice build fails
-      # without it. The repair script makes that probe optional in the crate's registry copy, before any build.
-      - name: sherpa-onnx without wmic
-        shell: pwsh
-        run: |
-          cargo fetch
-          ./scripts/repair-sherpa-cmake.ps1 -CargoRegistry
       - name: Check plugin (voice,managed-beta-driver)
         run: cargo check -p aokie-plugin --features voice,managed-beta-driver
       - name: Check driver helper (managed-beta-driver)
@@ -161,15 +138,8 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
 
-      # Windows runners have no wmic, which sherpa-onnx's CMake reads the OS name from, and the voice build fails
-      # without it. The repair script makes that probe optional in the crate's registry copy, before any build.
-      - name: sherpa-onnx without wmic
-        shell: pwsh
-        run: |
-          cargo fetch
-          ./scripts/repair-sherpa-cmake.ps1 -CargoRegistry
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --features transcribe-rs/openai
+        run: cargo clippy --workspace --all-targets
 
   # Supply-chain gate (audit AOK-CI-001): RustSec advisories fail CI — accept
   # an unavoidable one explicitly via audit.toml with a documented reason.
@@ -193,8 +163,8 @@ jobs:
 
   # Audit PKG-001 + TRUST-001 + DIST-001: the RELEASE bundle — helper built
   # first so its post-build SHA-256 can be pinned into the plugin (the
-  # aokie-dongle release gate), then plugin (voice) + helper + VOICE SERVER +
-  # manifests + checksums, first-party-signed (package-manifest.json) and, on
+  # aokie-dongle release gate), then plugin (voice) + helper + manifests +
+  # checksums, first-party-signed (package-manifest.json) and, on
   # tags, published as a DURABLE release asset. Tag builds FAIL without the
   # required signing credentials (Authenticode cert + package signing key);
   # workflow_dispatch smoke builds may proceed unsigned with loud warnings.
@@ -220,14 +190,6 @@ jobs:
 
       - name: Cargo cache
         uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
-
-      # Windows runners have no wmic, which sherpa-onnx's CMake reads the OS name from, and the voice build fails
-      # without it. The repair script makes that probe optional in the crate's registry copy, before any build.
-      - name: sherpa-onnx without wmic
-        shell: pwsh
-        run: |
-          cargo fetch
-          ./scripts/repair-sherpa-cmake.ps1 -CargoRegistry
 
       # Audit AOK-REL-001: the ONLY correct order is
       #   build helper → SIGN helper → VERIFY signature → hash the SIGNED
@@ -307,17 +269,13 @@ jobs:
             $sha = (Get-FileHash target/release/aokie-driver-helper.exe -Algorithm SHA256).Hash.ToLower()
             "final helper sha256 = $sha"
             $env:AOKIE_EXPECTED_HELPER_SHA256 = $sha
+            # Aokie has no speech of its own (OAIY Voice hears and speaks): no
+            # voice server, speech libraries or model list ship beside it.
             cargo build -p aokie-plugin --features voice --release
             if ($LASTEXITCODE -ne 0) { throw "plugin build failed" }
 
-            # DIST-001: the voice SERVER ships in the same bundle — FormLogic's
-            # voice-service template expects aokie-voice-server.exe beside the
-            # plugin, and a bundle without it was a phone with no speech stack.
-            cargo build -p aokie-voice-server --release
-            if ($LASTEXITCODE -ne 0) { throw "voice server build failed" }
-
             if ($signingEnabled) {
-              foreach ($exe in @('target/release/aokie-plugin.exe', 'target/release/aokie-voice-server.exe')) {
+              foreach ($exe in @('target/release/aokie-plugin.exe')) {
                 & $signtool sign /f $pfx /p $env:CERT_PASS /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $exe
                 if ($LASTEXITCODE -ne 0) { throw "signing failed: $exe" }
                 $signedExecutables += $exe
@@ -325,11 +283,11 @@ jobs:
               # Verify EVERY intended final executable before any release
               # metadata is written; the helper's post-sign pin above is
               # unchanged because signing the plugin never touches the helper.
-              foreach ($exe in @('target/release/aokie-driver-helper.exe', 'target/release/aokie-plugin.exe', 'target/release/aokie-voice-server.exe')) {
+              foreach ($exe in @('target/release/aokie-driver-helper.exe', 'target/release/aokie-plugin.exe')) {
                 & $signtool verify /pa $exe
                 if ($LASTEXITCODE -ne 0) { throw "signature verification failed: $exe" }
               }
-              if ($signedExecutables.Count -ne 3) { throw "expected 3 signed executables, signed $($signedExecutables.Count)" }
+              if ($signedExecutables.Count -ne 2) { throw "expected 2 signed executables, signed $($signedExecutables.Count)" }
               $packagedHelper = (Get-FileHash target/release/aokie-driver-helper.exe -Algorithm SHA256).Hash.ToLower()
               if ($packagedHelper -ne $sha) { throw "helper bytes changed after its hash was pinned ($sha -> $packagedHelper)" }
             }
@@ -342,37 +300,7 @@ jobs:
           Set-Content -Encoding ascii pinned-helper-sha.txt $sha
           Set-Content -Encoding ascii signing-state.txt $(if ($signingEnabled) { 'signed' } else { 'unsigned' })
 
-      # sherpa-rs-sys's build script copies its DLLs beside the binaries, but only when it runs: with its build restored
-      # from the cache it does not, and the cache keeps its output folder but not those copies (a release built on a warm
-      # cache had no sherpa-onnx-c-api.dll). Take any that are missing from that folder.
-      - name: sherpa-onnx's DLLs beside the binaries
-        shell: pwsh
-        run: |
-          foreach ($name in 'onnxruntime.dll', 'onnxruntime_providers_shared.dll', 'sherpa-onnx-c-api.dll', 'sherpa-onnx-cxx-api.dll') {
-            if (Test-Path -LiteralPath "target/release/$name") { continue }
-            $source = Get-ChildItem -Path target/release/build -Filter $name -Recurse -File |
-              Where-Object { $_.FullName -like '*\sherpa-rs-sys-*\out\lib\*' } |
-              Sort-Object LastWriteTime -Descending | Select-Object -First 1
-            if (-not $source) { throw "$name is neither beside the binaries nor in a sherpa-rs-sys build" }
-            Copy-Item -LiteralPath $source.FullName "target/release/$name"
-            "took $name from $($source.FullName)"
-          }
-
-      # The ort engines (Pocket-TTS, Parakeet) load ONNX Runtime 1.25.0 by that exact name from beside the exe
-      # (crates/aokie-plugin/src/voice.rs, ensure_ort_dylib); sherpa's own onnxruntime.dll is 1.17.1 and cannot run
-      # them, and scripts/verify-bundle-assets.ps1 requires both. Microsoft's release, pinned by the digest it publishes.
-      - name: ONNX Runtime 1.25.0 for the ort engines
-        shell: pwsh
-        run: |
-          $zip = Join-Path $env:RUNNER_TEMP 'onnxruntime-win-x64-1.25.0.zip'
-          Invoke-WebRequest -Uri 'https://github.com/microsoft/onnxruntime/releases/download/v1.25.0/onnxruntime-win-x64-1.25.0.zip' -OutFile $zip
-          $sha = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
-          if ($sha -ne 'da753f762bf2400e7191ec594086b186a7051d5af8dc886f6e2020c2403df738') { throw "onnxruntime-win-x64-1.25.0.zip is not the published release ($sha)" }
-          Expand-Archive -LiteralPath $zip -DestinationPath (Join-Path $env:RUNNER_TEMP 'ort') -Force
-          Copy-Item (Join-Path $env:RUNNER_TEMP 'ort/onnxruntime-win-x64-1.25.0/lib/onnxruntime.dll') target/release/onnxruntime_1.25.0.dll
-
-      # Audit AOK-REL-002: a voice release without its runtime is a phone
-      # that can't hear or speak — missing assets FAIL the release, and the
+      # Audit AOK-REL-002: missing assets FAIL the release, and the
       # pin/signature invariants are re-checked on the exact bytes packaged.
       - name: Assemble + verify bundle (fail closed)
         shell: pwsh
@@ -380,28 +308,17 @@ jobs:
           New-Item -ItemType Directory -Force bundle | Out-Null
           Copy-Item target/release/aokie-plugin.exe bundle/
           Copy-Item target/release/aokie-driver-helper.exe bundle/
-          Copy-Item target/release/aokie-voice-server.exe bundle/
           Copy-Item crates/aokie-plugin/manifest.json bundle/
           # Resolve every declared definition and UI file before inventory/signing.
           Copy-Item crates/aokie-plugin/definitions bundle/definitions -Recurse
           Copy-Item crates/aokie-plugin/ui bundle/ui -Recurse
-          # DIST-001: the model-bundle manifest (required voice models with
-          # pinned digests) rides in every release so installers can verify
-          # staged model files byte-for-byte.
-          Copy-Item docs/models-manifest.json bundle/
-          Copy-Item docs/MODEL_LICENSES.md bundle/
           New-Item -ItemType Directory -Force bundle/driver-package | Out-Null
           Copy-Item drivers/winusb/aokie_winusb_bluetooth.inf bundle/driver-package/
           Copy-Item drivers/winusb/aokie_winusb_bluetooth.cat bundle/driver-package/
-          $dll = Get-ChildItem target/release -Filter 'onnxruntime*.dll' -ErrorAction SilentlyContinue
-          if (-not $dll) { throw "AOK-REL-002: voice release requires onnxruntime*.dll beside the plugin exe — none found; the packaged receptionist could not transcribe or speak" }
-          $dll | Copy-Item -Destination bundle/
-          Copy-Item target/release/sherpa-onnx-c-api.dll bundle/
-          Copy-Item target/release/sherpa-onnx-cxx-api.dll bundle/
           # Realtek's RTL8761B firmware, its config and their licence, pinned: Aokie loads them into such a dongle at each
           # start (realtek.rs), which a phone does not see on its ROM alone
           ./scripts/fetch-realtek-firmware.ps1 -Destination bundle/firmware/rtl_bt
-          ./scripts/verify-bundle-assets.ps1 -Bundle bundle -Voice
+          ./scripts/verify-bundle-assets.ps1 -Bundle bundle
 
           # Cross-check: the helper bytes being PACKAGED must hash to the pin
           # the plugin was built with — one byte of drift fails the release.
@@ -415,7 +332,7 @@ jobs:
           $signingState = (Get-Content signing-state.txt -Raw).Trim()
           if ($signingState -eq 'signed') {
             $signtool = (Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" | Select-Object -Last 1).FullName
-            foreach ($exe in @('bundle/aokie-plugin.exe', 'bundle/aokie-driver-helper.exe', 'bundle/aokie-voice-server.exe')) {
+            foreach ($exe in @('bundle/aokie-plugin.exe', 'bundle/aokie-driver-helper.exe')) {
               & $signtool verify /pa $exe
               if ($LASTEXITCODE -ne 0) { throw "packaged executable is not signed although the build reported signed: $exe" }
             }
@@ -522,7 +439,7 @@ jobs:
         run: |
           $zip = "aokie-plugin-windows-${{ github.ref_name }}.zip"
           Compress-Archive -Path bundle/* -DestinationPath $zip
-          gh release create '${{ github.ref_name }}' --verify-tag --title 'Aokie ${{ github.ref_name }}' --notes 'Signed Aokie plugin bundle (plugin + driver helper + voice server + manifests + checksums). Verify with SHA256SUMS.txt and the package-manifest.json publisher signature.' $zip bundle/SHA256SUMS.txt bundle/release-manifest.json bundle/package-manifest.json
+          gh release create '${{ github.ref_name }}' --verify-tag --title 'Aokie ${{ github.ref_name }}' --notes 'Signed Aokie plugin bundle (plugin + driver helper + manifests + checksums). Aokie has no speech of its own: calls go to OAIY, whose OAIY Voice hears and speaks. Verify with SHA256SUMS.txt and the package-manifest.json publisher signature.' $zip bundle/SHA256SUMS.txt bundle/release-manifest.json bundle/package-manifest.json
           if ($LASTEXITCODE -ne 0) { throw "release publish failed" }
 
   # The managed-beta bundle (README, "Managed-beta driver build"): for administrator-managed pilots while the
@@ -550,17 +467,9 @@ jobs:
       - name: Cargo cache
         uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
 
-      # Windows runners have no wmic, which sherpa-onnx's CMake reads the OS name from, and the voice build fails
-      # without it. The repair script makes that probe optional in the crate's registry copy, before any build.
-      - name: sherpa-onnx without wmic
-        shell: pwsh
-        run: |
-          cargo fetch
-          ./scripts/repair-sherpa-cmake.ps1 -CargoRegistry
-
       # The production job's order, less the signing of executables: the helper first, its hash pinned into the plugin
-      # (the release gate of aokie-dongle), then the plugin and the voice server.
-      - name: Build the managed-beta helper, pin its hash, build the plugin and the voice server
+      # (the release gate of aokie-dongle), then the plugin.
+      - name: Build the managed-beta helper, pin its hash, build the plugin
         shell: pwsh
         run: |
           $env:AOKIE_EXPECTED_HELPER_SHA256 = 'helper-build-placeholder'
@@ -571,38 +480,7 @@ jobs:
           $env:AOKIE_EXPECTED_HELPER_SHA256 = $sha
           cargo build -p aokie-plugin --features voice,managed-beta-driver --release
           if ($LASTEXITCODE -ne 0) { throw "plugin build failed" }
-          cargo build -p aokie-voice-server --release
-          if ($LASTEXITCODE -ne 0) { throw "voice server build failed" }
           Set-Content -Encoding ascii pinned-helper-sha.txt $sha
-
-      # sherpa-rs-sys's build script copies its DLLs beside the binaries, but only when it runs: with its build restored
-      # from the cache it does not, and the cache keeps its output folder but not those copies (a release built on a warm
-      # cache had no sherpa-onnx-c-api.dll). Take any that are missing from that folder.
-      - name: sherpa-onnx's DLLs beside the binaries
-        shell: pwsh
-        run: |
-          foreach ($name in 'onnxruntime.dll', 'onnxruntime_providers_shared.dll', 'sherpa-onnx-c-api.dll', 'sherpa-onnx-cxx-api.dll') {
-            if (Test-Path -LiteralPath "target/release/$name") { continue }
-            $source = Get-ChildItem -Path target/release/build -Filter $name -Recurse -File |
-              Where-Object { $_.FullName -like '*\sherpa-rs-sys-*\out\lib\*' } |
-              Sort-Object LastWriteTime -Descending | Select-Object -First 1
-            if (-not $source) { throw "$name is neither beside the binaries nor in a sherpa-rs-sys build" }
-            Copy-Item -LiteralPath $source.FullName "target/release/$name"
-            "took $name from $($source.FullName)"
-          }
-
-      # The ort engines (Pocket-TTS, Parakeet) load ONNX Runtime 1.25.0 by that exact name from beside the exe
-      # (crates/aokie-plugin/src/voice.rs, ensure_ort_dylib); sherpa's own onnxruntime.dll is 1.17.1 and cannot run
-      # them, and scripts/verify-bundle-assets.ps1 requires both. Microsoft's release, pinned by the digest it publishes.
-      - name: ONNX Runtime 1.25.0 for the ort engines
-        shell: pwsh
-        run: |
-          $zip = Join-Path $env:RUNNER_TEMP 'onnxruntime-win-x64-1.25.0.zip'
-          Invoke-WebRequest -Uri 'https://github.com/microsoft/onnxruntime/releases/download/v1.25.0/onnxruntime-win-x64-1.25.0.zip' -OutFile $zip
-          $sha = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
-          if ($sha -ne 'da753f762bf2400e7191ec594086b186a7051d5af8dc886f6e2020c2403df738') { throw "onnxruntime-win-x64-1.25.0.zip is not the published release ($sha)" }
-          Expand-Archive -LiteralPath $zip -DestinationPath (Join-Path $env:RUNNER_TEMP 'ort') -Force
-          Copy-Item (Join-Path $env:RUNNER_TEMP 'ort/onnxruntime-win-x64-1.25.0/lib/onnxruntime.dll') target/release/onnxruntime_1.25.0.dll
 
       - name: Assemble + verify bundle (fail closed)
         shell: pwsh
@@ -610,21 +488,13 @@ jobs:
           New-Item -ItemType Directory -Force bundle | Out-Null
           Copy-Item target/release/aokie-plugin.exe bundle/
           Copy-Item target/release/aokie-driver-helper.exe bundle/
-          Copy-Item target/release/aokie-voice-server.exe bundle/
           Copy-Item crates/aokie-plugin/manifest.json bundle/
           Copy-Item crates/aokie-plugin/definitions bundle/definitions -Recurse
           Copy-Item crates/aokie-plugin/ui bundle/ui -Recurse
-          Copy-Item docs/models-manifest.json bundle/
-          Copy-Item docs/MODEL_LICENSES.md bundle/
-          $dll = Get-ChildItem target/release -Filter 'onnxruntime*.dll' -ErrorAction SilentlyContinue
-          if (-not $dll) { throw "AOK-REL-002: voice release requires onnxruntime*.dll beside the plugin exe — none found" }
-          $dll | Copy-Item -Destination bundle/
-          Copy-Item target/release/sherpa-onnx-c-api.dll bundle/
-          Copy-Item target/release/sherpa-onnx-cxx-api.dll bundle/
           # Realtek's RTL8761B firmware, its config and their licence, pinned: Aokie loads them into such a dongle at each
           # start (realtek.rs), which a phone does not see on its ROM alone
           ./scripts/fetch-realtek-firmware.ps1 -Destination bundle/firmware/rtl_bt
-          ./scripts/verify-bundle-assets.ps1 -Bundle bundle -Voice
+          ./scripts/verify-bundle-assets.ps1 -Bundle bundle
 
           $pinned = (Get-Content pinned-helper-sha.txt -Raw).Trim()
           $packaged = (Get-FileHash bundle/aokie-driver-helper.exe -Algorithm SHA256).Hash.ToLower()
@@ -751,10 +621,10 @@ jobs:
       - name: Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07
 
-      # No build cache, as in unix-bundle.yml: a build folder from a cache is without the speech libraries
-      # sherpa-onnx's build script put in it, and a release is built whole.
+      # No build cache, as in unix-bundle.yml: a release is built whole.
 
-      # (cmake 4 builds the speech stack's older CMake files only with a minimum policy named)
+      # Aokie has no speech of its own: no ONNX Runtime, speech engine, voice server or model goes in the bundle.
+      # (cmake 4 builds older CMake files only with a minimum policy named)
       - name: Build and lay out the plugin
         env:
           CMAKE_POLICY_VERSION_MINIMUM: '3.5'
@@ -877,7 +747,7 @@ jobs:
           if ! grep -q 'aokie-plugin-macos-arm64' notes.md; then
             cat >> notes.md <<EOF
 
-          **On a Mac (Apple silicon, macOS 11 or later):** $zip is the same plugin for macOS, signed with the same package key (fl-aokie-2026a), so OAIY verifies it as Aokie's; $zip.sha256 is its checksum. Install it the same way: in OAIY Desktop, Connections, Plugins, Install a plugin. On a Mac, Aokie opens the USB Bluetooth dongle itself through libusb: no driver is installed, and there is no fallback to the computer's own Bluetooth (docs/HARDWARE.md, macOS). Its programs are signed ad hoc, not with an Apple Developer ID, so the login Keychain asks before Aokie uses its key after each new version. libusb is LGPL-2.1 and comes as a library beside the plugin, with its licence and source in third-party/. Built from $GITHUB_SHA.
+          **On a Mac (Apple silicon, macOS 11 or later):** $zip is the plugin for macOS, signed with the same package key (fl-aokie-2026a), so OAIY verifies it as Aokie's; $zip.sha256 is its checksum. Install it the same way: in OAIY Desktop, Connections, Plugins, Install a plugin. On a Mac, Aokie opens the USB Bluetooth dongle itself through libusb: no driver is installed, and there is no fallback to the computer's own Bluetooth (docs/HARDWARE.md, macOS). Its programs are signed ad hoc, not with an Apple Developer ID, so the login Keychain asks before Aokie uses its key after each new version. libusb is LGPL-2.1 and comes as a library beside the plugin, with its licence and source in third-party/. Aokie has no speech of its own: calls go to OAIY, whose OAIY Voice hears and speaks, and nothing is downloaded. Built from $GITHUB_SHA.
           EOF
             gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file notes.md
           fi
@@ -904,7 +774,7 @@ jobs:
 
       # As unix-bundle.yml: libusb and udev for the USB transport, libdbus for the Secret Service the sealing key is
       # kept in, ALSA and the X libraries for libwebrtc, and clang 21 (libwebrtc's libc++ asks for it; 22.04 has 14).
-      # No build cache, for the same reason as the Mac's.
+      # No build cache, as for the Mac's.
       - name: Linux build dependencies
         run: |
           sudo apt-get update
@@ -1042,7 +912,7 @@ jobs:
           if ! grep -q 'aokie-plugin-linux-x86_64' notes.md; then
             cat >> notes.md <<EOF
 
-          **On Linux (x86_64; Ubuntu 22.04 or later, or a distribution as recent):** $zip is the same plugin for Linux, signed with the same package key (fl-aokie-2026a), so OAIY verifies it as Aokie's; $zip.sha256 is its checksum. Install it the same way: in OAIY Desktop, Connections, Plugins, Install a plugin. On Linux, Aokie opens the USB Bluetooth dongle itself through the system's libusb: its dongle setup step puts a udev rule in place (the desktop asks for your password) that gives the dongle to you, and Aokie takes it from the system's Bluetooth only while it runs. Only a dongle in Aokie's catalog is used: the computer's own Bluetooth is left to the system. What Aokie keeps (the phone's pairing keys, texts and transcripts) is sealed under a key in the desktop's keyring (the Secret Service: GNOME Keyring, KWallet). Built from $GITHUB_SHA.
+          **On Linux (x86_64; Ubuntu 22.04 or later, or a distribution as recent):** $zip is the plugin for Linux, signed with the same package key (fl-aokie-2026a), so OAIY verifies it as Aokie's; $zip.sha256 is its checksum. Install it the same way: in OAIY Desktop, Connections, Plugins, Install a plugin. On Linux, Aokie opens the USB Bluetooth dongle itself through the system's libusb: its dongle setup step puts a udev rule in place (the desktop asks for your password) that gives the dongle to you, and Aokie takes it from the system's Bluetooth only while it runs. Only a dongle in Aokie's catalog is used: the computer's own Bluetooth is left to the system. What Aokie keeps (the phone's pairing keys, texts and transcripts) is sealed under a key in the desktop's keyring (the Secret Service: GNOME Keyring, KWallet). Aokie has no speech of its own: calls go to OAIY, whose OAIY Voice hears and speaks, and nothing is downloaded. Built from $GITHUB_SHA.
           EOF
             gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file notes.md
           fi

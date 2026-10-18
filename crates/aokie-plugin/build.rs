@@ -12,9 +12,9 @@ fn main() {
     if matches!(os.as_str(), "windows" | "linux" | "macos") {
         println!("cargo:rustc-cfg=aokie_radio");
     }
-    // The speech libraries (sherpa-onnx, ONNX Runtime) are shared libraries that ship beside the programs. Windows
-    // looks beside a program for them by itself; macOS and Linux look where the program's own run path says, so
-    // the programs are given the folder they are in as one. Without it a bundle's plugin does not start there.
+    // A shared library that ships beside the plugin (libusb on a Mac, scripts/bundle-unix.sh) is found there only
+    // through the program's own run path on macOS and Linux (Windows looks beside a program by itself), so the
+    // programs are given the folder they are in as one. Without it a bundle's plugin does not start there.
     match os.as_str() {
         "macos" => println!("cargo:rustc-link-arg-bins=-Wl,-rpath,@executable_path"),
         "linux" => println!("cargo:rustc-link-arg-bins=-Wl,-rpath,$ORIGIN"),

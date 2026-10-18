@@ -332,13 +332,13 @@ pub(super) fn local_voice_before_identity(
     handset_dial || (!oaiy_route && (already_active || promotion_pending))
 }
 
-/// The automatic hold juggle speaks announcements. On the OAIY route it runs
-/// only when a voice is there for them (OAIY's speak mode, or Aokie's own
-/// TTS); otherwise the second caller keeps hearing call waiting, and a
-/// caller who gives up is a missed call that OAIY rings back.
+/// The automatic hold juggle speaks announcements, so it runs only when a
+/// voice is there for them: OAIY's speak mode, on the OAIY route (Aokie has
+/// none of its own). Otherwise the second caller keeps hearing call waiting,
+/// and a caller who gives up is a missed call that OAIY rings back.
 #[cfg(feature = "voice")]
-pub(super) fn auto_hold_has_voice(oaiy_route: bool, voice_available: bool) -> bool {
-    !oaiy_route || voice_available
+pub(super) fn auto_hold_has_voice(voice_available: bool) -> bool {
+    voice_available
 }
 
 /// Whether the realtime fail-safe may speak its apology in Aokie's own

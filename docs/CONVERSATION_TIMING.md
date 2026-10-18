@@ -1,12 +1,12 @@
 # Conversation timing
 
-In OAIY, open **AI Receptionist → Settings → Conversation tuning**.
-Reconnect Aokie after changing these settings.
-
-These settings apply to calls that Aokie's own speech answers. On the OAIY
-route, where calls go to OAIY's Front desk, OAIY Voice decides when the caller
-has finished and stops a reply when the caller talks over it. The Settings tab
-then hides Conversation tuning and says so under Answering.
+Aokie has no speech of its own any more: calls go to OAIY's Front desk, and
+OAIY Voice decides when the caller has finished and stops a reply when the
+caller talks over it. The Settings tab no longer has Conversation tuning. The
+settings below were the turn-taking of Aokie's own speech; a saved settings
+file may still have them, and the plugin keeps them, but no call uses them.
+They are written down here for the older in-plugin receptionist, whose code is
+still in the radio loop (it is never given a voice).
 
 - **Listen while speaking and allow interruptions** (`bargeIn`) keeps the
   echo-cancelled microphone active during replies. Caller audio is retained
@@ -56,8 +56,7 @@ invented AM/PM. Invalid times and timestamp/identifier fragments stay unchanged.
 
 ## Local checks
 
-Run `cargo test -p aokie-plugin --lib --features voice` on Windows with the
-voice build prerequisites. The synthetic audio tests cover early/short caller
+Run `cargo test -p aokie-plugin --lib --features voice`. The synthetic audio tests cover early/short caller
 interruptions, retained pre-roll, short noise, echo-only playback, protected
 spans, spoken stop commands and urgent call controls. The acknowledgement
 policy tests cover pauses, cooldown, stale transcripts and unfinished details.

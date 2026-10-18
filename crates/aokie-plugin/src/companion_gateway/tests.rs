@@ -1632,6 +1632,38 @@ fn consult_without_a_matching_assistance_fence_is_refused() {
 }
 
 #[test]
+fn a_private_consult_is_never_offered_without_speech_of_aokies_own() {
+    // A current assistance request and consult consent once offered one: Aokie
+    // would speak the question and transcribe the answer. It has no speech of
+    // its own now, so there is no consult offer and a claim is refused.
+    let mut harness = RelayHarness::new();
+    let remote = harness.media.snapshot();
+    let fence = crate::assistance::AssistanceCallFence {
+        call_id: remote.call_id.expect("test call is active"),
+        call_epoch: remote.call_epoch,
+        owner_epoch: remote.owner_epoch,
+        switchboard_revision: harness.radio.switchboard_revision(),
+        remote_revision: remote.remote_revision,
+    };
+    harness
+        .session
+        .assistance
+        .request(fence, "Which appointment should I offer?", None, 60)
+        .expect("assistance request is accepted");
+    assert!(harness.media.snapshot().consent.consult_enabled);
+    let offers = harness.publish_offers();
+    assert!(offers.iter().all(|offer| offer.offer.offered_mode != LeaseMode::Consult));
+
+    let monitor = harness.offer_for(LeaseMode::Monitor);
+    let mut consult = monitor.clone();
+    consult.offer.offered_mode = LeaseMode::Consult;
+    assert!(!harness.answer(&monitor, "request_consult_now").is_empty());
+    let refused = harness.post(&lease_request(&consult, "request_consult_now", "rtc_a"));
+    assert_eq!(harness.rejection(&refused).code, "mode_unavailable");
+    assert!(harness.session.relay_leases.is_empty());
+}
+
+#[test]
 fn a_second_claimant_is_refused_claimant_busy() {
     let mut harness = RelayHarness::new();
     let granted = harness.claim(LeaseMode::Takeover, "request_first");

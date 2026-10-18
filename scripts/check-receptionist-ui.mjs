@@ -61,12 +61,18 @@ app.state.call = { callId: 'fixture', state: 'active' };
 await Promise.all([app.refreshSnapshot(), app.refreshPhoneStatus(), app.refreshPhones(), app.refreshSettings()]);
 assert.equal(element('hero-headline').textContent, 'Ready for calls');
 assert.match(element('readiness').innerHTML, /Bluetooth linked/);
-assert.equal(element('speak-send').disabled, false);
+// Operator mode: what is typed would be said in Aokie's own voice, which it
+// does not have (OAIY Voice speaks on calls that go to OAIY).
+assert.equal(element('speak-send').disabled, true);
+assert.match(element('live-body').innerHTML, /no speech of its own/);
 snapshot = { state: 'unhealthy', lastHealth: { status: 'degraded', detail: 'Phone is disconnected', components: { responder: { mode: 'agent', ready: true } } }, manifest: { version: '0.2.0' } };
 await app.refreshSnapshot();
 assert.equal(element('hero-headline').textContent, 'Running — needs attention');
 assert.equal(element('hero-sub').textContent, 'Phone is disconnected');
-assert.match(element('readiness').innerHTML, /LLM ready/);
+// Off the realtime route nobody answers: Aokie has no speech of its own.
+assert.match(element('readiness').innerHTML, /Nobody/);
+assert.match(element('readiness').innerHTML, /send them to OAIY/);
+assert.doesNotMatch(element('readiness').innerHTML, /LLM ready/);
 assert.equal(element('hero-version').textContent, 'Aokie v0.2.0');
 snapshot = { state: 'unhealthy', lastHealthError: 'Health probe timed out', health: { status: 'ok', components: { responder: { mode: 'agent', ready: true } } } };
 await app.refreshSnapshot();
@@ -100,7 +106,7 @@ assert.equal(element('speak-send').disabled, true);
 failed = false;
 await Promise.all([app.refreshSnapshot(), app.refreshPhoneStatus(), app.refreshPhones(), app.refreshSettings()]);
 assert.equal(element('hero-headline').textContent, 'Ready for calls');
-assert.equal(element('speak-send').disabled, false);
+assert.equal(element('speak-send').disabled, true);
 for (const [value, owner] of [[true, 'agent'], ['true', 'agent'], [false, 'operator'], ['false', 'operator'], [undefined, 'unknown'], ['invalid', 'unknown']]) {
   app.state.settings = { settings: { aiReceptionist: value } };
   assert.equal(app.replyOwner(), owner);
@@ -192,9 +198,23 @@ await app.refreshSettings();
 assert.match(element('readiness').innerHTML, /Another realtime provider/);
 assert.equal(element('settings-title').textContent, 'Calls do not go to OAIY');
 
+// Calls that do not go to OAIY: nobody answers them (Aokie has no speech of
+// its own), on the Overview's summary too; the OAIY route reads as before.
+payloads['settings.get'] = { settings: { aiReceptionist: true, realtimeVoiceMode: 'legacy' } };
+await app.refreshSettings();
+assert.match(element('settings-body').innerHTML, /Nobody: calls ring through/);
+assert.doesNotMatch(element('settings-body').innerHTML, /own speech/);
+payloads['settings.get'] = { settings: oaiyBag };
+snapshot = { state: 'running', lastHealth: { status: 'ok', components: { responder: { mode: 'desktop_realtime', ready: true } } } };
+await Promise.all([app.refreshSnapshot(), app.refreshSettings()]);
+assert.match(element('readiness').innerHTML, /OAIY Front desk/);
+assert.doesNotMatch(element('readiness').innerHTML + element('settings-body').innerHTML, /no speech of its own|Nobody/);
+assert.equal(element('settings-title').textContent, 'Calls go to OAIY');
+
 const settingsSource = await readFile(new URL('tabs/settings.js', base), 'utf8');
 vm.runInContext(settingsSource.replace(/\}\)\(\);\s*$/, `
-  window.testSettings = { settingsPatch, withAokieDefaults, personalGreeting, DEFAULT_GREETING };
+  window.testSettings = { settingsPatch, withAokieDefaults, personalGreeting, DEFAULT_GREETING,
+    formFor(bag) { baseline = withAokieDefaults(bag); settings = withAokieDefaults(bag); return formHtml(); } };
 })();`), context);
 const settings = window.testSettings;
 // Keys the form no longer shows keep their saved values: an edit to the
@@ -218,6 +238,29 @@ for (const [greeting, name, said] of [
   ['Hi! Thanks for calling', '', 'Hi! Thanks for calling'],
   [settings.DEFAULT_GREETING, 'Zoë', 'Hello Zoë, thanks for calling. How can I help you today?'],
 ]) assert.equal(settings.personalGreeting(greeting, name), said, greeting);
+// The settings form offers no route or setting that needs Aokie's own speech
+// (it has none): not Aokie's own receptionist, not its conversation tuning.
+// Off OAIY's route it says nobody answers, and offers to send calls to OAIY.
+{
+  for (const bag of [{ aiReceptionist: true, realtimeVoiceMode: 'legacy' }, { aiReceptionist: false }]) {
+    const form = settings.formFor(bag);
+    assert.match(form, /no speech of its own/);
+    assert.match(form, /they ring through to you/);
+    assert.match(form, /data-act="set-route-oaiy"/);
+    assert.doesNotMatch(form, /data-bool="aiReceptionist"/);
+    assert.doesNotMatch(form, /Conversation tuning|data-num="sttEndpointMs"|data-bool="bargeIn"|data-num="bargeSensitivity"|conversationAcknowledgements/);
+  }
+  const elsewhere = settings.formFor({ ...oaiyBag, realtimeVoiceEndpoint: 'ws://127.0.0.1:17872/api/ai/providers/openai/v1/realtime/stream' });
+  assert.match(elsewhere, /another realtime provider/);
+  assert.match(elsewhere, /no voice of its own there/);
+  assert.match(elsewhere, /data-act="set-route-oaiy"/);
+  const toOaiy = settings.formFor(oaiyBag);
+  assert.match(toOaiy, /Calls go to OAIY/);
+  assert.doesNotMatch(toOaiy, /no speech of its own|data-act="set-route-oaiy"|data-bool="aiReceptionist"/);
+  for (const form of [elsewhere, toOaiy]) {
+    assert.doesNotMatch(form, /Conversation tuning|data-num="sttEndpointMs"|data-bool="bargeIn"/);
+  }
+}
 const phoneSource = await readFile(new URL('tabs/phone.js', base), 'utf8');
 vm.runInContext(phoneSource.replace(/\}\)\(\);\s*$/, `
   window.testPhone = { refreshAll, pairingCardBody, bondedCardBody };

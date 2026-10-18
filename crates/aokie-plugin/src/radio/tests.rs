@@ -488,10 +488,9 @@ fn oaiy_route_never_leaves_a_caller_to_aokies_missing_voice() {
     assert!(!local_voice_before_identity(true, false, false, true));
     assert!(!local_voice_before_identity(false, false, false, false));
 
-    // Hold announcements need a voice on the OAIY route.
-    assert!(auto_hold_has_voice(false, false));
-    assert!(!auto_hold_has_voice(true, false));
-    assert!(auto_hold_has_voice(true, true));
+    // Hold announcements need a voice, on every route.
+    assert!(!auto_hold_has_voice(false));
+    assert!(auto_hold_has_voice(true));
 
     // An agent dial with no session: legacy fallback elsewhere, ended on OAIY.
     assert!(outbound_falls_back_to_local_voice(false));
@@ -579,9 +578,9 @@ fn fixed_lines_use_oaiys_speak_mode_on_its_route_and_the_local_voice_elsewhere()
         turn_detection: crate::realtime_voice::TurnDetection::ServerVad,
         max_output_tokens: 4_096,
     };
-    // Elsewhere: Aokie's own TTS exactly as before, whatever the config.
+    // Elsewhere: no voice at all (Aokie has none of its own), whatever the config.
     let own = LineVoice::for_route(false, Some(&config), false);
-    assert!(own.oaiy.is_none() && own.own_tts && own.can_speak());
+    assert!(own.oaiy.is_none() && !own.own_tts && !own.can_speak());
     // OAIY route: OAIY's voice, with the local TTS only as a fallback.
     let oaiy = LineVoice::for_route(true, Some(&config), false);
     assert!(oaiy.oaiy.is_some() && !oaiy.own_tts && oaiy.can_speak());
@@ -589,8 +588,9 @@ fn fixed_lines_use_oaiys_speak_mode_on_its_route_and_the_local_voice_elsewhere()
     // No config, no own TTS: no voice, so the hold juggle stays off.
     let none = LineVoice::for_route(true, None, false);
     assert!(!none.can_speak());
-    assert!(!auto_hold_has_voice(true, none.can_speak()));
-    assert!(auto_hold_has_voice(true, oaiy.can_speak()));
+    assert!(!auto_hold_has_voice(none.can_speak()));
+    assert!(auto_hold_has_voice(oaiy.can_speak()));
+    assert!(!auto_hold_has_voice(own.can_speak()));
 
     // A speak session: the line as the greeting, speak mode, nothing else.
     let say = oaiy_say_config(&config, "call_1", 9, "Please hold for a moment.");
@@ -3635,36 +3635,6 @@ fn handle_event_device_loss_terminates_the_active_call_once() {
     );
 }
 
-#[test]
-fn http_speech_fallback_is_sticky_per_call() {
-    let mut state = HttpSpeechFallback::new(Some(
-        "  http://127.0.0.1:17920/v1/audio/speech  ".to_string(),
-    ));
-    assert_eq!(
-        state.endpoint_for_call(),
-        Some("http://127.0.0.1:17920/v1/audio/speech")
-    );
-
-    assert!(state.mark_failed_for_call());
-    assert_eq!(state.endpoint_for_call(), None);
-    assert!(!state.mark_failed_for_call());
-
-    state.reset_call();
-    assert_eq!(
-        state.endpoint_for_call(),
-        Some("http://127.0.0.1:17920/v1/audio/speech")
-    );
-
-    assert!(state.mark_failed_for_call());
-    state.configure(Some("http://127.0.0.1:17920/v1/audio/speech2".to_string()));
-    assert_eq!(
-        state.endpoint_for_call(),
-        Some("http://127.0.0.1:17920/v1/audio/speech2")
-    );
-
-    state.configure(Some("   ".to_string()));
-    assert_eq!(state.endpoint_for_call(), None);
-}
 #[cfg(all(aokie_radio, feature = "voice"))]
 #[test]
 fn overlap_capture_initializes_without_a_greeting_and_survives_phrases() {

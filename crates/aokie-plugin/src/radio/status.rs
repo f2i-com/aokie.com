@@ -133,9 +133,6 @@ pub struct RadioStatus {
     /// debugger on a production box.
     pub loop_beat: AtomicU64,
     pub loop_phase: std::sync::atomic::AtomicU8,
-    /// When the STT worker started its CURRENT transcription (None = idle) +
-    /// the job's sample count — a wedged engine reports itself the same way.
-    pub stt_busy: Mutex<Option<(std::time::Instant, usize)>>,
     pub gap_yields: AtomicU64,
     pub semantic_cuts: AtomicU64,
     pub barge_cuts: AtomicU64,

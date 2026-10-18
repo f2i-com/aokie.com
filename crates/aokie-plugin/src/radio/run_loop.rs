@@ -74,192 +74,52 @@ pub(super) fn run_loop(
         }
     }
 
-    // Phase 2: synthesis runs on the synth WORKER (in-process engine loaded
-    // lazily there on the first thing Aokie says; the HTTP TTS endpoint +
-    // its sticky per-call fallback live there too). The radio thread paces
-    // the worker's PCM into SCO ~200 ms ahead of playout — see tts_speak.
+    // Aokie has no speech of its own: the synthesis lane answers every span
+    // with a failure (crate::synth), and tts_speak, which paces whatever a
+    // span produces into SCO, says nothing with it.
     #[cfg(feature = "voice")]
     let synth = crate::synth::SynthHandle::spawn();
-    #[cfg(feature = "voice")]
-    let private_consult = crate::private_consult::PrivateConsultHandle::spawn(remote_media.clone())
-        .map_err(|error| {
-            eprintln!("[aokie-plugin] private consult worker unavailable: {error}");
-            error
-        })
-        .ok();
-    #[cfg(feature = "voice")]
-    let mut consult_started_for: Option<String> = None;
     let _ = &greeting; // used only in the voice build / greeting block below
 
-    // AOK-VOICE-001: fast asset preflight (presence-only — radio start stays
-    // instant) seeds the shared voice-status slots BEFORE any call can arrive:
-    // a deleted model / missing ONNX Runtime DLL (with no HTTP endpoint
-    // substituting) is a KNOWN failure that degrades plugin.health and blocks
-    // auto-answer below, instead of being discovered mid-call by answering a
-    // caller into silence. Corruption is caught by the live engine loads,
-    // which update the same slots.
+    // AOK-VOICE-001: the shared voice-status slots are seeded BEFORE any call
+    // can arrive. Aokie has no speech of its own, so both say so from the
+    // start: a call that does not go to OAIY is a KNOWN failure that blocks
+    // auto-answer below (it rings through, never answered into silence), and
+    // on the OAIY route a fixed line goes to OAIY's speak mode alone. Nothing
+    // is downloaded, and there is no engine to self-test: the report records
+    // the skip, so readers (health) see a settled state.
     #[cfg(feature = "voice")]
     {
+        let pf = crate::voice::preflight();
+        *status.stt_error.lock().unwrap() = pf.stt_error;
+        *status.tts_error.lock().unwrap() = pf.tts_error;
         if realtime_selected {
-            // Realtime owns normal-call STT and synthesis upstream. Do not
-            // download, self-test, or eagerly load the local speech bundles at
-            // startup; they remain lazy for explicit legacy lanes.
-            // The presence-only probe is intentionally retained: a caller
-            // classified into the manager/screened legacy lane must still
-            // ring through if its local fallback cannot hear or speak.
-            let pf = crate::voice::preflight_assets();
-            *status.stt_error.lock().unwrap() = pf.stt_error;
-            *status.tts_error.lock().unwrap() = pf.tts_error;
-            *status.self_test.lock().unwrap() = Some(VoiceSelfTest {
-                ok: true,
-                at: aokie_core::events::now_iso8601(),
-                duration_ms: 0,
-                detail: "skipped: Desktop realtime selected; local speech remains lazy for legacy policy calls"
-                    .to_string(),
-            });
             eprintln!(
-                "[aokie-plugin] local speech downloads/self-test skipped for Desktop realtime voice (presence-only legacy preflight retained)"
+                "[aokie-plugin] Aokie has no speech of its own: the realtime voice hears and speaks; fixed lines go to OAIY's speak mode on the OAIY route"
             );
         } else {
-            // DIST-001: a clean machine obtains immutable, digest-pinned model
-            // bundles automatically. Downloads happen on this background radio
-            // thread, resume from `.part` files, and complete before auto-answer
-            // can arm. A remote speech endpoint suppresses its local bundle.
-            let distribution = crate::model_distribution::ensure_required_models();
-            let mut pf = crate::voice::preflight_assets();
-            if distribution.stt_error.is_some() {
-                pf.stt_error = distribution.stt_error;
-            }
-            if distribution.tts_error.is_some() {
-                pf.tts_error = distribution.tts_error;
-            }
-            if let Some(e) = &pf.stt_error {
-                eprintln!("[aokie-plugin] voice preflight: {e}");
-            }
-            if let Some(e) = &pf.tts_error {
-                eprintln!("[aokie-plugin] voice preflight: {e}");
-            }
-            if pf.stt_error.is_none() && pf.tts_error.is_none() {
-                eprintln!(
-                    "[aokie-plugin] voice preflight OK (ORT + STT/TTS assets or endpoints present)"
-                );
-            }
-            let preflight_failed = pf.stt_error.is_some() || pf.tts_error.is_some();
-            *status.stt_error.lock().unwrap() = pf.stt_error;
-            *status.tts_error.lock().unwrap() = pf.tts_error;
-
-            // VOICE-001: the measured loopback self-test — EXERCISE the engines
-            // (TTS→STT round trip of a known phrase) before auto-answer may arm,
-            // so a corrupt model / broken provider / silent synthesis is caught at
-            // startup, not by the first caller. Runs on its own thread (the ONNX
-            // loads are heavy); auto-answer stays blocked until a report lands.
-            // Skip cases write an OK report with the reason so arming isn't held
-            // hostage: HTTP endpoints replace the local engines this test covers,
-            // and a failed preflight already blocks via its own slots.
-            let skip_reason: Option<String> = if std::env::var("AOKIE_SKIP_SELF_TEST").as_deref()
-                == Ok("1")
-            {
-                Some("skipped (AOKIE_SKIP_SELF_TEST=1)".to_string())
-            } else if std::env::var("AOKIE_STT_ENDPOINT").is_ok_and(|v| !v.trim().is_empty())
-                || std::env::var("AOKIE_TTS_ENDPOINT").is_ok_and(|v| !v.trim().is_empty())
-            {
-                Some(
-                    "skipped: HTTP speech endpoint(s) configured - the local-engine loopback does not cover them"
-                        .to_string(),
-                )
-            } else if preflight_failed {
-                Some("skipped: asset preflight already failed (see stt/tts errors)".to_string())
-            } else {
-                None
-            };
-            match skip_reason {
-                Some(reason) => {
-                    eprintln!("[aokie-plugin] voice self-test {reason}");
-                    *status.self_test.lock().unwrap() = Some(VoiceSelfTest {
-                        ok: true,
-                        at: aokie_core::events::now_iso8601(),
-                        duration_ms: 0,
-                        detail: reason,
-                    });
-                }
-                None => {
-                    let status_st = status.clone();
-                    let spawned = std::thread::Builder::new()
-                        .name("aokie-voice-selftest".to_string())
-                        .spawn(move || {
-                            let started = std::time::Instant::now();
-                            // A panic inside the ONNX stack must still produce a
-                            // report — an empty slot blocks auto-answer forever.
-                            let outcome =
-                                std::panic::catch_unwind(crate::voice::run_loopback_self_test)
-                                    .unwrap_or_else(|_| {
-                                        Err("self-test panicked inside the speech stack"
-                                            .to_string())
-                                    });
-                            let report = match outcome {
-                                Ok(heard) => VoiceSelfTest {
-                                    ok: true,
-                                    at: aokie_core::events::now_iso8601(),
-                                    duration_ms: started.elapsed().as_millis() as u64,
-                                    detail: format!("loopback ok - heard {heard:?}"),
-                                },
-                                Err(e) => VoiceSelfTest {
-                                    ok: false,
-                                    at: aokie_core::events::now_iso8601(),
-                                    duration_ms: started.elapsed().as_millis() as u64,
-                                    detail: e,
-                                },
-                            };
-                            eprintln!(
-                                "[aokie-plugin] voice self-test {} in {}ms — {}",
-                                if report.ok {
-                                    "PASSED"
-                                } else {
-                                    "FAILED (auto-answer blocked)"
-                                },
-                                report.duration_ms,
-                                report.detail
-                            );
-                            *status_st.self_test.lock().unwrap() = Some(report);
-                        });
-                    if let Err(e) = spawned {
-                        // Can't run it — never leave the slot empty (permanent block).
-                        eprintln!("[aokie-plugin] voice self-test thread failed to start: {e}");
-                        *status.self_test.lock().unwrap() = Some(VoiceSelfTest {
-                            ok: false,
-                            at: aokie_core::events::now_iso8601(),
-                            duration_ms: 0,
-                            detail: format!("self-test thread failed to start: {e}"),
-                        });
-                    }
-                }
-            }
+            eprintln!(
+                "[aokie-plugin] calls do not go to OAIY, and Aokie has no speech of its own: they ring through until they do"
+            );
         }
     }
-    // Non-voice builds never run the loopback: record the skip so any reader
-    // (health) sees a settled state instead of "still running" forever.
-    #[cfg(not(feature = "voice"))]
-    {
-        *status.self_test.lock().unwrap() = Some(VoiceSelfTest {
-            ok: true,
-            at: aokie_core::events::now_iso8601(),
-            duration_ms: 0,
-            detail: "skipped: no voice output compiled".to_string(),
-        });
-    }
+    *status.self_test.lock().unwrap() = Some(VoiceSelfTest {
+        ok: true,
+        at: aokie_core::events::now_iso8601(),
+        duration_ms: 0,
+        detail: "skipped: Aokie has no speech of its own".to_string(),
+    });
     // Warn-once bookkeeping for the auto-answer voice block (per call id).
     let mut voice_block_logged_call: Option<String> = None;
 
-    // â”€â”€ Speech-to-text (voice build) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    // The caller's audio is transcribed OFF the radio loop: a worker thread owns
-    // the heavy Parakeet engine (lazy-loaded on the first utterance) so a ~300 ms
-    // transcription never stalls SCO I/O or control handling. The loop segments
-    // utterances with a simple energy VAD and ships each finished one to the
-    // worker; finished transcripts come back and become `aokie.call.turn.final`
-    // events â€” the hook a flow binds to drive the conversation.
-    // The CURRENT call generation, shared with the worker: jobs stamped with
-    // any other generation are for a finished call — the worker skips them
-    // WITHOUT transcribing (cheap cancellation on hangup; audit AK-002).
+    // ── Speech-to-text (voice build) ──
+    // Aokie has no speech-to-text of its own: on the OAIY route OAIY Voice
+    // hears the caller, and a realtime call never hands audio to this lane.
+    // A lane that would (a call off the OAIY route, which rings through)
+    // still sends utterances and probes here; nothing transcribes them, so no
+    // turn ever comes back. The result senders live as long as the worker,
+    // so a reader waits (bounded) exactly as it waited for a slow engine.
+    // The CURRENT call generation stamps every job (audit AK-002).
     #[cfg(feature = "voice")]
     let stt_current_gen = Arc::new(AtomicU64::new(0));
     #[cfg(feature = "voice")]
@@ -269,172 +129,11 @@ pub(super) fn run_loop(
         // Dedicated probe-result channel: control probes must never be
         // confused with (or consume) final-utterance results.
         let (probe_tx, probe_rx) = std::sync::mpsc::channel::<SttResult>();
-        let initial_stt_endpoint = std::env::var("AOKIE_STT_ENDPOINT").ok();
-        let worker_gen = stt_current_gen.clone();
-        let worker_status = status.clone();
         std::thread::Builder::new()
             .name("aokie-stt".into())
             .spawn(move || {
-                // CONSENT-001: the operator denied the `transcription` scope —
-                // NO caller audio may reach any STT engine (in-process or HTTP).
-                // Set by the connector before radio start from the consent gate;
-                // frames are dropped here at the last hop before an engine.
-                let stt_disabled = std::env::var("AOKIE_STT_DISABLED")
-                    .map(|v| v == "1")
-                    .unwrap_or(false);
-                if stt_disabled {
-                    eprintln!(
-                        "[aokie-plugin] transcription consent DENIED — STT worker will drop all audio"
-                    );
-                }
-                let mut engine: Option<crate::voice::SttEngine> = None;
-                let mut http_stt = HttpSpeechFallback::new(initial_stt_endpoint);
-                while let Ok(work) = utter_rx.recv() {
-                    // Control probes first: local engine only (no HTTP egress),
-                    // answered on the probe channel, generation-gated like
-                    // everything else. Best-effort — a failed probe is silence,
-                    // never an error path.
-                    if let SttWork::Probe { generation, lane, samples } = &work {
-                        if stt_disabled || *generation != worker_gen.load(Ordering::Relaxed) {
-                            continue;
-                        }
-                        if engine.is_none() {
-                            match crate::voice::SttEngine::load() {
-                                Ok(e) => {
-                                    eprintln!("[aokie-plugin] STT engine loaded");
-                                    *worker_status.stt_error.lock().unwrap() = None;
-                                    engine = Some(e);
-                                }
-                                Err(e) => {
-                                    eprintln!("[aokie-plugin] STT load failed (probe): {e}");
-                                    *worker_status.stt_error.lock().unwrap() =
-                                        Some(format!("the STT engine failed to load: {e}"));
-                                    continue;
-                                }
-                            }
-                        }
-                        if let Some(eng) = engine.as_mut() {
-                            let _busy = SttBusyGuard::set(&worker_status, samples.len());
-                            match eng.transcribe(samples) {
-                                Ok(text) if !text.is_empty() => {
-                                    let _ = probe_tx.send(SttResult {
-                                        generation: *generation,
-                                        // Echo the probe's LANE id so each
-                                        // consumer can drop foreign results
-                                        // (stale-probe fencing, 066d2237).
-                                        utterance: *lane,
-                                        text,
-                                    });
-                                }
-                                Ok(_) => {}
-                                Err(e) => {
-                                    eprintln!("[aokie-plugin] STT probe transcribe failed: {e}")
-                                }
-                            }
-                        }
-                        continue;
-                    }
-                    let (generation, utterance, buf) = match work {
-                        SttWork::Utterance { .. } if stt_disabled => continue,
-                        SttWork::Utterance {
-                            generation,
-                            utterance,
-                            samples,
-                        } => (generation, utterance, samples),
-                        SttWork::Probe { .. } => continue, // handled above
-                        SttWork::Warm => {
-                            if !stt_disabled && engine.is_none() {
-                                match crate::voice::SttEngine::load() {
-                                    Ok(e) => {
-                                        eprintln!("[aokie-plugin] STT engine pre-warmed");
-                                        *worker_status.stt_error.lock().unwrap() = None;
-                                        engine = Some(e);
-                                    }
-                                    Err(e) => {
-                                        eprintln!("[aokie-plugin] STT pre-warm failed: {e}");
-                                        *worker_status.stt_error.lock().unwrap() =
-                                            Some(format!("the STT engine failed to load: {e}"));
-                                    }
-                                }
-                            }
-                            continue;
-                        }
-                        SttWork::Configure { endpoint } => {
-                            http_stt.configure(endpoint);
-                            continue;
-                        }
-                        SttWork::ResetCall => {
-                            http_stt.reset_call();
-                            continue;
-                        }
-                    };
-                    // Stale-job gate: the call this audio belongs to is over
-                    // (or a new one replaced it) — do not spend a transcription
-                    // on it, and never emit its text.
-                    if generation != worker_gen.load(Ordering::Relaxed) {
-                        eprintln!(
-                            "[aokie-plugin] skipped stale STT job (call gen {generation}, utterance {utterance})"
-                        );
-                        continue;
-                    }
-                    let send = |text: String| {
-                        let _ = res_tx.send(SttResult {
-                            generation,
-                            utterance,
-                            text,
-                        });
-                    };
-                    // Busy for the rest of this job (HTTP or local): the loop
-                    // watchdog reports a wedged transcription with its size.
-                    let _busy = SttBusyGuard::set(&worker_status, buf.len());
-                    if let Some(endpoint) = http_stt.endpoint_for_call().map(str::to_string) {
-                        // Hardened per-endpoint client (AOK-ENDPOINT-001); a rejected
-                        // endpoint takes the same sticky fallback path as a failed request.
-                        match http_speech_client(&endpoint)
-                            .and_then(|client| http_stt_transcribe(&client, &endpoint, &buf))
-                        {
-                            Ok(text) if !text.is_empty() => {
-                                send(text);
-                                continue;
-                            }
-                            Ok(_) => continue,
-                            Err(e) => {
-                                if http_stt.mark_failed_for_call() {
-                                    eprintln!(
-                                        "[aokie-plugin] HTTP STT failed at {endpoint}: {e}; falling back to in-process STT for this call"
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    if engine.is_none() {
-                        match crate::voice::SttEngine::load() {
-                            Ok(e) => {
-                                eprintln!("[aokie-plugin] STT engine loaded");
-                                // AOK-VOICE-001: a working load clears any
-                                // preflight/previous failure for this half.
-                                *worker_status.stt_error.lock().unwrap() = None;
-                                engine = Some(e);
-                            }
-                            Err(e) => {
-                                eprintln!("[aokie-plugin] STT load failed: {e}");
-                                // AOK-VOICE-001: a KNOWN hearing failure —
-                                // degrade health + block auto-answer.
-                                *worker_status.stt_error.lock().unwrap() = Some(format!(
-                                    "the STT engine failed to load: {e}"
-                                ));
-                                continue;
-                            }
-                        }
-                    }
-                    if let Some(eng) = engine.as_mut() {
-                        match eng.transcribe(&buf) {
-                            Ok(text) if !text.is_empty() => send(text),
-                            Ok(_) => {}
-                            Err(e) => eprintln!("[aokie-plugin] STT transcribe failed: {e}"),
-                        }
-                    }
-                }
+                let _senders = (res_tx, probe_tx);
+                while utter_rx.recv().is_ok() {}
             })
             .ok();
         (utter_tx, res_rx, probe_rx)
@@ -821,14 +520,8 @@ pub(super) fn run_loop(
                     }
                     let beat = status.loop_beat.load(Ordering::Relaxed);
                     if beat == last && beat != 0 {
-                        let stt = match *status.stt_busy.lock().unwrap() {
-                            Some((at, n)) => {
-                                format!("BUSY {}ms on {n} samples", at.elapsed().as_millis())
-                            }
-                            None => "idle".to_string(),
-                        };
                         eprintln!(
-                            "[aokie-plugin] WATCHDOG: run_loop stalled >5s in phase {} (beat {beat}); stt worker {stt}",
+                            "[aokie-plugin] WATCHDOG: run_loop stalled >5s in phase {} (beat {beat})",
                             status.loop_phase.load(Ordering::Relaxed)
                         );
                     }
@@ -867,29 +560,6 @@ pub(super) fn run_loop(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
-    // Warm the speech engines NOW, at radio start — not at the first ring.
-    //
-    // ⚠️ Loading a sherpa/VITS voice bundle takes ~1.8s, but the ring window
-    // is only ~1.3-1.7s (auto-answer holds for the caller id + the
-    // personalization overlay, then answers). Warming on CallIncoming
-    // therefore finished AFTER the call was already answered and the caller
-    // sat in silence waiting for it — measured live 2026-07-18: answered at
-    // 11:06:43.765, "TTS engine pre-warmed (ring)" at 11:06:45.615. The ring
-    // warm below stays as a cheap idempotent safety net (the workers no-op
-    // when an engine is already loaded); this makes the FIRST call as fast as
-    // every later one. Both sends are to worker threads, so the radio loop
-    // never blocks on the load.
-    #[cfg(all(aokie_radio, feature = "voice"))]
-    {
-        if should_prepare_local_speech(realtime_selected, false) {
-            let _ = stt_tx.send(SttWork::Warm);
-            synth.warm();
-            eprintln!(
-                "[aokie-plugin] warming the speech engines at radio start (the first call must not wait for a model load)"
-            );
-        }
-    }
-
     loop {
         let mut idle = true;
         status.loop_beat.fetch_add(1, Ordering::Relaxed);
@@ -912,7 +582,6 @@ pub(super) fn run_loop(
             &mut ctx,
             &mut idle,
             realtime_selected,
-            &synth,
             &stt_tx,
             &stt_result_rx,
             &mut stt_buf,
@@ -1044,29 +713,12 @@ pub(super) fn run_loop(
             &mut ctx,
         );
 
+        // A private voice consult with a Companion user would have Aokie speak
+        // the question and transcribe the answer, with speech it does not
+        // have: one that opens is ended at once, and the caller returns.
         #[cfg(feature = "voice")]
-        {
-            let remote = remote_media.snapshot();
-            if remote.service_mode == crate::remote_media::ServiceMode::ConsultActive {
-                if consult_started_for.is_none() {
-                    let started = remote_media.active_consult_binding().and_then(|binding| {
-                        let request_id = ctx.pending_assistance.as_ref()?.request_id.clone();
-                        let request = crate::assistance::global().voice_request(&request_id)?;
-                        let worker = private_consult.as_ref()?;
-                        worker
-                            .start(request, binding.device_id)
-                            .map(|()| request_id)
-                            .ok()
-                    });
-                    if let Some(request_id) = started {
-                        consult_started_for = Some(request_id);
-                    } else {
-                        let _ = remote_media.end_active_consult("consult_pipeline_unavailable");
-                    }
-                }
-            } else {
-                consult_started_for = None;
-            }
+        if remote_media.snapshot().service_mode == crate::remote_media::ServiceMode::ConsultActive {
+            let _ = remote_media.end_active_consult("consult_pipeline_unavailable");
         }
 
         // The only remote caller-bound lane. Both the media worker and this
@@ -1114,7 +766,7 @@ pub(super) fn run_loop(
             LineVoice::for_route(oaiy_route, realtime_config.as_ref(), tts_available)
         };
         #[cfg(feature = "voice")]
-        let hold_voice = auto_hold_has_voice(oaiy_route, line_voice.can_speak());
+        let hold_voice = auto_hold_has_voice(line_voice.can_speak());
         #[cfg(feature = "voice")]
         reconcile_switchboard(
             bt,
@@ -1632,8 +1284,6 @@ pub(super) fn run_loop(
             realtime_selected,
             oaiy_route,
             &realtime_config,
-            &synth,
-            &stt_tx,
             &agent_persona,
             &mut answer_hold_started,
             &screen_policy,
@@ -2158,7 +1808,6 @@ pub(super) fn run_loop(
             &mut pending_controls,
             &mut idle,
             &synth,
-            &stt_tx,
             &mut stt_buf,
             &mut stt_had_speech,
             &mut stt_silence,

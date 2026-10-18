@@ -26,6 +26,11 @@
 //!
 //! Hard rule from the SDK: **never write non-protocol output to
 //! stdout** — diagnostics go to stderr or `log.emit`.
+//!
+//! Aokie has no speech of its own. With the `voice` feature it streams each
+//! call to OAIY's voice gateway (the OAIY route), where OAIY Voice hears and
+//! speaks, and cancels OAIY's voice out of the caller's audio; there are no
+//! speech engines, no ONNX Runtime and no speech models to download.
 
 #[cfg(feature = "voice")]
 pub mod aec;
@@ -53,11 +58,7 @@ pub mod event_bridge;
 pub mod host_rpc;
 pub mod manager_auth;
 pub mod manager_pin;
-#[cfg(feature = "voice")]
-pub mod model_distribution;
 pub mod outbox;
-#[cfg(feature = "voice")]
-pub mod private_consult;
 pub mod radio;
 pub mod realtime;
 pub mod realtime_appointment;

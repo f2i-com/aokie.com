@@ -6,10 +6,10 @@
 //! correlation-aligned windows instead, so a number read at 0.7× keeps the
 //! same voice — just slower.
 //!
-//! Consumers: the plugin's per-span TTS pacing (slow the digits, keep the
-//! surrounding sentence at normal rate) and aokie-voice-server's
-//! OpenAI-compatible `speed` parameter. Pure DSP — no I/O, no engines —
-//! which is why it lives in aokie-core.
+//! It served the per-span pacing of Aokie's own TTS (slow the digits, keep
+//! the surrounding sentence at normal rate) and the voice server's `speed`
+//! parameter, both gone with Aokie's own speech. Pure DSP — no I/O, no
+//! engines — which is why it lives in aokie-core.
 
 /// Speaking-speed multiplier bounds shared by every consumer: below 0.5 the
 /// splice density makes speech watery, above 2.0 it turns choppy.

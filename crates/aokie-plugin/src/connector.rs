@@ -28,17 +28,13 @@ pub const CONNECTOR_ID: &str = "aokie";
 pub const OUTBOX_FILE: &str = "outbox.sqlite";
 pub const COMMAND_JOURNAL_FILE: &str = "command-journal.sqlite3";
 
-const RECEPTIONIST_CONFIG_KEYS: [&str; 9] = [
-    "persona",
-    "greeting",
-    "ttsVoice",
-    "aiModel",
-    "aiEndpoint",
-    "sttEndpoint",
-    "ttsEndpoint",
-    "ttsEngine",
-    "ttsModelDir",
-];
+const RECEPTIONIST_CONFIG_KEYS: [&str; 4] = ["persona", "greeting", "aiModel", "aiEndpoint"];
+
+/// Settings that only ever shaped Aokie's own speech (its engines, voices
+/// and speech endpoints). Aokie has none now: OAIY Voice hears and speaks.
+/// A saved settings file or an app may still carry them, so `settings.set`
+/// accepts any value for them and they are kept, but nothing reads them.
+const OWN_SPEECH_KEYS: [&str; 5] = ["ttsVoice", "ttsEngine", "ttsModelDir", "sttEndpoint", "ttsEndpoint"];
 
 /// Settings whose values are URLs that will receive caller audio/transcripts —
 /// classified via `aokie_core::url_classification` before persisting
@@ -481,18 +477,6 @@ impl Plugin {
             "aiEndpoint",
             "AOKIE_AI_ENDPOINT",
         );
-        // Optional HTTP speech services. When set, the voice receptionist tries
-        // these before loading its in-process Parakeet / Pocket-TTS engines.
-        apply_endpoint_env_from_settings(
-            &self.store.config.settings,
-            "sttEndpoint",
-            "AOKIE_STT_ENDPOINT",
-        );
-        apply_endpoint_env_from_settings(
-            &self.store.config.settings,
-            "ttsEndpoint",
-            "AOKIE_TTS_ENDPOINT",
-        );
         let realtime_mode = self
             .store
             .config
@@ -582,81 +566,6 @@ impl Plugin {
         {
             if !p.trim().is_empty() {
                 std::env::set_var("AOKIE_AI_PERSONA", p.trim());
-            }
-        }
-        // TTS voice (pocket-tts predefined: alba/azelma/cosette/eponine/fantine/
-        // javert/jean/marius, or a .wav path to clone). Empty = bundle default.
-        if let Some(v) = self
-            .store
-            .config
-            .settings
-            .get("ttsVoice")
-            .and_then(|v| v.as_str())
-        {
-            if !v.trim().is_empty() {
-                // The pairing check needs `crate::voice`, which only exists in a
-                // voice build (lib.rs gates the module; Cargo's default feature
-                // set is deliberately empty so the light plugin still builds).
-                // Without those engines there is no mismatch to detect, so the
-                // base build passes the value straight through as it always did.
-                #[cfg(not(feature = "voice"))]
-                {
-                    std::env::set_var("AOKIE_TTS_VOICE", v.trim());
-                    eprintln!(
-                        "[aokie-plugin] ttsVoice setting → AOKIE_TTS_VOICE={}",
-                        v.trim()
-                    );
-                }
-                #[cfg(feature = "voice")]
-                {
-                // The engine about to be loaded, decided the same way the synth
-                // worker decides it, so this check sees what will actually speak.
-                let engine = crate::voice::normalize_tts_engine(
-                    self.store
-                        .config
-                        .settings
-                        .get("ttsEngine")
-                        .and_then(|e| e.as_str())
-                        .unwrap_or_default(),
-                );
-                if crate::voice::voice_matches_engine(engine, v.trim()) {
-                    std::env::set_var("AOKIE_TTS_VOICE", v.trim());
-                    eprintln!(
-                        "[aokie-plugin] ttsVoice setting → AOKIE_TTS_VOICE={}",
-                        v.trim()
-                    );
-                } else {
-                    // A voice belonging to the OTHER engine. Passing it through
-                    // is not an error anywhere downstream — the engine simply
-                    // fails to find it and falls back — so the operator hears a
-                    // voice they did not choose and nothing explains it. Clear
-                    // the stamp so the engine's own default is used, and say so.
-                    std::env::remove_var("AOKIE_TTS_VOICE");
-                    eprintln!(
-                        "[aokie-plugin] ttsVoice {:?} is not a {engine} voice — using the \
-                         {engine} default instead (set ttsEngine=sherpa to use Piper/VITS voices)",
-                        v.trim()
-                    );
-                }
-                }
-            }
-        }
-        // In-process TTS engine selection: ttsEngine (blank/pocket = Pocket-TTS,
-        // sherpa = sherpa-onnx VITS/Piper or Kokoro voices) + the sherpa voice
-        // bundle folder (ttsModelDir). Read by the synth worker at engine load.
-        apply_tts_engine_env(&self.store.config.settings);
-        if let Some(v) = self
-            .store
-            .config
-            .settings
-            .get("ttsEngine")
-            .and_then(|v| v.as_str())
-        {
-            if !v.trim().is_empty() {
-                eprintln!(
-                    "[aokie-plugin] ttsEngine setting → AOKIE_TTS_ENGINE={}",
-                    v.trim()
-                );
             }
         }
         // Full-duplex / barge-in: when `bargeIn` is truthy AND the agent is on,
@@ -3053,7 +2962,9 @@ impl Plugin {
                 if let Some(radio) = self.radio.as_ref() {
                     // Truthfulness gate (audit INT-006/C-15): a build without
                     // voice output can only LOG the text — never claim it was
-                    // spoken to the caller.
+                    // spoken to the caller. (With it, Aokie still has no voice
+                    // of its own: the span produces no audio, and the radio
+                    // reports `speak_failed` with this request's operation id.)
                     if !cfg!(feature = "voice") {
                         return Err(CmdError::failed(
                             "this plugin build has no voice output (voice feature not compiled) — operatorSpeak cannot be spoken",
@@ -3405,23 +3316,12 @@ impl Plugin {
                     None => {
                         let mut public = self.store.config.settings.clone();
                         public.remove("managerPin");
-                        #[allow(unused_mut)]
-                        let mut resp = json!({
+                        Ok(json!({
                             "settings": public,
                             "managerPinSet": pin_set,
                             "configVersion": self.store.config.config_version,
                             "configQuarantined": self.store.quarantined,
-                        });
-                        // Side-metadata (like managerPinSet): the per-engine
-                        // voice catalog for the console's engine-first voice
-                        // picker. Pure filesystem scan — never loads an
-                        // engine. Absent on non-voice builds; consumers
-                        // degrade to their built-in lists.
-                        #[cfg(feature = "voice")]
-                        {
-                            resp["ttsVoiceCatalog"] = crate::voice::tts_voice_catalog();
-                        }
-                        Ok(resp)
+                        }))
                     }
                 }
             }
@@ -3493,14 +3393,6 @@ impl Plugin {
                     ),
                     None => None,
                 };
-                // ttsEngine / ttsModelDir reselect the in-process TTS engine.
-                // Detect a REAL change BEFORE the persist loop overwrites the
-                // old values — the reload drops + reloads a heavy engine, so a
-                // same-value re-push (a console card re-save) stays a no-op.
-                let tts_engine_changed = ["ttsEngine", "ttsModelDir"].iter().any(|k| {
-                    obj.get(*k)
-                        .is_some_and(|new| self.store.config.settings.get(*k) != Some(new))
-                });
                 let destination_blocked = destination_block.is_some();
                 if let Some(reason) = destination_block {
                     eprintln!(
@@ -3550,8 +3442,6 @@ impl Plugin {
                 }
                 for (setting, env) in [
                     ("aiEndpoint", "AOKIE_AI_ENDPOINT"),
-                    ("sttEndpoint", "AOKIE_STT_ENDPOINT"),
-                    ("ttsEndpoint", "AOKIE_TTS_ENDPOINT"),
                     ("realtimeVoiceEndpoint", "AOKIE_REALTIME_VOICE_ENDPOINT"),
                     (
                         "realtimeVoiceDestination",
@@ -3599,11 +3489,6 @@ impl Plugin {
                         .unwrap_or(4096)
                         .clamp(64, 4096);
                     std::env::set_var("AOKIE_REALTIME_MAX_OUTPUT_TOKENS", value.to_string());
-                }
-                if tts_engine_changed {
-                    // Re-stamp BEFORE the Configure below queues the engine
-                    // reload — the synth worker reads env at load time.
-                    apply_tts_engine_env(&self.store.config.settings);
                 }
                 // Replacing an inert ungranted endpoint with a destination
                 // the current grant already covers (or explicitly returning
@@ -3670,12 +3555,8 @@ impl Plugin {
                         let _ = radio.send(crate::radio::RadioControl::Configure {
                             persona: string_setting(obj, "persona"),
                             greeting: string_setting(obj, "greeting"),
-                            voice: string_setting(obj, "ttsVoice"),
                             model: string_setting(obj, "aiModel"),
                             endpoint: endpoint_update(obj, "aiEndpoint"),
-                            stt_endpoint: endpoint_update(obj, "sttEndpoint"),
-                            tts_endpoint: endpoint_update(obj, "ttsEndpoint"),
-                            reload_tts_engine: tts_engine_changed,
                         });
                     }
                 }
@@ -3685,6 +3566,10 @@ impl Plugin {
                 let mut applied_live: Vec<&String> = Vec::new();
                 let mut applies_at_reconnect: Vec<&String> = Vec::new();
                 for key in obj.keys() {
+                    // (Aokie's own speech settings apply nowhere: kept, unread.)
+                    if OWN_SPEECH_KEYS.contains(&key.as_str()) {
+                        continue;
+                    }
                     match setting_spec(key) {
                         Some(spec) if spec.applies_live && radio_running => applied_live.push(key),
                         Some(_) => applies_at_reconnect.push(key),
@@ -4865,6 +4750,8 @@ pub const SETTING_SPECS: &[SettingSpec] = &[
         kind: SettingKind::Str { max_chars: 1000 },
         applies_live: true,
     },
+    // (Aokie's own speech: kept in the shared schema, never read; see
+    // OWN_SPEECH_KEYS.)
     SettingSpec {
         key: "ttsVoice",
         kind: SettingKind::Str { max_chars: 200 },
@@ -4917,6 +4804,10 @@ pub const SETTING_SPECS: &[SettingSpec] = &[
         kind: SettingKind::Int { min: 64, max: 4096 },
         applies_live: false,
     },
+    // Aokie's own speech engines and speech servers: kept in the shared
+    // settings schema (docs/contracts/aokie-settings-schema.v1.json, which
+    // FormLogic holds a copy of), never read. validate_setting accepts any
+    // value for them (OWN_SPEECH_KEYS).
     SettingSpec {
         key: "sttEndpoint",
         kind: SettingKind::EndpointUrl,
@@ -5154,10 +5045,10 @@ fn normalize_granted_destination(value: &str) -> Result<Option<String>, String> 
     effective_consent_destination(value)
 }
 
-const CONSENT_DESTINATION_SETTING_KEYS: [&str; 6] = [
+// (sttEndpoint and ttsEndpoint were Aokie's own speech servers: nothing is
+// sent to them now, so they are no destination.)
+const CONSENT_DESTINATION_SETTING_KEYS: [&str; 4] = [
     "aiEndpoint",
-    "sttEndpoint",
-    "ttsEndpoint",
     "audioTranscriptEndpoint",
     "realtimeVoiceEndpoint",
     "realtimeVoiceDestination",
@@ -5519,6 +5410,11 @@ fn validate_setting(key: &str, value: &Value) -> Result<(), CmdError> {
     if key == "managerPin" {
         return validate_manager_pin(value);
     }
+    // Aokie's own speech is gone: whatever an app or an older settings file
+    // still has for its keys is kept and never read, so it is never refused.
+    if OWN_SPEECH_KEYS.contains(&key) {
+        return Ok(());
+    }
     let Some(spec) = setting_spec(key) else {
         return match value {
             Value::Object(_) | Value::Array(_) => Err(CmdError::failed(format!(
@@ -5829,28 +5725,6 @@ fn has_receptionist_config_key(obj: &Map<String, Value>) -> bool {
     RECEPTIONIST_CONFIG_KEYS
         .iter()
         .any(|k| obj.contains_key(*k))
-}
-
-/// Stamp the in-process TTS engine selection env from the merged config:
-/// `ttsEngine` → AOKIE_TTS_ENGINE (blank/absent = pocket-tts) and
-/// `ttsModelDir` → AOKIE_TTS_MODEL_DIR (the sherpa voice-bundle folder;
-/// blank = scan `<app_data>/models/tts`). The synth worker reads these at
-/// engine-load time, so a change also needs a `ReloadEngine` nudge (the
-/// settings.set handler sends it via `RadioControl::Configure`).
-fn apply_tts_engine_env(settings: &Map<String, Value>) {
-    for (setting_key, env_key) in [
-        ("ttsEngine", "AOKIE_TTS_ENGINE"),
-        ("ttsModelDir", "AOKIE_TTS_MODEL_DIR"),
-    ] {
-        match settings
-            .get(setting_key)
-            .and_then(Value::as_str)
-            .map(str::trim)
-        {
-            Some(v) if !v.is_empty() => std::env::set_var(env_key, v),
-            _ => std::env::remove_var(env_key),
-        }
-    }
 }
 
 /// Resolve the spoken greeting from settings. BLANK and MISSING both mean the
@@ -7444,7 +7318,6 @@ mod tests {
                 "http://169.254.169.254/latest/meta-data",
                 "metadata",
             ),
-            ("ttsEndpoint", "http://169.254.7.9:9000/tts", "link-local"),
         ] {
             let err = plugin
                 .dispatch_command("settings.set", &json!({ key: url }), &mut sink)
@@ -9851,72 +9724,79 @@ mod tests {
     #[test]
     fn endpoint_settings_map_to_radio_env_vars() {
         let _guard = ENV_TEST_LOCK.lock().unwrap();
-        std::env::remove_var("AOKIE_STT_ENDPOINT");
-        std::env::set_var("AOKIE_TTS_ENDPOINT", "http://stale.invalid");
+        std::env::remove_var("AOKIE_AI_ENDPOINT");
+        std::env::set_var("AOKIE_REALTIME_VOICE_DESTINATION", "http://stale.invalid");
 
         let mut settings = Map::new();
         settings.insert(
-            "sttEndpoint".to_string(),
-            json!("  http://127.0.0.1:17920/v1/audio/transcriptions  "),
+            "aiEndpoint".to_string(),
+            json!("  http://127.0.0.1:8080/v1/chat/completions  "),
         );
-        settings.insert("ttsEndpoint".to_string(), json!(""));
+        settings.insert("realtimeVoiceDestination".to_string(), json!(""));
 
-        apply_endpoint_env_from_settings(&settings, "sttEndpoint", "AOKIE_STT_ENDPOINT");
-        apply_endpoint_env_from_settings(&settings, "ttsEndpoint", "AOKIE_TTS_ENDPOINT");
+        apply_endpoint_env_from_settings(&settings, "aiEndpoint", "AOKIE_AI_ENDPOINT");
+        apply_endpoint_env_from_settings(
+            &settings,
+            "realtimeVoiceDestination",
+            "AOKIE_REALTIME_VOICE_DESTINATION",
+        );
 
         assert_eq!(
-            std::env::var("AOKIE_STT_ENDPOINT").unwrap(),
-            "http://127.0.0.1:17920/v1/audio/transcriptions"
+            std::env::var("AOKIE_AI_ENDPOINT").unwrap(),
+            "http://127.0.0.1:8080/v1/chat/completions"
         );
-        assert!(std::env::var("AOKIE_TTS_ENDPOINT").is_err());
+        assert!(std::env::var("AOKIE_REALTIME_VOICE_DESTINATION").is_err());
 
-        std::env::remove_var("AOKIE_STT_ENDPOINT");
-        std::env::remove_var("AOKIE_TTS_ENDPOINT");
+        std::env::remove_var("AOKIE_AI_ENDPOINT");
+        std::env::remove_var("AOKIE_REALTIME_VOICE_DESTINATION");
     }
 
+    /// Aokie's own speech is gone. Its settings (engines, voices, speech
+    /// endpoints), from an app or an older settings file, are accepted with
+    /// any value and kept, but reach nothing: no env, no live reconfigure, no
+    /// consent destination.
     #[test]
-    fn stt_and_tts_endpoint_settings_trigger_live_configure() {
-        let obj = json!({
-            "sttEndpoint": "http://127.0.0.1:17920/v1/audio/transcriptions",
-            "ttsEndpoint": "http://127.0.0.1:17920/v1/audio/speech"
-        })
-        .as_object()
-        .unwrap()
-        .clone();
+    fn own_speech_settings_are_kept_and_never_used() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        let mut plugin = Plugin::ephemeral(true);
+        let mut sink = VecSink::default();
+        let old = json!({
+            "ttsVoice": "vits-piper-en_GB-jenny_dioco-medium",
+            "ttsEngine": "sherpa",
+            "ttsModelDir": "/nowhere/at/all",
+            "sttEndpoint": "http://169.254.7.9:9000/stt",
+            "ttsEndpoint": {"not": "a url"},
+        });
+        let saved = plugin
+            .dispatch_command("settings.set", &old, &mut sink)
+            .unwrap();
+        for (key, value) in old.as_object().unwrap() {
+            assert_eq!(&saved["settings"][key], value, "{key} is kept as it was");
+            for list in ["appliedLive", "appliesAtReconnect"] {
+                assert!(
+                    !saved[list].as_array().unwrap().contains(&json!(key)),
+                    "{key} applies nowhere, so it is not in {list}"
+                );
+            }
+        }
+        assert!(!has_receptionist_config_key(old.as_object().unwrap()));
+        for key in ["sttEndpoint", "ttsEndpoint"] {
+            assert!(!CONSENT_DESTINATION_SETTING_KEYS.contains(&key));
+        }
+        for var in ["AOKIE_STT_ENDPOINT", "AOKIE_TTS_ENDPOINT", "AOKIE_TTS_ENGINE", "AOKIE_TTS_VOICE"] {
+            assert!(std::env::var(var).is_err(), "{var} is not stamped");
+        }
 
-        assert!(has_receptionist_config_key(&obj));
-        assert_eq!(
-            string_setting(&obj, "sttEndpoint").as_deref(),
-            Some("http://127.0.0.1:17920/v1/audio/transcriptions")
-        );
-        assert_eq!(
-            string_setting(&obj, "ttsEndpoint").as_deref(),
-            Some("http://127.0.0.1:17920/v1/audio/speech")
-        );
-        assert_eq!(
-            endpoint_update(&obj, "sttEndpoint"),
-            crate::radio::EndpointUpdate::Set(
-                "http://127.0.0.1:17920/v1/audio/transcriptions".to_string()
-            )
-        );
-
-        let cleared = json!({"sttEndpoint": null, "ttsEndpoint": "  "})
+        // The live receptionist keys still reconfigure a running radio.
+        let obj = json!({"persona": "Notes", "aiEndpoint": null})
             .as_object()
             .unwrap()
             .clone();
+        assert!(has_receptionist_config_key(&obj));
         assert_eq!(
-            endpoint_update(&cleared, "sttEndpoint"),
+            endpoint_update(&obj, "aiEndpoint"),
             crate::radio::EndpointUpdate::Clear
         );
-        assert_eq!(
-            endpoint_update(&cleared, "ttsEndpoint"),
-            crate::radio::EndpointUpdate::Clear
-        );
-        assert_eq!(
-            endpoint_update(&cleared, "aiEndpoint"),
-            crate::radio::EndpointUpdate::Unchanged
-        );
-
         let obj = json!({"mockCalls": true}).as_object().unwrap().clone();
         assert!(!has_receptionist_config_key(&obj));
     }

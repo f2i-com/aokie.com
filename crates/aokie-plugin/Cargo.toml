@@ -9,11 +9,13 @@ publish.workspace = true
 
 [features]
 default = []
-# In-process voice receptionist: STT/TTS via aokie-ai + ONNX Runtime, driven on
-# the live SCO audio. HEAVY — pulls ort/ndarray/rubato/etc. and needs the ORT DLL
-# + speech models at runtime. Off by default so the base plugin stays light;
-# build the voice plugin with `--features voice`.
-voice = ["dep:aokie-ai", "dep:aokie-audio", "dep:reqwest", "dep:aec-rs"]
+# Call audio: the Desktop realtime lane that streams a call to OAIY's voice
+# gateway (the OAIY route: OAIY Voice hears and speaks, OAIY's speak mode says
+# Aokie's fixed lines) and the echo canceller (aec-rs) that takes OAIY's voice
+# out of the caller's audio. Aokie has no speech of its own: no ONNX Runtime,
+# no speech engines, no speech models. Without it the plugin texts, syncs
+# contacts and lets calls ring through. `--features voice`.
+voice = ["dep:reqwest", "dep:aec-rs"]
 # Controlled WinUSB self-signing path for administrator-managed beta installs.
 # The runtime still requires the operator's opt-in: acceptance of the install on
 # the dongle setup screen, or AOKIE_ALLOW_SELF_SIGNED_DRIVER=1.
@@ -23,25 +25,18 @@ managed-beta-driver = ["aokie-dongle/managed-beta-driver"]
 aokie-core = { path = "../aokie-core" }
 aokie-media = { path = "../aokie-media" }
 aokie-protocol = { path = "../aokie-protocol" }
-# Streaming LLM client for the in-plugin real-time reply (voice feature). Blocking
-# API read line-by-line = SSE streaming without a tokio runtime. rustls to match
-# aokie-ai and avoid a native-TLS build.
+# The Companion relay carrier and the older in-plugin LLM client (voice
+# feature). Blocking API read line-by-line = SSE streaming without a tokio
+# runtime. rustls to avoid a native-TLS build.
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "multipart", "rustls-tls"], optional = true }
-# Acoustic echo cancellation for full-duplex / barge-in (voice feature). Bundles
-# the speexdsp C echo canceller via aec-rs-sys, so no system libspeexdsp needed.
+# Acoustic echo cancellation (voice feature): on the OAIY route OAIY's voice,
+# played into the call, is cancelled out of the caller's audio before that is
+# streamed back to OAIY. Bundles the speexdsp C echo canceller via aec-rs-sys,
+# so no system libspeexdsp needed.
 aec-rs = { version = "1.0", optional = true }
 # The radio bridge (every system the radio stack has a USB transport for), dongle enumeration, and on Windows the
 # WinUSB driver install (dongle.installDriver), which the other systems do not have: they install no driver.
 aokie-dongle = { path = "../aokie-dongle" }
-# Optional in-process speech (TTS greeting + STT), behind the `voice` feature.
-# `sherpa` adds the sherpa-onnx VITS/Piper + Kokoro TTS engines (selectable via
-# the ttsEngine setting). Dynamic by necessity (static sherpa's vendored KISS
-# FFT collides with aec-rs's speexdsp at link time): deploys must ship
-# sherpa-onnx-c-api.dll + sherpa's onnxruntime.dll (1.17.1) next to the exe,
-# and ensure_ort_dylib pins the ort engines to onnxruntime_1.25.0.dll by
-# explicit name so sherpa's ORT can never shadow it.
-aokie-ai = { path = "../aokie-ai", features = ["onnx", "sherpa"], optional = true }
-aokie-audio = { path = "../aokie-audio", features = ["sherpa"], optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }

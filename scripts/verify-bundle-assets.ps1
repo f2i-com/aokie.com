@@ -1,16 +1,12 @@
-param([Parameter(Mandatory = $true)][string]$Bundle, [switch]$Voice)
+# Every file the bundle's manifest names (its program, service definitions and screens) must be in the bundle, inside
+# it. Aokie has no speech of its own, so there is no speech library, voice server or model list to look for.
+param([Parameter(Mandatory = $true)][string]$Bundle)
 
 $ErrorActionPreference = 'Stop'
 $bundleRoot = (Resolve-Path -LiteralPath $Bundle).Path
 $bundlePrefix = $bundleRoot.TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
 $manifest = Get-Content -LiteralPath (Join-Path $bundleRoot 'manifest.json') -Raw | ConvertFrom-Json
 $references = @($manifest.entry.command)
-if ($Voice) {
-    # sherpa's unversioned ORT cannot run the newer Pocket/Parakeet engines.
-    $references += @('aokie-voice-server.exe', 'models-manifest.json',
-        'onnxruntime_1.25.0.dll', 'onnxruntime.dll',
-        'sherpa-onnx-c-api.dll', 'sherpa-onnx-cxx-api.dll')
-}
 $references += @($manifest.serviceDefinitions | ForEach-Object { $_.definitionFile })
 foreach ($screen in $manifest.ui.screens) {
     $references += $screen.entry

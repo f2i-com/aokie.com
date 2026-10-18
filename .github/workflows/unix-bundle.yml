@@ -3,8 +3,9 @@
 #
 # A manual run only (Actions, "Unix bundles", Run workflow): nothing starts it by itself. Each leg runs
 # scripts/bundle-unix.sh on a runner of its system and uploads the folder it lays out, as a .tar.gz, as an artifact
-# of the run. Nothing is published, tagged or signed with a publisher's key, and the run is given no secret: OAIY
-# Desktop asks its owner to trust the plugin, as it does for any plugin that is not signed.
+# of the run. Aokie has no speech of its own (OAIY Voice hears and speaks for calls), so the bundle has no speech
+# library, voice server or model in it. Nothing is published, tagged or signed with a publisher's key, and the run
+# is given no secret: OAIY Desktop asks its owner to trust the plugin, as it does for any plugin that is not signed.
 #
 # The Mac's leg is how a Mac build is made without a Mac at hand, and with nothing to install on the Mac that uses
 # it: the plugin links macOS's own frameworks, so only a Mac can build it. Its programs are signed ad hoc there (a
@@ -41,9 +42,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07
 
-      # No build cache: this is an occasional build, and a cache gives back a build folder without the speech
-      # libraries sherpa-onnx's build script had put in it (cargo does not track them), which is a bundle whose
-      # plugin cannot start. The third run met exactly that on its Linux leg.
+      # No build cache: this is an occasional build, built whole.
 
       # libusb and udev for the USB transport, libdbus for the Secret Service the sealing key is kept in, ALSA and the X
       # libraries for libwebrtc, and clang 21: libwebrtc is built against a libc++ of its own that asks for it, and
@@ -93,17 +92,13 @@ jobs:
       - name: The bundled plugin starts from its folder and answers
         run: python3 scripts/virtual-dongle/plugin_check.py --no-dongle "$PWD/aokie/aokie-plugin"
 
-      # A .tar.gz keeps each program's mode, which a plugin's program needs to be started. The speech libraries'
-      # links are written out as files (-h): OAIY Desktop takes regular files and folders from an archive, and
-      # nothing else.
+      # A .tar.gz keeps each program's mode, which a plugin's program needs to be started. Any link would be written
+      # out as a file (-h): OAIY Desktop takes regular files and folders from an archive, and nothing else.
       - name: Package
         run: |
           set -euo pipefail
           if [ "$RUNNER_OS" = Linux ]; then
-            for program in aokie/aokie-plugin aokie/aokie-voice-server; do
-              [ -f "$program" ] || continue
-              if ldd "$program" | grep -i 'not found'; then echo "::error::$program asks for a library that is neither in the bundle nor on this system"; exit 1; fi
-            done
+            if ldd aokie/aokie-plugin | grep -i 'not found'; then echo "::error::aokie-plugin asks for a library that is neither in the bundle nor on this system"; exit 1; fi
           fi
           tar -czhf "aokie-plugin-${{ matrix.label }}.tar.gz" aokie
           shasum -a 256 "aokie-plugin-${{ matrix.label }}.tar.gz"

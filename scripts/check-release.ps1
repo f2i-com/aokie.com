@@ -53,13 +53,10 @@ Invoke-Gate 'check: voice,managed-beta-driver (shipping combo)' $repo {
 Invoke-Gate 'check: driver helper (managed-beta-driver)' $repo {
     cargo check -p aokie-dongle --features managed-beta-driver --bins
 }
-Invoke-Gate 'check: ONNX CUDA API and Candle engines' $repo {
-    cargo check -p aokie-ai --features onnx-cuda,candle
-}
 
 # -- Tests --
-Invoke-Gate 'test: workspace (default features, transcribe-rs OpenAI engine on a loopback mock)' $repo {
-    cargo test --workspace --features transcribe-rs/openai
+Invoke-Gate 'test: workspace (default features)' $repo {
+    cargo test --workspace
 }
 # --test-threads=2: the synthetic-audio/QuickJS timing tests are a documented
 # flake class under full parallel load.
@@ -69,7 +66,7 @@ Invoke-Gate 'test: plugin (voice)' $repo {
 
 # -- Lints --
 Invoke-Gate 'clippy: workspace (deny-level lints)' $repo {
-    cargo clippy --workspace --all-targets --features transcribe-rs/openai
+    cargo clippy --workspace --all-targets
 }
 Invoke-Gate 'clippy: plugin (voice)' $repo {
     cargo clippy -p aokie-plugin --all-targets --features voice
@@ -120,8 +117,8 @@ if ($Msrv) {
     Invoke-Gate 'MSRV: plugin (cargo +1.88.0, shipping combo)' $repo {
         cargo +1.88.0 check -p aokie-plugin --features voice,managed-beta-driver
     }
-    Invoke-Gate 'MSRV: voice-server + dongle + signer' $repo {
-        cargo +1.88.0 check -p aokie-voice-server -p package-signer
+    Invoke-Gate 'MSRV: dongle + signer' $repo {
+        cargo +1.88.0 check -p package-signer
         if ($LASTEXITCODE -ne 0) { throw 'MSRV check failed' }
         cargo +1.88.0 check -p aokie-dongle --features managed-beta-driver --bins
     }

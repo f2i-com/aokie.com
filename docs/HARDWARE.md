@@ -296,18 +296,22 @@ Bluetooth is not a USB device, so there the dongle is the only one.
 
 ### Building and trying it
 
-Xcode's command-line tools, Rust and `cmake` are needed (the speech stack has
-native parts). Then:
+Xcode's command-line tools, Rust and `cmake` are needed (libwebrtc and the
+echo canceller have native parts). Then:
 
 ```sh
 sh scripts/bundle-unix.sh
 ```
 
-builds the plugin with voice and lays out the folder OAIY Desktop loads, with
-the manifest's entry changed to `aokie-plugin` (the one difference from the
-Windows manifest) and ONNX Runtime 1.25.0 fetched for the speech engines that
-run on it (Microsoft publishes it for Apple silicon, not for Intel Macs, where
-those engines stay off). libusb goes beside the plugin as a library of its own,
+builds the plugin with call audio (the `voice` feature) and lays out the
+folder OAIY Desktop loads, with the manifest's entry changed to `aokie-plugin`
+(the one difference from the Windows manifest). Aokie has no speech of its
+own: OAIY Voice hears and speaks for calls, so the bundle has no ONNX Runtime,
+speech engine, voice server or model, and the plugin downloads none. On 18
+October 2026 it was 34.8 MB in 19 files (the plugin 33.6 MB), where the
+bundle with Aokie's own speech had been 132.8 MB (127 MiB) in 27 files and
+fetched ~800 MB of models on a first start.
+libusb goes beside the plugin as a library of its own,
 `libusb-1.0.0.dylib`: the script fetches libusb's release (1.0.27, the version
 the `libusb1-sys` crate carries, its digest pinned), builds it as a library
 for macOS 11 and later, and has cargo link the plugin to it in place of the
@@ -318,9 +322,9 @@ plugin still has libusb built in, and puts libusb's licence and that source in
 libusb in, which is fine for a program that stays on the Mac it was built on.
 Its last lines say where to copy the folder; OAIY Desktop
 then asks you to trust the plugin, as it does for any plugin that is not
-signed. `AOKIE_FEATURES="" sh scripts/bundle-unix.sh` builds without the speech
-stack: a plugin that pairs, texts and lets calls ring through, and a much
-shorter build to find out whether the dongle works at all.
+signed. `AOKIE_FEATURES="" sh scripts/bundle-unix.sh` builds without call audio
+as well: a plugin that pairs, texts and lets calls ring through, and the
+shortest build to find out whether the dongle works at all.
 
 **Without building on the Mac.** GitHub's Mac can make the same folder: on the
 repository's page, **Actions**, **Unix bundles**, **Run workflow**
@@ -335,20 +339,11 @@ from its folder on the build machine and asked what OAIY asks a plugin first
 (`python3 scripts/virtual-dongle/plugin_check.py --no-dongle <the program>`): it
 answers, lists no dongle, keeps its radio off, and shuts down cleanly. That says
 the bundle runs from its folder on that system, and nothing about a dongle.
-The workflow uses no build cache: a build folder that comes back from one has
-lost the speech libraries a build script had put in it, and `bundle-unix.sh`
-now builds that part again when it finds them missing rather than lay out a
-plugin that cannot start.
+The workflow uses no build cache: an occasional build is built whole.
 The Mac's programs are signed there by nobody (ad hoc), which is what an
 Apple-silicon Mac asks before it runs a program; a downloaded one may still be
 held back by macOS until you allow it, as OAIY's own app is (OAIY's
 `docs/MAC.md`).
-
-A plugin built with voice fetches its speech models the first time it starts,
-before its radio thread reports the dongle (as on Windows). That takes minutes
-on a first start: until it is done the dongle screen says the radio is not up,
-and its "Start Aokie again" gives up after half a minute. Wait for the
-download rather than starting again; the plugin's log says what it is fetching.
 
 The tests: `AOKIE_SEAL_EPHEMERAL=1 cargo test --workspace` (and the same in
 front of `cargo test -p aokie-plugin --features voice`). Several crates' tests
@@ -382,9 +377,8 @@ as a new program and asks again before Aokie uses its key.
    Call audio rides isochronous transfers, whose timing through libusb on
    macOS has not been measured: expect texts and pairing to be the first
    things that work and call audio to be the part that needs a Mac to tune.
-3. The speech stack's native libraries (sherpa-onnx, speexdsp, libwebrtc)
-   build there, and the plugin finds them beside it when it starts (and ONNX
-   Runtime 1.25.0). A bundle has no links in it: OAIY Desktop refuses to
+3. The native libraries (speexdsp and libwebrtc) build there, and the plugin
+   finds libusb beside it when it starts. A bundle has no links in it: OAIY Desktop refuses to
    install or trust a plugin that has one, so `bundle-unix.sh` copies the
    file a link names.
 4. The Keychain's prompts for a plugin that OAIY Desktop starts.

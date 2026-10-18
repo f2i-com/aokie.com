@@ -333,8 +333,9 @@ impl<'a> SttProbeLane<'a> {
 /// half-duplex path (caller relies on the mute), still gaining the ~200 ms
 /// cancel latency. No-op with no SCO channel (sample_rate 0) or empty text.
 ///
-/// `rate` is the span's speaking-speed multiplier (1.0 = normal; WSOLA on the
-/// worker). `finish_extra` is the span's interrupt policy.
+/// `_rate` is the speaking-speed multiplier a voice would speak the span at
+/// (1.0 = normal); Aokie has no voice of its own, so nothing uses it.
+/// `finish_extra` is the span's interrupt policy.
 #[cfg(all(aokie_radio, feature = "voice"))]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn tts_speak(
@@ -345,7 +346,7 @@ pub(super) fn tts_speak(
     mut aec: Option<&mut crate::aec::EchoCanceller>,
     barge_rms: Option<f32>,
     mut ctl: Option<&mut ControlProbe<'_>>,
-    rate: f32,
+    _rate: f32,
     finish_extra: Option<std::time::Duration>,
     mut probe: Option<&mut SttProbeLane<'_>>,
     // Post-answer settle (greeting only): hold SCO EGRESS until this instant.
@@ -374,9 +375,9 @@ pub(super) fn tts_speak(
     // operatorSpeak all funnel through here): "10 a.m.," → "10 AM," — dotted
     // abbreviations against punctuation make the TTS stutter audibly.
     let text = &crate::speech_wire::normalize_speech_text(text);
-    // Voice from AOKIE_TTS_VOICE, shared by HTTP and in-process synthesis.
-    let voice = std::env::var("AOKIE_TTS_VOICE").unwrap_or_default();
-    let epoch = synth.begin(text, &voice, rate, sample_rate as u32);
+    // Aokie has no voice of its own: the span fails at once (crate::synth),
+    // and the caller of this path hears nothing from it.
+    let epoch = synth.begin();
 
     let mut playback = TtsChunkPlayback::new(sample_rate, finish_extra);
     let mut pending: std::collections::VecDeque<i16> = std::collections::VecDeque::new();
@@ -695,8 +696,8 @@ pub(super) fn speak_announcement(
     control_rx: &std::sync::mpsc::Receiver<RadioControl>,
     pending_controls: &mut std::collections::VecDeque<RadioControl>,
     // Whose line it is and in which voice: on the OAIY route OAIY's speak
-    // mode says it (Aokie's own TTS only as a fallback); elsewhere
-    // `LineVoice::own()`, the local TTS as before.
+    // mode says it; elsewhere `LineVoice::own()`, which has no voice (Aokie
+    // has none of its own), so the line is not said.
     voice: LineVoice<'_>,
     call_id: &str,
 ) -> Option<CancelAction> {

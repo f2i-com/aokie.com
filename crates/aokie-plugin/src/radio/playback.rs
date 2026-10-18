@@ -119,56 +119,6 @@ pub(super) struct SpeakOutcome {
     pub(super) cut_est: Option<CutEstimate>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-#[cfg_attr(not(feature = "voice"), allow(dead_code))]
-pub(super) struct HttpSpeechFallback {
-    pub(super) endpoint: Option<String>,
-    pub(super) failed_for_call: bool,
-}
-
-#[cfg_attr(not(feature = "voice"), allow(dead_code))]
-impl HttpSpeechFallback {
-    pub(super) fn new(endpoint: Option<String>) -> Self {
-        Self {
-            endpoint: normalize_endpoint(endpoint),
-            failed_for_call: false,
-        }
-    }
-
-    pub(super) fn from_env(var: &str) -> Self {
-        Self::new(std::env::var(var).ok())
-    }
-
-    pub(super) fn configure(&mut self, endpoint: Option<String>) {
-        let endpoint = normalize_endpoint(endpoint);
-        if endpoint != self.endpoint {
-            self.endpoint = endpoint;
-            self.failed_for_call = false;
-        }
-    }
-
-    pub(super) fn reset_call(&mut self) {
-        self.failed_for_call = false;
-    }
-
-    pub(super) fn endpoint_for_call(&self) -> Option<&str> {
-        if self.failed_for_call {
-            None
-        } else {
-            self.endpoint.as_deref()
-        }
-    }
-
-    pub(super) fn mark_failed_for_call(&mut self) -> bool {
-        if self.endpoint.is_some() && !self.failed_for_call {
-            self.failed_for_call = true;
-            true
-        } else {
-            false
-        }
-    }
-}
-
 #[cfg_attr(not(feature = "voice"), allow(dead_code))]
 pub(super) fn normalize_endpoint(endpoint: Option<String>) -> Option<String> {
     endpoint
@@ -661,22 +611,3 @@ pub(super) mod loop_phase {
     pub const TAIL: u8 = 8;
 }
 
-/// Marks the STT worker busy for the lifetime of one transcription job — the
-/// loop watchdog reads it, so a wedged engine names itself in the log.
-#[cfg(feature = "voice")]
-pub(super) struct SttBusyGuard(pub(super) Arc<RadioStatus>);
-
-#[cfg(feature = "voice")]
-impl SttBusyGuard {
-    pub(super) fn set(status: &Arc<RadioStatus>, samples: usize) -> Self {
-        *status.stt_busy.lock().unwrap() = Some((std::time::Instant::now(), samples));
-        Self(status.clone())
-    }
-}
-
-#[cfg(feature = "voice")]
-impl Drop for SttBusyGuard {
-    fn drop(&mut self) {
-        *self.0.stt_busy.lock().unwrap() = None;
-    }
-}
