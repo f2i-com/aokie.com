@@ -3,9 +3,11 @@
 - [`glib/`](#glib-compatibility-backport): a security backport for the GTK 3 desktop dependencies.
 - [`wry-0.57.0-patched/`](#wry-android-main-thread-panics): wry with its Android main-thread message pump made
   panic-free.
+- [`webrtc-sys-build-0.3.19-patched/`](#webrtc-sys-build-on-zip-9): libwebrtc's build helper on zip 9, whose archive
+  extraction is not RUSTSEC-2026-0367, -0368 and -0369.
 
-Both are wired in by `[patch.crates-io]` in the root `Cargo.toml`, and both keep the upstream version number: they
-are not upstream releases.
+All three are wired in by `[patch.crates-io]` in the root `Cargo.toml`, and all keep the upstream version number:
+they are not upstream releases.
 
 # GLib compatibility backport
 
@@ -87,3 +89,33 @@ Remove this patch when a wry release carries the same fixes, or when Tauri moves
 Upstream issue to file when it is convenient: `MainPipe::handle_message` unwraps `Sender::send` for requests whose
 asker has already timed out inside a callback that aborts on panic (and `get_webview` unwraps a missing activity),
 and `tauri-runtime-wry` turns a timed-out `webview_version()` into `WebviewRuntimeNotInstalled`.
+
+# webrtc-sys-build on zip 9
+
+`webrtc-sys-build-0.3.19-patched/` is the unmodified crates.io source of **webrtc-sys-build 0.3.19** (registry
+checksum `0cd4f418e16f4b7ba028e6b5c70e4f532c7d2b5ca39726d42b699f3e4591ed5c`, from LiveKit's rust-sdks at
+`2d9f01ab1e933a86a8a5c53805ee29ee58b9be1b`), minus the `.cargo-ok` marker and the crate's own `Cargo.lock` (not read
+for a dependency; it named zip 0.6.6), except for the `zip` dependency in `Cargo.toml`, marked `PATCH (aokie)`. Its
+Apache-2.0 licence is included as `LICENSE`, LiveKit's from that repository. The version stays 0.3.19; this is not an
+upstream release.
+
+It is the build script helper of `webrtc-sys` (through `libwebrtc`, for `aokie-media` and the plugin): at build time
+it downloads LiveKit's prebuilt libwebrtc and unpacks it with `zip::ZipArchive::extract`. 0.3.19 is its latest
+release and asks for zip 0.6, and `ZipArchive::extract` before zip 9 keeps SUID/SGID bits, makes symbolic links whose
+targets leave the destination, and applies permissions through them (RUSTSEC-2026-0367, -0368, -0369), which failed
+`cargo audit` and so the release job. The patch asks for zip 9 with deflate through flate2 on zlib-rs alone (0.6's
+`deflate` was decompression only too; zip 9's defaults would add zstd, bzip2, lzma and AES). `src/lib.rs` compiles
+against zip 9 unchanged. zip 9.0.5 asks for Rust 1.88, the workspace's MSRV.
+
+Checked on Windows (2026-10-19): `aokie-media` built from an empty target folder, so the helper downloaded libwebrtc
+`win-x64-release-webrtc-89d790b` and unpacked it through zip 9 (38,755 files); `cargo audit` reports no
+vulnerability; the plugin's tests (`voice,managed-beta-driver`) pass.
+
+Remove this patch when a webrtc-sys-build release asks for zip 9 or later:
+
+1. Delete the `webrtc-sys-build = { path = ... }` line under `[patch.crates-io]` in the root `Cargo.toml` and the
+   `vendor/webrtc-sys-build-0.3.19-patched/` directory.
+2. `cargo update -p webrtc-sys-build` (or bump `libwebrtc`) and check that `Cargo.lock` has the registry `source` and
+   `checksum` lines for it again, and no zip before 9.
+3. Build `aokie-media` from an empty target folder (the helper downloads and unpacks libwebrtc there) and run
+   `cargo audit`.

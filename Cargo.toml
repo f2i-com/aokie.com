@@ -53,3 +53,6 @@ glib = { path = "vendor/glib" }
 # wry 0.57.0 with its Android main-thread message pump made panic-free: a late answer there aborts the app
 # process (see vendor/README.md).
 wry = { path = "vendor/wry-0.57.0-patched" }
+# webrtc-sys-build 0.3.19 (libwebrtc's build helper, the latest) on zip 9: zip 0.6's extract is RUSTSEC-2026-0367,
+# -0368 and -0369 (see vendor/README.md).
+webrtc-sys-build = { path = "vendor/webrtc-sys-build-0.3.19-patched" }
