@@ -67,6 +67,13 @@
   var bondedError = null;
   var busyPhones = {};
   var forgetArm = null; // address with the inline Forget confirm open
+  // Disconnect with a call on the line asks first: { address, text } of the
+  // inline confirm open, and the address whose call check is out.
+  var disconnectArm = null;
+  var disconnectChecking = null;
+  // The phone line is not running ({ consent, reason } from phone.status):
+  // nothing here can pair, reconnect or forget a phone until it does.
+  var lineDown = null;
   var baselineBonds = 0;
   var confirmed = false; // operator accepted THIS window's comparison
   var confirmedAddress = null; // ...for this phone
@@ -106,7 +113,9 @@
         d.pairingOpen && typeof d.pairingSecondsRemaining === 'number'
           ? d.pairingSecondsRemaining
           : 0;
-      radioError = d.error || null;
+      // (no phone line: said as such, not as the radio's last Bluetooth error)
+      lineDown = U.lineDownFromPhone(d);
+      radioError = lineDown ? null : d.error || null;
       // Connected is what the plugin says: an old error kept in `error`
       // (shown below) does not make a connected phone read "Pair a phone".
       connected = !!d.connected && !d.pairingConfirm;
@@ -131,18 +140,25 @@
 
   function refreshAll() {
     if (refreshing) return refreshing;
-    refreshing = Promise.all([pollStatus(), loadBonded(), loadTransport()]).then(
+    // Every read is waited for, each failing on its own: a status read that
+    // failed first once drew the paired list before it had been read ("No
+    // phone is paired yet" over paired phones). A failed read is shown by
+    // the card it is for (statusError, bondedError); `error` is an action's,
+    // and stays until the next action.
+    var settledRead = function (p) {
+      return p.then(
+        function () {
+          return true;
+        },
+        function () {
+          return false;
+        }
+      );
+    };
+    refreshing = Promise.all([settledRead(pollStatus()), settledRead(loadBonded()), settledRead(loadTransport())]).then(
       function () {
         known = true;
-        error = null;
         afterPoll();
-      },
-      function (e) {
-        // A failed read is shown by the card it is for (the status, the
-        // paired list); `error` is for a failure neither of them says.
-        error = statusError || bondedError ? null : errMsg(e);
-        known = true;
-        render();
       }
     ).then(
       function () {
@@ -422,6 +438,45 @@
       });
   }
 
+  /** Disconnect: with a call on the line, disconnecting takes it off the
+   *  receptionist, so the plugin is asked first (the Phone tab does not
+   *  follow calls) and the row asks before going on. */
+  function disconnect(address) {
+    if (!address || busyPhones[address] || disconnectChecking) return;
+    disconnectChecking = address;
+    render();
+    HOST.command('call.current')
+      .then(
+        function (data) {
+          var call = data && data.call;
+          if (!call || !call.state || call.state === 'ended') return '';
+          var who = call.from || 'the caller';
+          return call.state === 'ringing' && call.direction !== 'outbound'
+            ? 'A call from ' + who + ' is ringing: once the phone is disconnected, the receptionist cannot answer it.'
+            : 'This ends the call with ' + who + '.';
+        },
+        function () {
+          return 'Aokie cannot tell whether a call is on the line: if one is, this ends it.';
+        }
+      )
+      .then(function (text) {
+        disconnectChecking = null;
+        if (!text) {
+          phoneAct('phone.disconnect', address);
+          return;
+        }
+        disconnectArm = { address: address, text: text };
+        render();
+        focusIn('[data-act="ph-disconnect-cancel"]');
+      });
+  }
+
+  /** Focus `sel` in the tab once it is drawn again (an inline confirm opened or closed). */
+  function focusIn(sel) {
+    var el = root && root.querySelector ? root.querySelector(sel) : null;
+    if (el && typeof el.focus === 'function') el.focus();
+  }
+
   // ---- setup mode -----------------------------------------------------------
 
   /** The bonded phone that is connected now, or null. */
@@ -487,6 +542,30 @@
       );
     }
 
+    // No phone line: no pairing window can open, so none is offered; what
+    // the line waits on is said once, with where it is put right.
+    if (lineDown) {
+      var builtIn = transportMode !== 'dongle';
+      return (
+        '<div class="rcp-card__body">' +
+        '<p class="rcp-step-meta">' +
+        (lineDown.consent
+          ? 'The phone line is paused until consent is given again' +
+            (lineDown.reason ? ': ' + esc(U.sentence(lineDown.reason).replace(/\.+$/, '')) : '') +
+            '. Phones pair and reconnect once it is.'
+          : 'Aokie’s phone line is not running' +
+            (lineDown.reason ? ': ' + esc(U.plainTimes(lineDown.reason).replace(/\.+$/, '')) : '') +
+            '. ' + (builtIn ? 'A phone can pair once it is.' : 'A phone can pair once the dongle is set up and Aokie’s radio is running.')) +
+        '</p>' +
+        (lineDown.consent
+          ? '<div class="rcp-actions"><button type="button" class="rcp-button is-primary" data-tabgo="consent">Review consent</button></div>'
+          : builtIn
+            ? ''
+            : '<div class="rcp-actions"><button type="button" class="rcp-button is-primary" data-tabgo="dongle">Open the Dongle tab</button></div>') +
+        '</div>'
+      );
+    }
+
     if (connected) {
       var name = device && (device.name || device.address);
       return (
@@ -521,9 +600,14 @@
   }
 
   function bondedCardBody() {
+    // (a list the radio could not give for not running: no failure of its own)
+    if (bondedError && U.radioDownReason(bondedError) !== null) {
+      return '<p class="rcp-empty">The paired phones show here once the phone line is running.</p>';
+    }
     if (bondedError) return U.problemHtml(bondedError);
     if (!known) return U.loadingHtml;
     if (bonded.length === 0) {
+      if (lineDown) return '<p class="rcp-empty">No phone is paired yet.</p>';
       return transportMode === 'dongle'
         ? '<p class="rcp-empty">No phone is paired yet. Press Pair a phone, then pair your phone with “Aokie AI Assistant”.</p>'
         : '<p class="rcp-empty">No phone is paired yet. Pair your phone in Windows Settings › Bluetooth &amp; devices › Add device.</p>';
@@ -532,10 +616,12 @@
     for (var i = 0; i < bonded.length; i++) {
       var d = bonded[i];
       var addr = String(d.address || '');
-      var rowBusy = !!busyPhones[addr] || busy;
+      var rowBusy = !!busyPhones[addr] || busy || disconnectChecking === addr;
+      // (the status's own device only while its read is current)
       var isConn =
         d.connected ||
-        (connected && device && device.address && addr.toLowerCase() === String(device.address).toLowerCase());
+        (!statusError && connected && device && device.address && addr.toLowerCase() === String(device.address).toLowerCase());
+      var armed = !!(disconnectArm && disconnectArm.address === addr && isConn);
       rows.push(
         '<div class="rcp-phone-row">' +
           '<span class="rcp-phone-row__id">' +
@@ -544,12 +630,24 @@
           '</span>' +
           '<span class="rcp-phone-row__actions">' +
           '<span class="rcp-pill ' + (isConn ? 'is-ok' : 'is-neutral') + '"><i></i>' + (isConn ? 'Connected' : 'Offline') + '</span>' +
-          '<button type="button" class="rcp-button is-small" data-act="' + (isConn ? 'ph-disconnect' : 'ph-connect') + '" data-addr="' + esc(addr) + '"' +
-          (rowBusy ? ' disabled' : '') + '>' +
-          (busyPhones[addr] ? (isConn ? 'Disconnecting…' : 'Reconnecting…') : isConn ? 'Disconnect' : 'Reconnect') +
-          '</button>' +
-          '<button type="button" class="rcp-button is-small is-danger" data-act="ph-forget" data-addr="' + esc(addr) + '"' + (rowBusy || forgetArm === addr ? ' disabled' : '') + '>Forget</button>' +
+          // (no phone line: none of these can be done until it runs)
+          (lineDown
+            ? ''
+            : '<button type="button" class="rcp-button is-small" data-act="' + (isConn ? 'ph-disconnect' : 'ph-connect') + '" data-addr="' + esc(addr) + '"' +
+              (rowBusy || armed ? ' disabled' : '') + '>' +
+              (busyPhones[addr] ? (isConn ? 'Disconnecting…' : 'Reconnecting…') : isConn ? 'Disconnect' : 'Reconnect') +
+              '</button>' +
+              '<button type="button" class="rcp-button is-small is-danger" data-act="ph-forget" data-addr="' + esc(addr) + '"' + (rowBusy || forgetArm === addr ? ' disabled' : '') + '>Forget</button>') +
           '</span>' +
+          (armed
+            ? '<div class="rcp-confirm is-danger" role="group" aria-label="Disconnect while a call is on the line">' +
+              '<p><strong>Disconnect ' + esc(d.name || 'this phone') + '?</strong> ' + esc(disconnectArm.text) + '</p>' +
+              '<div class="rcp-actions">' +
+              '<button type="button" class="rcp-button is-danger" data-act="ph-disconnect-confirm" data-addr="' + esc(addr) + '"' + (rowBusy ? ' disabled' : '') + '>Disconnect anyway</button>' +
+              '<button type="button" class="rcp-button" data-act="ph-disconnect-cancel" data-addr="' + esc(addr) + '">Keep it connected</button>' +
+              '</div>' +
+              '</div>'
+            : '') +
           (forgetArm === addr
             ? '<div class="rcp-confirm is-danger">' +
               '<p><strong>Forget ' + esc(d.name || 'this phone') + '?</strong> It cannot reconnect until you pair it again.</p>' +
@@ -562,7 +660,14 @@
           '</div>'
       );
     }
-    return '<div class="rcp-phone-list">' + rows.join('') + '</div>';
+    return (
+      '<div class="rcp-phone-list">' + rows.join('') + '</div>' +
+      (lineDown
+        ? '<p class="rcp-empty">' +
+          (lineDown.consent ? 'Phones reconnect by themselves once consent is given again.' : 'Phones reconnect by themselves once the phone line is running.') +
+          '</p>'
+        : '')
+    );
   }
 
   function render() {
@@ -582,6 +687,8 @@
       '<h3>' +
       (statusError
         ? 'Phone status unavailable'
+        : lineDown
+        ? lineDown.consent ? 'Paused for consent' : 'No phone line yet'
         : confirmPrompt
         ? 'Confirm the pairing code'
         : secondsLeft > 0
@@ -607,7 +714,9 @@
       '<div class="rcp-card__heading-copy">' +
       '<small>Paired phones</small>' +
       '<h3>' +
-      (bondedError ? 'Paired phones unavailable' : known ? bonded.length + ' phone' + (bonded.length === 1 ? '' : 's') + ' paired' : 'Checking paired phones…') +
+      (bondedError
+        ? U.radioDownReason(bondedError) !== null ? 'Not known yet' : 'Paired phones unavailable'
+        : known ? bonded.length + ' phone' + (bonded.length === 1 ? '' : 's') + ' paired' : 'Checking paired phones…') +
       '</h3>' +
       '</div>' +
       '</div>' +
@@ -634,8 +743,16 @@
       else if (act === 'pair-confirm') resolvePairing(true);
       else if (act === 'pair-reject') resolvePairing(false);
       else if (act === 'ph-connect') phoneAct('phone.connect', btn.getAttribute('data-addr'));
-      else if (act === 'ph-disconnect') phoneAct('phone.disconnect', btn.getAttribute('data-addr'));
-      else if (act === 'ph-forget') {
+      else if (act === 'ph-disconnect') disconnect(btn.getAttribute('data-addr'));
+      else if (act === 'ph-disconnect-confirm') {
+        disconnectArm = null;
+        phoneAct('phone.disconnect', btn.getAttribute('data-addr'));
+      } else if (act === 'ph-disconnect-cancel') {
+        var kept = btn.getAttribute('data-addr');
+        disconnectArm = null;
+        render();
+        focusIn('[data-act="ph-disconnect"][data-addr="' + String(kept || '').replace(/["\\]/g, '\\$&') + '"]');
+      } else if (act === 'ph-forget') {
         forgetArm = btn.getAttribute('data-addr');
         render();
       } else if (act === 'ph-forget-confirm') doForget(btn.getAttribute('data-addr'));

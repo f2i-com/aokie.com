@@ -49,8 +49,21 @@
    *  quiet note, not an error: OAIY says so above the screen, with Start. */
   var NOT_RUNNING = "Aokie is not running, so this can't be read yet. Start it and this fills in by itself.";
 
+  /** The screen is a page of OAIY Desktop (its PluginHost reads OAIY's own
+   *  state, which FormLogic Desktop's does not): words that name FormLogic
+   *  are said as they are inside OAIY. */
+  var OAIY_HOST = typeof HOST.oaiyStatus === 'function';
+
+  /** The plugin's words, as they read inside OAIY: a reason an older Aokie
+   *  kept sends the person to "the FormLogic consent wizard", which is this
+   *  screen's Consent tab there. */
+  function hostWords(text) {
+    var s = String(text == null ? '' : text);
+    return OAIY_HOST ? s.replace(/re-run the FormLogic consent wizard/gi, 'review consent in the Consent tab') : s;
+  }
+
   function errMsg(e) {
-    var m = e && e.message ? e.message : String(e);
+    var m = hostWords(e && e.message ? e.message : String(e));
     // The host's words when Aokie itself is not running ("503: The "aokie"
     // connector is not available: its plugin is … Not started yet …"): OAIY
     // already says so above the screen, with a Start button, so say it once
@@ -92,8 +105,100 @@
 
   /** A reason as a sentence of its own: times made plain, a capital first. */
   function sentence(text) {
-    var s = plainTimes(text).trim();
+    var s = plainTimes(hostWords(text)).trim();
     return s ? s.charAt(0).toUpperCase() + s.slice(1) : s;
+  }
+
+  // ---- the phone line not running ------------------------------------------
+  // Without its radio (no dongle, a dongle another program holds, or consent
+  // holding it back) Aokie refuses every call and phone command with a reason
+  // for developers ("call.current: the radio is not running (…) — command not
+  // performed"; "dongle.diagnostics is not yet wired to hardware (outbox: …)").
+  // The screens read that as one plain state, said once, with where to put it
+  // right, instead of showing each refusal in red.
+
+  /** The reason in a refusal for want of the radio ('' when it gives none),
+   *  or null for any other error. */
+  function radioDownReason(message) {
+    var m = String(message == null ? '' : message);
+    var running = /the radio is not running \((.*)\)\s*[\u2014-]+\s*command not performed/i.exec(m);
+    if (running) return running[1];
+    if (/not yet wired to hardware/i.test(m)) return '';
+    return null;
+  }
+
+  /** What phone.status says while the radio is not running (`source`
+   *  'config', its `error` why): { consent, reason }, or null while the radio
+   *  runs or no reason is known. `consent`: consent holds the line back. */
+  function lineDownFromPhone(status) {
+    if (!status || status.source !== 'config' || !status.error) return null;
+    return lineDownFor(String(status.error));
+  }
+
+  /** A not-running reason as { consent, reason }. */
+  function lineDownFor(reason) {
+    var consent = /^consent required:\s*/i.exec(reason);
+    return consent ? { consent: true, reason: reason.slice(consent[0].length) } : { consent: false, reason: reason };
+  }
+
+  // ---- focus across a redraw ------------------------------------------------
+  // A tab drawn again from its markup (a form after a save or a reload) loses
+  // the field the person was in, and with it what they type next. These note
+  // the focused control (by its data-* name or id), its caret and its scroll,
+  // and put them back on the new one.
+
+  var FOCUS_KEYS = ['data-key', 'data-bool', 'data-num', 'data-scope', 'data-act', 'id'];
+
+  /** Where focus is inside `root`, or null when it is not there. */
+  function focusOf(root) {
+    var a = document.activeElement;
+    if (!root || !a || a === root || a === document.body || !root.contains || !root.contains(a)) return null;
+    for (var i = 0; i < FOCUS_KEYS.length; i++) {
+      var v = a.getAttribute && a.getAttribute(FOCUS_KEYS[i]);
+      if (!v) continue;
+      var at = { sel: '[' + FOCUS_KEYS[i] + '="' + String(v).replace(/["\\]/g, '\\$&') + '"]' };
+      try {
+        if (typeof a.selectionStart === 'number') {
+          at.start = a.selectionStart;
+          at.end = a.selectionEnd;
+          at.dir = a.selectionDirection;
+        }
+      } catch (e) {
+        /* a number field has no caret to read */
+      }
+      if (typeof a.scrollTop === 'number' && a.scrollTop) at.scroll = a.scrollTop;
+      return at;
+    }
+    return null;
+  }
+
+  /** Put focus back where `focusOf` found it. True when it took. */
+  function restoreFocus(root, at) {
+    if (!root || !at || !root.querySelector) return false;
+    var el = root.querySelector(at.sel);
+    if (!el || el.disabled || typeof el.focus !== 'function') return false;
+    try {
+      el.focus({ preventScroll: true });
+    } catch (e) {
+      el.focus();
+    }
+    if (typeof at.start === 'number') {
+      try {
+        el.setSelectionRange(at.start, at.end, at.dir || 'none');
+      } catch (e) {
+        /* not a text field */
+      }
+    }
+    if (typeof at.scroll === 'number') el.scrollTop = at.scroll;
+    return document.activeElement === el;
+  }
+
+  /** Nowhere in particular has focus (a redraw dropped it, or none was
+   *  set): or only `root` itself, the tab's panel, which WebKit focuses for
+   *  a mouse press on a button inside it (it does not focus buttons). */
+  function focusLost(root) {
+    var a = document.activeElement;
+    return !a || a === document.body || a === document.documentElement || (!!root && a === root);
   }
 
   /** innerHTML with a change guard so a poll re-render never resets hover
@@ -223,6 +328,8 @@
     providerId: OAIY_PROVIDER_ID,
     endpoint: OAIY_REALTIME_ENDPOINT,
     destination: OAIY_DESTINATION,
+    /** This screen runs inside OAIY Desktop (see OAIY_HOST). */
+    isHost: OAIY_HOST,
     realtimeProviderId: realtimeProviderId,
     callRoute: callRoute,
     voiceService: oaiyVoiceService,
@@ -344,6 +451,13 @@
     util: {
       esc: esc, errMsg: errMsg, setHtml: setHtml, svg: svg, icons: ICONS, navLink: navLink,
       problemHtml: problemHtml, loadingHtml: LOADING_HTML, plainTimes: plainTimes, sentence: sentence, notRunning: NOT_RUNNING,
+      radioDownReason: radioDownReason, lineDownFromPhone: lineDownFromPhone, lineDownFor: lineDownFor,
+      focusOf: focusOf, restoreFocus: restoreFocus, focusLost: focusLost,
+    },
+    /** A tab saved settings: the Overview reads them again when it is next
+     *  shown (its summary otherwise waited up to 30 s for its own read). */
+    settingsChanged: function () {
+      state.settingsDue = true;
     },
     /** Where calls go, shared by the Overview, Settings and Consent tabs. */
     oaiy: OAIY,
@@ -451,6 +565,9 @@
     var el = tabContainer(id);
     el.hidden = false;
     if (id === 'overview') {
+      // What another tab saved (the greeting, where calls go) shows at once,
+      // not at the summary's next 30 s read.
+      state.settingsDue = true;
       if (!document.hidden) startTimers();
       return;
     }
@@ -578,6 +695,12 @@
     busyCall: false,
     busyPhones: {}, // address -> true while connect/disconnect runs
     busyRedrive: false,
+    // The phone whose Disconnect asks first: a call is on the line (or none
+    // can be told), and disconnecting takes it off the receptionist.
+    disconnectArm: null,
+    // The settings are read on the next tick, not only every sixth: at start,
+    // on entering the Overview, and after another tab saved them.
+    settingsDue: true,
     now: Date.now(),
   };
 
@@ -681,7 +804,10 @@
         state.callKnown = false;
         state.callPauseReason = '';
       }
-    ).then(renderLive);
+    ).then(function () {
+      renderLive();
+      renderPhones(); // Disconnect asks first while a call is on the line
+    });
   }
 
   function refreshSettings() {
@@ -769,7 +895,11 @@
     if (slowBusy) return;
     slowBusy = true;
     var reads = [refreshSnapshot(), refreshPhoneStatus(), refreshDiag(), refreshPhones()];
-    if (slowTicks % 6 === 0) reads.push(refreshSettings()); // every ~30 s (and at start)
+    if (state.settingsDue || slowTicks % 6 === 0) {
+      // every ~30 s, at start, on entering the Overview and after a save
+      state.settingsDue = false;
+      reads.push(refreshSettings());
+    }
     if (slowTicks % 3 === 0) {
       // every ~15 s (and at start)
       reads.push(refreshSources());
@@ -836,6 +966,37 @@
     return !!(snap && (snap.state === 'running' || snap.state === 'unhealthy'));
   }
 
+  /** The radio's reason in the health report ("radio: no supported USB
+   *  Bluetooth dongle was found"), '' when it has none. */
+  function healthRadioReason() {
+    var health = pluginHealth();
+    var m = health && /^radio:\s*(.+)$/i.exec(String(health.detail || ''));
+    return m ? m[1] : '';
+  }
+
+  /** The phone line is not running: { consent, reason } (consent holds it
+   *  back, or the radio did not start), from whichever read says so; null
+   *  while it runs or nothing says otherwise. */
+  function lineDown() {
+    var radio = state.diag && state.diag.radio;
+    if (radio && radio.paused && radio.blockedBy === 'consent') return { consent: true, reason: String(radio.reason || '') };
+    if (state.callPauseReason) return { consent: true, reason: state.callPauseReason };
+    var fromPhone = lineDownFromPhone(state.phone);
+    if (fromPhone) return fromPhone;
+    var why = state.diag === null ? radioDownReason(state.diagError) : null;
+    if (why === null && state.call === null && !state.callKnown) why = radioDownReason(state.callError);
+    if (why === null) return null;
+    var down = lineDownFor(why);
+    if (!down.consent && !down.reason) down.reason = healthRadioReason();
+    return down;
+  }
+
+  /** "No supported USB Bluetooth dongle was found" and the like: the dongle
+   *  itself is missing, not some other fault of the radio. */
+  function noDongleReason(reason) {
+    return /no (?:supported )?(?:usb )?(?:bluetooth )?dongle/i.test(String(reason || ''));
+  }
+
   function renderHero() {
     var headline = $('hero-headline');
     var sub = $('hero-sub');
@@ -867,6 +1028,13 @@
     // line, or calls sent where nobody answers, the headline said "Ready for
     // calls" over tiles that said otherwise.
     var gaps = status === 'ok' ? readinessGaps() : [];
+    // A line held back for consent, or a radio that did not start, is the
+    // news: what follows from it (no phone connected) is not.
+    var down = status === 'ok' || status === 'degraded' ? lineDown() : null;
+    // Records that did not reach OAIY: the delivery card says so, and the
+    // headline agrees with it rather than read all well above it.
+    var outbox = outboxCounts(state.diag);
+    var stuck = outbox ? (Number(outbox.dead) || 0) + (Number(outbox.failed) || 0) : 0;
 
     if (!running) {
       headline.textContent = 'Aokie is not running';
@@ -881,10 +1049,30 @@
       headline.textContent = 'Starting up';
       sub.textContent = 'No health report from the plugin yet.';
       setPill(pill, pillText, 'is-neutral', 'Starting');
+    } else if (down && down.consent) {
+      headline.textContent = 'Paused until consent is reviewed';
+      sub.textContent =
+        (down.reason ? sentence(down.reason).replace(/\.+$/, '') + '. ' : '') +
+        'Calls ring through to you until consent is given again, in Consent.';
+      setPill(pill, pillText, 'is-warn', 'Consent needed');
+    } else if (down) {
+      headline.textContent = 'Not ready for calls';
+      sub.textContent =
+        'Aokie’s phone line is not running' + (down.reason ? ': ' + plainTimes(down.reason).replace(/\.+$/, '') : '') + '.' +
+        (transportMode === 'native' ? '' : ' Set up the dongle in the Dongle tab.');
+      setPill(pill, pillText, 'is-warn', 'Not ready');
     } else if (status === 'ok' && gaps.length) {
       headline.textContent = 'Not ready for calls';
       sub.textContent = gaps.join(' ');
       setPill(pill, pillText, 'is-warn', 'Not ready');
+    } else if (status === 'ok' && stuck > 0) {
+      var dead = Number(outbox.dead) || 0;
+      headline.textContent = 'Ready for calls · some records waiting';
+      sub.textContent = dead > 0
+        ? (dead === 1 ? 'One call or text record' : dead + ' call and text records') +
+          ' did not reach OAIY: send ' + (dead === 1 ? 'it' : 'them') + ' again under Call & text records.'
+        : 'Some call and text records have not reached OAIY yet: Aokie keeps trying.';
+      setPill(pill, pillText, 'is-warn', 'Records waiting');
     } else if (status === 'ok') {
       headline.textContent = 'Ready for calls';
       sub.textContent = sentence(health.detail) || 'Aokie is running and its phone line is up.';
@@ -908,7 +1096,11 @@
   function readinessGaps() {
     var gaps = [];
     var phone = state.phone;
-    if (phone && typeof phone === 'object') {
+    var radio = state.diag && state.diag.radio;
+    var paused = !!(radio && radio.paused && radio.blockedBy === 'consent');
+    // (first, and alone of the phone's gaps: no phone connects while it lasts)
+    if (paused) gaps.push('The phone line is paused until consent is given again.');
+    if (!paused && phone && typeof phone === 'object') {
       if (phone.pairingConfirm) gaps.push('A phone is waiting for its pairing code to be confirmed in Phone setup.');
       else if (!phone.connected) {
         gaps.push(
@@ -921,10 +1113,6 @@
     var route = state.settings ? OAIY.callRoute(state.settings.settings) : 'unknown';
     if (route === 'local' || route === 'flows') {
       gaps.push('Calls do not go to OAIY, so nobody answers them: send them to OAIY in Settings.');
-    }
-    var radio = state.diag && state.diag.radio;
-    if (radio && radio.paused && radio.blockedBy === 'consent') {
-      gaps.push('The phone line is paused until consent is given again.');
     }
     return gaps;
   }
@@ -957,6 +1145,25 @@
       // the connection; the bonded list says who is paired).
       var linked = !!phone.connected && !phone.pairingConfirm;
       var bondedCount = Array.isArray(state.phones) ? state.phones.length : 0;
+      // No phone line (consent holds it back, or the radio did not start):
+      // the phone waits on that, and the tile says where it is put right
+      // rather than offer a pairing that cannot happen. The radio tile says why.
+      var down = lineDownFromPhone(phone);
+      if (down) {
+        items.push({
+          icon: ICONS.smartphone,
+          label: label,
+          value: bondedCount > 0 || phone.paired ? 'Paired, offline' : 'Not paired',
+          note: down.consent
+            ? 'Reconnects once consent is given again'
+            : bondedCount > 0 || phone.paired
+              ? 'Reconnects once the phone line is running'
+              : 'A phone can pair once the phone line is running',
+          ok: null,
+          go: down.consent ? ['consent', 'Review consent'] : transportMode === 'native' ? null : ['dongle', 'Dongle setup'],
+        });
+        return;
+      }
       var value = phone.pairingConfirm
         ? 'Confirm pairing'
         : linked
@@ -1060,6 +1267,26 @@
         return;
       }
       var radio = diag && diag.radio;
+      // The radio did not start (no dongle, one another program holds): its
+      // reason in plain words, once, and the Dongle tab to put it right.
+      var notStarted = !radio && state.diagError !== NOT_RUNNING ? radioDownReason(state.diagError) : null;
+      if (notStarted !== null) {
+        var line = lineDown();
+        if (line && line.consent) {
+          items.push({ icon: ICONS.radio, label: label, value: 'Paused for consent', note: sentence(line.reason) || 'Consent must be reviewed', ok: false, go: ['consent', 'Review consent'] });
+          return;
+        }
+        var why = (line && line.reason) || notStarted || healthRadioReason();
+        items.push({
+          icon: ICONS.radio,
+          label: label,
+          value: noDongleReason(why) ? 'No dongle' : 'Not running',
+          note: why ? sentence(why) : 'Aokie’s radio is not running',
+          ok: false,
+          go: transportMode === 'native' ? null : ['dongle', 'Dongle setup'],
+        });
+        return;
+      }
       if (!radio) {
         var off = state.diagError === NOT_RUNNING;
         items.push({
@@ -1189,19 +1416,43 @@
     if (!call) {
       pill.hidden = true;
       speakRow.hidden = true;
-      if (!state.callKnown) {
+      // The radio not running is a state of the line, not a failed read: the
+      // card says so once, calmly, and where to put it right (the radio tile
+      // above gives the reason).
+      var downWhy = state.callKnown ? null : radioDownReason(state.callError);
+      var pauseWhy = state.callPauseReason;
+      if (downWhy !== null && lineDownFor(downWhy).consent) {
+        pauseWhy = lineDownFor(downWhy).reason || 'Consent must be reviewed before the receptionist can resume.';
+        downWhy = null;
+      }
+      if (downWhy !== null) {
+        title.textContent = 'No phone line';
+        setHtml(
+          body,
+          '<div class="rcp-empty-call">' +
+            '<span class="rcp-empty-call__icon">' + ICONS.phoneBig + '</span>' +
+            '<h4>The phone line is not running</h4>' +
+            '<p>Calls show here once Aokie’s radio is running' + (transportMode === 'native' ? '.' : ' on the dongle.') + '</p>' +
+            (transportMode === 'native'
+              ? ''
+              : '<div class="rcp-actions"><button type="button" class="rcp-button" data-tabgo="dongle">Open the Dongle tab</button></div>') +
+            '</div>'
+        );
+        return;
+      }
+      if (!state.callKnown && !pauseWhy) {
         title.textContent = 'Live call unavailable';
         setHtml(body, problemHtml(state.callError || 'The current call could not be read.'));
         return;
       }
-      if (state.callPauseReason) {
+      if (pauseWhy) {
         title.textContent = 'Receptionist paused';
         setHtml(
           body,
           '<div class="rcp-empty-call">' +
             '<span class="rcp-empty-call__icon is-warn">' + ICONS.alert + '</span>' +
             '<h4>Consent needs review</h4>' +
-            '<p>' + esc(sentence(state.callPauseReason).replace(/\.+$/, '')) + '. Calls ring through to you until consent is given again.</p>' +
+            '<p>' + esc(sentence(pauseWhy).replace(/\.+$/, '')) + '. Calls ring through to you until consent is given again.</p>' +
             '<div class="rcp-actions"><button type="button" class="rcp-button is-primary" data-tabgo="consent">Review consent</button></div>' +
             '</div>'
         );
@@ -1294,11 +1545,12 @@
   function renderSwitchboard() {
     var body = $('switchboard-body');
     var board = state.switchboard;
-    // (Aokie not running: the live call card says so already, once is enough)
+    // (Aokie or its radio not running: the live call card says so already,
+    // once is enough)
     body.hidden =
       board === undefined ||
       !!(board && !board.waiting && !board.parked && !board.switchInProgress) ||
-      (!board && state.switchboardError === NOT_RUNNING);
+      (!board && (state.switchboardError === NOT_RUNNING || radioDownReason(state.switchboardError) !== null));
     if (body.hidden) {
       setHtml(body, '');
       return;
@@ -1391,6 +1643,20 @@
 
   // ---- paired phones ------------------------------------------------------
 
+  /** What Disconnect would do to a call: the words of its confirm, or ''
+   *  when no call is on the line (then it asks nothing). */
+  function disconnectWarning() {
+    var call = state.call;
+    if (call) {
+      var who = call.from || 'the caller';
+      return call.state === 'ringing' && call.direction !== 'outbound'
+        ? 'A call from ' + who + ' is ringing: once the phone is disconnected, the receptionist cannot answer it.'
+        : 'This ends the call with ' + who + '.';
+    }
+    // (the current call could not be read: it may be there)
+    return state.callKnown ? '' : 'Aokie cannot tell whether a call is on the line: if one is, this ends it.';
+  }
+
   function renderPhones() {
     var title = $('phones-title');
     var body = $('phones-body');
@@ -1402,19 +1668,45 @@
       return;
     }
     if (phones === null) {
-      title.textContent = 'Paired phones unavailable';
-      setHtml(body, problemHtml(state.phonesError || 'The paired phones could not be read.'));
+      // (a list the radio could not give for not running: no failure of its own)
+      var listDown = radioDownReason(state.phonesError) !== null;
+      title.textContent = listDown ? 'Not known yet' : 'Paired phones unavailable';
+      setHtml(
+        body,
+        listDown
+          ? '<p class="rcp-empty">The paired phones show here once the phone line is running.</p>'
+          : problemHtml(state.phonesError || 'The paired phones could not be read.')
+      );
       return;
     }
+    // No phone line: nothing here can pair, reconnect or disconnect a phone
+    // until it runs, so the card says what it waits on instead.
+    var down = lineDown();
+    var goFix = down
+      ? down.consent
+        ? '<button type="button" class="rcp-button" data-tabgo="consent">Review consent</button>'
+        : transportMode === 'native'
+          ? ''
+          : '<button type="button" class="rcp-button" data-tabgo="dongle">Set up the dongle</button>'
+      : '';
     if (phones.length === 0) {
       title.textContent = 'No phones paired';
       setHtml(
         body,
-        '<p class="rcp-empty">No phone is paired with Aokie yet.</p>' +
-          '<div class="rcp-actions"><button type="button" class="rcp-button" data-tabgo="phone">Pair a phone</button></div>'
+        down
+          ? '<p class="rcp-empty">No phone is paired with Aokie yet. A phone can pair once ' +
+              (down.consent ? 'consent is given again.' : 'the phone line is running.') + '</p>' +
+              (goFix ? '<div class="rcp-actions">' + goFix + '</div>' : '')
+          : '<p class="rcp-empty">No phone is paired with Aokie yet.</p>' +
+              '<div class="rcp-actions"><button type="button" class="rcp-button" data-tabgo="phone">Pair a phone</button></div>'
       );
       return;
     }
+
+    // Disconnect asks first while a call is on the line; with none now, the
+    // question is dropped.
+    var warning = disconnectWarning();
+    if (!warning) state.disconnectArm = null;
 
     title.textContent = phones.length + ' phone' + (phones.length === 1 ? '' : 's') + ' paired';
     var html =
@@ -1424,6 +1716,7 @@
           var addr = String(d.address || '');
           var busy = !!state.busyPhones[addr];
           var connected = !!d.connected;
+          var armed = state.disconnectArm === addr && connected && !down;
           return (
             '<div class="rcp-phone-row">' +
             '<span class="rcp-phone-row__id">' +
@@ -1434,23 +1727,39 @@
             '<span class="rcp-pill ' + (connected ? 'is-ok' : 'is-neutral') + '"><i></i>' +
             (connected ? 'Connected' : 'Offline') +
             '</span>' +
-            '<button type="button" class="rcp-button is-small" data-act="' +
-            (connected ? 'phone-disconnect' : 'phone-connect') +
-            '" data-addr="' + esc(addr) + '"' + (busy ? ' disabled' : '') + '>' +
-            (busy
-              ? connected
-                ? 'Disconnecting…'
-                : 'Reconnecting…'
-              : connected
-                ? 'Disconnect'
-                : 'Reconnect') +
-            '</button>' +
+            (down
+              ? ''
+              : '<button type="button" class="rcp-button is-small" data-act="' +
+                (connected ? 'phone-disconnect' : 'phone-connect') +
+                '" data-addr="' + esc(addr) + '"' + (busy || armed ? ' disabled' : '') + '>' +
+                (busy
+                  ? connected
+                    ? 'Disconnecting…'
+                    : 'Reconnecting…'
+                  : connected
+                    ? 'Disconnect'
+                    : 'Reconnect') +
+                '</button>') +
             '</span>' +
+            (armed
+              ? '<div class="rcp-confirm is-danger" role="group" aria-label="Disconnect while a call is on the line">' +
+                '<p><strong>Disconnect ' + esc(d.name || 'this phone') + '?</strong> ' + esc(warning) + '</p>' +
+                '<div class="rcp-actions">' +
+                '<button type="button" class="rcp-button is-danger" data-act="phone-disconnect-confirm" data-addr="' + esc(addr) + '"' + (busy ? ' disabled' : '') + '>Disconnect anyway</button>' +
+                '<button type="button" class="rcp-button" data-act="phone-disconnect-cancel" data-addr="' + esc(addr) + '">Keep it connected</button>' +
+                '</div>' +
+                '</div>'
+              : '') +
             '</div>'
           );
         })
         .join('') +
-      '</div>';
+      '</div>' +
+      (down
+        ? '<p class="rcp-empty">' +
+          (down.consent ? 'Phones reconnect by themselves once consent is given again.' : 'Phones reconnect by themselves once the phone line is running.') +
+          '</p>'
+        : '');
     setHtml(body, html);
   }
 
@@ -1508,7 +1817,8 @@
       var voiceName = OAIY.voiceText(state.oaiy);
       var model = OAIY.modelText(state.oaiy);
       rows.push(['OAIY Voice', oaiyVoiceLabel(), 'services']);
-      rows.push(['Voice on calls', voiceName || 'Chosen in Calendar', 'calendar']);
+      // (the voice card, How the phone sounds, is on Calendar › Hours & Services)
+      rows.push(['Voice on calls', voiceName || 'Chosen in Hours & Services', 'hours']);
       rows.push(['Model', model || 'Loaded in Engines', 'engines']);
     }
     rows.push(
@@ -1554,7 +1864,9 @@
         },
         function (e) {
           var msg = errMsg(e);
-          if (msg.indexOf('stale_call') !== -1) {
+          // OAIY's bridge hands the plugin's typed error on as `code`; an
+          // older host has only the words (errMsg capitalises their start).
+          if ((e && e.code === 'stale_call') || /stale_call/i.test((e && e.message) || String(e))) {
             HOST.toast('info', 'The call changed meanwhile: showing it as it is now.');
             return refreshCall().then(function () {
               return false;
@@ -1663,13 +1975,37 @@
     var btn = el && el.closest ? el.closest('[data-act]') : null;
     if (!btn || btn.disabled) return;
     var act = btn.getAttribute('data-act');
-    if (act === 'phone-connect') phoneAct('phone.connect', btn.getAttribute('data-addr'));
-    else if (act === 'phone-disconnect') phoneAct('phone.disconnect', btn.getAttribute('data-addr'));
-    else if (act === 'call-answer') callAct('call.answer');
+    var addr = btn.getAttribute('data-addr');
+    if (act === 'phone-connect') phoneAct('phone.connect', addr);
+    else if (act === 'phone-disconnect') {
+      // With a call on the line (or none that can be told) disconnecting
+      // takes it off the receptionist: asked first, by the phone's row.
+      if (!disconnectWarning()) {
+        phoneAct('phone.disconnect', addr);
+        return;
+      }
+      state.disconnectArm = addr;
+      renderPhones();
+      focusIn($('phones-body'), '[data-act="phone-disconnect-cancel"]');
+    } else if (act === 'phone-disconnect-confirm') {
+      state.disconnectArm = null;
+      phoneAct('phone.disconnect', addr);
+    } else if (act === 'phone-disconnect-cancel') {
+      state.disconnectArm = null;
+      renderPhones();
+      focusIn($('phones-body'), '[data-act="phone-disconnect"][data-addr="' + String(addr || '').replace(/["\\]/g, '\\$&') + '"]');
+    } else if (act === 'call-answer') callAct('call.answer');
     else if (act === 'call-reject') callAct('call.reject');
     else if (act === 'call-hangup') callAct('call.hangup');
     else if (act === 'redrive') redriveDead();
   });
+
+  /** Move focus to `sel` in `container`, where an inline confirm opened or
+   *  closed (its markup was drawn anew, which drops focus). */
+  function focusIn(container, sel) {
+    var el = container && container.querySelector ? container.querySelector(sel) : null;
+    if (el && typeof el.focus === 'function') el.focus();
+  }
 
   $('speak-send').addEventListener('click', sendSpeech);
   $('speak-input').addEventListener('keydown', function (e) {

@@ -635,6 +635,8 @@
       .then(function () {
         resetting = false;
         render();
+        // (the radio after the reset: up again, or why not)
+        checkRadio();
       });
   }
 
@@ -788,33 +790,52 @@
         '. Go back to the consent step, then return here.</span></div>'
       );
     }
+    if (!radioStartOffered()) return '';
+    // No driver step (Linux, macOS): the dongle is chosen first, below, and
+    // this goes with the choice, after it (selectStepHtml).
+    if (noDriver()) return '';
+    return (
+      '<div class="rcp-callout is-warn">' + ICONS.alert +
+      '<span>The dongle has its driver, but Aokie’s radio has not opened it: Aokie started before the driver was there. ' +
+      'Start Aokie again to open the dongle. It takes a few seconds.</span></div>' +
+      '<div class="rcp-actions">' + startButtonHtml(false) + '</div>' +
+      radioStartErrorHtml()
+    );
+  }
+
+  /** Whether starting Aokie again is offered: the radio is checked and not
+   *  up, consent is not what keeps it off, and a dongle that could open is
+   *  there (or a start is under way or failed). */
+  function radioStartOffered() {
+    if (setupRadio === undefined || radioUp()) return false;
+    if (setupRadio && setupRadio.paused && setupRadio.blockedBy === 'consent' && !radioStarting) return false;
     // A dongle with its driver (not other hardware on WinUSB: that says nothing of the dongle).
     var bound = false;
     var conn = candidates();
     for (var i = 0; i < conn.length; i++) {
       if (conn[i].driverBound) bound = true;
     }
-    if (!bound && !radioStarting && !radioStartError) return '';
-    // No driver step: the reason is whatever the radio said when it tried (on
-    // a Mac, that macOS's own Bluetooth holds the dongle), or that the dongle
-    // was plugged in after Aokie started.
-    var why = noDriver()
-      ? 'Aokie’s radio has not opened the dongle' +
-        (setupRadio && setupRadio.error
-          ? ': ' + esc(setupRadio.error) + '. If that is put right, start Aokie again to open the dongle.'
-          : '. If it was plugged in after Aokie started, start Aokie again to open it. It takes a few seconds.')
-      : 'The dongle has its driver, but Aokie’s radio has not opened it: Aokie started before the driver was there. ' +
-        'Start Aokie again to open the dongle. It takes a few seconds.';
+    return bound || radioStarting || !!radioStartError;
+  }
+
+  /** Several controllers and none chosen for Aokie yet (no driver marks one
+   *  as Aokie's on Linux or macOS): starting first would open whichever. */
+  function choiceNeeded() {
+    var offered = candidates();
+    return noDriver() && offered.length > 1 && !offered.some(isPreferred);
+  }
+
+  function startButtonHtml(waitForChoice) {
     return (
-      '<div class="rcp-callout is-warn">' + ICONS.alert +
-      '<span>' + why + '</span></div>' +
-      '<div class="rcp-actions">' +
-      '<button type="button" class="rcp-button is-primary" data-act="dg-setup-start"' + (radioStarting ? ' disabled' : '') + '>' +
+      '<button type="button" class="rcp-button' + (waitForChoice ? '' : ' is-primary') + '" data-act="dg-setup-start"' +
+      (radioStarting || waitForChoice ? ' disabled' : '') + '>' +
       (radioStarting ? 'Starting Aokie — opening the dongle…' : 'Start Aokie with this dongle') +
-      '</button>' +
-      '</div>' +
-      (radioStartError && !radioStarting ? '<p class="rcp-error" role="alert">' + esc(radioStartError) + '</p>' : '')
+      '</button>'
     );
+  }
+
+  function radioStartErrorHtml() {
+    return radioStartError && !radioStarting ? '<p class="rcp-error" role="alert">' + esc(radioStartError) + '</p>' : '';
   }
 
   /** Setup mode on the built-in transport: nothing to set up here. */
@@ -1008,6 +1029,26 @@
       right.push('<button type="button" class="rcp-button is-primary" data-act="dg-continue">Continue</button>');
     }
 
+    // No driver (Linux, macOS): the radio has not opened the dongle. Why, in
+    // the radio's own words (on a Mac, that macOS's own Bluetooth holds it),
+    // after the choice of dongle, and starting Aokie with it as the way on
+    // once one is chosen.
+    var startError = '';
+    if (noDriver() && radioStartOffered()) {
+      var waitForChoice = choiceNeeded();
+      html.push(
+        '<div class="rcp-callout is-warn">' + ICONS.alert + '<span>' +
+          'Aokie’s radio has not opened the dongle' +
+          (setupRadio && setupRadio.error
+            ? ': ' + esc(setupRadio.error) + '. If that is put right, start Aokie again to open the dongle.'
+            : '. If it was plugged in after Aokie started, start Aokie again to open it. It takes a few seconds.') +
+          (waitForChoice ? ' Choose the dongle Aokie should use first, above.' : '') +
+          '</span></div>'
+      );
+      right.push(startButtonHtml(waitForChoice));
+      startError = radioStartErrorHtml();
+    }
+
     if (sel && restoreArm === key(sel)) {
       html.push(
         '<div class="rcp-confirm is-danger">' +
@@ -1022,6 +1063,7 @@
       );
     }
     html.push(errorHtml());
+    html.push(startError);
     html.push(
       barHtml(
         ['<button type="button" class="rcp-button" data-act="dg-rescan"' + (loading ? ' disabled' : '') + '>' + (loading ? 'Scanning…' : 'Rescan') + '</button>'],
@@ -1179,6 +1221,22 @@
 
   /** The "Reset the dongle" card: software recovery without unplugging. */
   function resetCardHtml() {
+    // A reset reopens the radio's own USB connection: with the radio not
+    // running there is none, and the plugin refuses it. Not offered then,
+    // and said why (the radio's state is read on entering the tab).
+    var up = radioUp();
+    var paused = !!(setupRadio && setupRadio.paused && setupRadio.blockedBy === 'consent');
+    var why = up
+      ? ''
+      : setupRadio === undefined
+        ? 'Checking Aokie’s radio…'
+        : paused
+          ? 'There is nothing to reset now: the phone line is paused until consent is given again, in the Consent tab.'
+          : noDriver() && radioStartOffered()
+            ? 'There is nothing to reset now: Aokie’s radio has not opened the dongle (see above). A reset is for a dongle that was working and got stuck.'
+            : 'There is nothing to reset now: Aokie’s radio is not running' +
+              (setupRadio && setupRadio.error ? ': ' + String(setupRadio.error).replace(/\.+$/, '') : '') +
+              '. A reset is for a dongle that was working and got stuck.';
     return (
       '<section class="rcp-card">' +
       '<div class="rcp-card__heading">' +
@@ -1192,10 +1250,12 @@
       'here instead of unplugging it: Aokie closes and reopens its USB connection, resets the Bluetooth ' +
       'controller and reconnects the phone. The phone drops off for a few seconds. It cannot be done during a call.</p>' +
       '<div class="rcp-actions">' +
-      '<button type="button" class="rcp-button" data-act="dg-reset"' + (resetting ? ' disabled' : '') + '>' +
+      '<button type="button" class="rcp-button" data-act="dg-reset"' + (resetting || !up ? ' disabled' : '') +
+      (why ? ' aria-describedby="dg-reset-why"' : '') + '>' +
       (resetting ? 'Resetting the dongle…' : 'Reset the dongle') +
       '</button>' +
       '</div>' +
+      (why && !resetting ? '<p class="rcp-step-meta" id="dg-reset-why">' + esc(U.plainTimes(why)) + '</p>' : '') +
       (resetNote && !resetting
         ? resetNote.ok
           ? '<p class="rcp-status-ok">' + ICONS.check + ' ' + esc(resetNote.text) + '</p>'
@@ -1299,8 +1359,9 @@
         // A driver step still running in the plugin: wait for it again, its buttons off. One that ended while the
         // tab was away: its outcome. (No answer from the plugin: the step the tab left is looked for next time.)
         if (!resumeRunningJob() && data) showFinishedJob();
-        // Where there is no driver step, the radio's state is the tab's news.
-        if (noDriver() && !setupActive()) checkRadio();
+        // The radio's state: the tab's news where there is no driver step,
+        // and whether there is anything for Reset to reset.
+        if (!setupActive()) checkRadio();
       });
     },
     unmount: function () {
@@ -1329,8 +1390,9 @@
     },
     onEvent: function (evt) {
       var name = (evt && evt.name) || '';
-      // Setup mode: the radio coming up (or going down) settles the step.
-      if (name.indexOf('aokie.dongle.') === 0 && setupActive() && !radioStarting) checkRadio();
+      // The radio coming up (or going down): it settles the setup step, and
+      // whether Reset has anything to reset.
+      if (name.indexOf('aokie.dongle.') === 0 && !radioStarting) checkRadio();
       // Dongle plug/unplug/driver events refresh the pick list, but never
       // yank the wizard out of an install/verify step.
       if (name.indexOf('aokie.dongle.') === 0 && step === 'select' && !loading) {

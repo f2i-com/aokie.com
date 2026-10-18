@@ -185,9 +185,52 @@
     ['Callbacks and screening', 'agent', 'Agent', ' › Phone: missed-call callbacks, who is answered, and blocked numbers'],
     ['Speech', 'services', 'Services', ': speech to text, and the call voice'],
     ['Model', 'engines', 'Engines', ', which the Front desk agent’s OAIY provider follows (Agent › Settings › AI providers)'],
-    ['Voice on calls', 'calendar', 'Calendar', ' › Hours & services › Voice on calls'],
-    ['Hours, services and booking', 'calendar', 'Calendar', ' › Hours & services; the receptionist looks these up during calls'],
+    // (both on Calendar's Hours & Services page: OAIY's `hours` view)
+    ['Voice on calls', 'hours', 'Hours & Services', ' (Calendar) › How the phone sounds'],
+    ['Hours, services and booking', 'hours', 'Hours & Services', ' (Calendar); the receptionist looks these up during calls'],
   ];
+
+  /** The plugin's refusals name settings by their keys ("persona must be at
+   *  most 4000 characters"): said with the form's own names for them. */
+  var FIELD_LABELS = {
+    greeting: 'The greeting',
+    persona: 'The receptionist brief',
+    allowedNumbers: 'The allowed numbers',
+    callsAllowedOnly: '“Answer calls only from these numbers”',
+    otherCallers: '“Calls from other numbers”',
+    textsAllowedOnly: '“Text only these numbers”',
+    rejectPrivate: '“Do not answer hidden or private numbers”',
+    autoAnswer: '“Auto-answer incoming calls”',
+    agentHangup: '“The receptionist can end the call”',
+    hfpCodec: 'The Bluetooth audio codec',
+    reenumerateHwid: 'The hardware id to re-enumerate',
+    legacyPairingPin: 'Legacy PIN pairing',
+    answerTone: 'The test tone',
+    aiReceptionist: 'The AI receptionist',
+    realtimeVoiceMode: 'Where calls go',
+    realtimeVoiceEndpoint: 'Where calls go',
+    realtimeVoiceDestination: 'Where calls go',
+  };
+
+  /** A refusal with the key it starts with (or names before a colon) said
+   *  as the field's name. */
+  function fieldWords(message) {
+    var has = function (key) {
+      return Object.prototype.hasOwnProperty.call(FIELD_LABELS, key);
+    };
+    return String(message)
+      .replace(/^([a-z][A-Za-z]*)\b/, function (word) {
+        return has(word) ? FIELD_LABELS[word] : word;
+      })
+      .replace(/\b([a-z]+[A-Z][A-Za-z]*):/g, function (match, word) {
+        return has(word) ? FIELD_LABELS[word] + ':' : match;
+      });
+  }
+
+  /** The Windows-only hardware knob (re-enumerating a dongle by its Windows
+   *  device path) shows only where the screen runs on Windows. */
+  var ON_WINDOWS =
+    typeof navigator !== 'undefined' && /\bWin(?:dows|32|64)\b/.test(String(navigator.userAgent || '') + ' ' + String(navigator.platform || ''));
 
   // ======================================================================
   // Tab state (module-level — survives tab switches, like the compiled
@@ -206,6 +249,11 @@
   // "Restart receptionist now" is under way (the call check, then the
   // restart): a second press does nothing meanwhile.
   var restarting = false;
+  // Reload asked first: it would throw away edits not saved yet.
+  var reloadArm = false;
+  // The control to give focus back to once a save or a read is over: the
+  // form is drawn anew for each (Save is off meanwhile), which drops focus.
+  var heldFocus = null;
   var settings = withAokieDefaults(null);
   var baseline = withAokieDefaults(null);
   // The host's AI sources, read for OAIY Voice's running state only.
@@ -249,6 +297,7 @@
     }
     loading = true;
     error = null;
+    holdFocus();
     render();
     var settingsP = HOST.command('settings.get');
     // Source listing is best-effort — a failure must not block the form.
@@ -311,18 +360,51 @@
       HOST.toast('info', 'Nothing to save: no setting was changed.');
       return Promise.resolve(false);
     }
+    // An empty allowed list with "Answer calls only from these numbers" on
+    // answers nobody (and with "Reject them", refuses every caller): not
+    // saved, and said by the list. (Only when this save is what does it.)
+    var empty = emptyListText();
+    if (empty && ('allowedNumbers' in patch || 'callsAllowedOnly' in patch || 'otherCallers' in patch)) {
+      error = 'Not saved: ' + empty;
+      render();
+      var list = root && root.querySelector ? root.querySelector('[data-key="allowedNumbers"]') : null;
+      if (list) list.focus();
+      return Promise.resolve(false);
+    }
+    return write(patch, null);
+  }
+
+  /** Write `patch` to the plugin. `keep`: edits not saved yet that stay in
+   *  the form over what comes back (a write of some keys only, as "Send
+   *  calls to OAIY" is). Resolves true when the plugin accepted it. */
+  function write(patch, keep) {
+    if (saving) return Promise.resolve(false);
     saving = true;
     error = null;
+    reloadArm = false;
+    // (a mouse press on Save leaves no focus behind: Save has it afterwards)
+    if (!holdFocus() && U.focusLost(root)) heldFocus = { sel: '#set-save' };
     render();
+    // The form as it was sent: what is typed while the save is out is kept
+    // over what comes back, not overwritten by it.
+    var sent = withAokieDefaults(settings);
     var ok = false;
     return HOST.command('settings.set', patch)
       .then(
         function (data) {
           ok = true;
+          var meanwhile = settingsPatch(sent, settings);
           var merged = withAokieDefaults((data || {}).settings);
           // Separate objects — see the aliasing note in load().
           baseline = merged;
           settings = withAokieDefaults(merged);
+          [keep, meanwhile].forEach(function (edits) {
+            for (var k in edits || {}) {
+              if (Object.prototype.hasOwnProperty.call(edits, k)) settings[k] = edits[k];
+            }
+          });
+          // The Overview's summary reads them again when it is next shown.
+          if (TABS.settingsChanged) TABS.settingsChanged();
           // The saved mode now drives the Dongle tab's visibility too.
           if (TABS.transport && TABS.transport.update) TABS.transport.update(merged);
           // OUR bump — never mistake a successful save for the linked app.
@@ -341,14 +423,14 @@
           } else if (pendingRestart) {
             HOST.toast(
               'success',
-              'Saved. One more step: press Restart receptionist now, at the top, to apply it.'
+              'Saved. One more step: press Restart receptionist now, beside Save, to apply it.'
             );
           } else {
             HOST.toast('success', 'Saved. It applies from the next call.');
           }
         },
         function (e) {
-          error = errMsg(e);
+          error = fieldWords(errMsg(e));
         }
       )
       .then(function () {
@@ -360,23 +442,32 @@
 
   var ROUTE_KEYS = ['realtimeVoiceMode', 'realtimeVoiceEndpoint', 'realtimeVoiceDestination', 'aiReceptionist'];
 
-  /** Point calls at OAIY's voice gateway and save. The route keys are
-   *  start-only, so the restart banner follows; a destination the consent
-   *  grant does not cover pauses the line until Consent is reviewed. A
-   *  refused save puts the route keys back, so a later Save of something
-   *  else never retries it unasked. */
+  /** Point calls at OAIY's voice gateway, writing those keys alone: other
+   *  edits in the form stay unsaved, for Save (it once saved them too,
+   *  unasked). The route keys are start-only, so the restart step follows;
+   *  a destination the consent grant does not cover pauses the line until
+   *  Consent is reviewed. A refused write changes nothing in the form. */
   function routeToOaiy() {
-    var before = {};
-    for (var i = 0; i < ROUTE_KEYS.length; i++) before[ROUTE_KEYS[i]] = settings[ROUTE_KEYS[i]];
-    settings.realtimeVoiceMode = 'desktop_realtime';
-    settings.realtimeVoiceEndpoint = OAIY.endpoint;
-    settings.realtimeVoiceDestination = OAIY.destination;
-    settings.aiReceptionist = true;
-    save().then(function (saved) {
-      if (saved) return;
-      for (var k in before) settings[k] = before[k];
-      render();
-    });
+    if (saving || loading) return;
+    var others = settingsPatch(baseline, settings);
+    for (var i = 0; i < ROUTE_KEYS.length; i++) delete others[ROUTE_KEYS[i]];
+    write(
+      {
+        realtimeVoiceMode: 'desktop_realtime',
+        realtimeVoiceEndpoint: OAIY.endpoint,
+        realtimeVoiceDestination: OAIY.destination,
+        aiReceptionist: true,
+      },
+      others
+    );
+  }
+
+  /** Note the control in use (its caret too), to give focus back to once
+   *  the form is drawn again. True when there was one. */
+  function holdFocus() {
+    var at = U.focusOf(root);
+    if (at) heldFocus = at;
+    return !!at;
   }
 
   // Number inputs: guard against NaN AND a momentarily-empty field while
@@ -528,18 +619,24 @@
       ['ring', 'Leave them ringing on your phone'],
       ['reject', 'Reject them'],
     ];
+    var empty = emptyListText();
     return section(
       'Who is answered',
       field(
         'Allowed numbers',
-        '<textarea rows="4" data-key="allowedNumbers" placeholder="0400 111 222&#10;+61 2 9876 5432">' +
+        // (the placeholder is plainly an example, in the reserved fictional range: not a number on the list)
+        '<textarea rows="4" data-key="allowedNumbers" maxlength="' + TEXT_LIMITS.allowedNumbers + '"' +
+          ' placeholder="For example:&#10;0491 570 156&#10;+61 491 570 157">' +
           esc(settings.allowedNumbers) + '</textarea>'
       ) +
+        counterHtml('allowedNumbers') +
         hint('One number a line (or with commas), written in full with its area code: a number matches however it is written, by its last nine digits.') +
         '<p class="rcp-hint is-warn" id="set-allowed-short" aria-live="polite"' +
         (shortAllowedNumbers(settings.allowedNumbers).length ? '' : ' hidden') + '>' +
         esc(shortAllowedText(settings.allowedNumbers)) + '</p>' +
         check('callsAllowedOnly', 'Answer calls only from these numbers') +
+        '<p class="rcp-hint is-warn" id="set-allowed-empty" role="status"' + (empty ? '' : ' hidden') + '>' +
+        U.icons.alert + ' <span>' + esc(empty) + '</span></p>' +
         field(
           'Calls from other numbers',
           '<select data-key="otherCallers"' + (settings.callsAllowedOnly ? '' : ' disabled') + '>' +
@@ -556,6 +653,28 @@
         hint('No text goes to any other number: not a reply, a follow-up or a missed-call text back. Texts from other numbers still arrive and are kept.') +
         check('rejectPrivate', 'Do not answer hidden or private numbers') +
         hint('Rejected while the phone rings when it says the number is hidden; a phone that only shows the number once a call is answered has it hung up straight away instead.')
+    );
+  }
+
+  /** The allowed list's entries, split as the plugin splits it. */
+  function allowedEntries(list) {
+    return String(list || '')
+      .split(/[\n,;]+/)
+      .map(function (entry) {
+        return entry.trim();
+      })
+      .filter(Boolean);
+  }
+
+  /** With "Answer calls only from these numbers" on and no number on the
+   *  list, what that does ('' otherwise). */
+  function emptyListText() {
+    if (!settings.callsAllowedOnly || allowedEntries(settings.allowedNumbers).length) return '';
+    return (
+      (settings.otherCallers === 'reject'
+        ? 'The list is empty, so every caller is rejected.'
+        : 'The list is empty, so the receptionist answers nobody: every call rings through to you.') +
+      ' Add a number, or turn off “Answer calls only from these numbers”.'
     );
   }
 
@@ -649,6 +768,25 @@
   /** The route the form was drawn for, for the greeting's lines as it is typed. */
   var greetingRoute = null;
 
+  /** The plugin's own caps on the text fields (it refuses longer ones). */
+  var TEXT_LIMITS = { greeting: 1000, persona: 4000, allowedNumbers: 4000 };
+
+  /** "3,812 of 4,000 characters", shown from nine tenths of the cap. */
+  function counterText(key) {
+    var max = TEXT_LIMITS[key];
+    var n = String(settings[key] || '').length;
+    if (!max || n < max * 0.9) return '';
+    return n.toLocaleString() + ' of ' + max.toLocaleString() + ' characters' + (n >= max ? ': the most it can hold' : '');
+  }
+
+  function counterHtml(key) {
+    var text = counterText(key);
+    return (
+      '<p class="rcp-hint rcp-count" id="set-count-' + key + '" aria-live="polite"' + (text ? '' : ' hidden') + '>' +
+      esc(text) + '</p>'
+    );
+  }
+
   /** The greeting and the brief Aokie sends with each call. */
   function greetingHtml(route) {
     greetingRoute = route;
@@ -656,9 +794,10 @@
       'Greeting &amp; brief',
       field(
         'Greeting (spoken first)',
-        '<input type="text" data-key="greeting" maxlength="1000" placeholder="' + esc(DEFAULT_GREETING) + '" value="' +
+        '<input type="text" data-key="greeting" maxlength="' + TEXT_LIMITS.greeting + '" placeholder="' + esc(DEFAULT_GREETING) + '" value="' +
           esc(settings.greeting) + '" />'
       ) +
+        counterHtml('greeting') +
         hint(
           route === 'oaiy'
             ? 'Spoken first, as soon as the call connects, in the voice chosen in OAIY. Blank = the built-in greeting shown in the box.'
@@ -667,9 +806,10 @@
         '<p class="rcp-greeting-said" id="set-greeting-said" aria-live="polite">' + greetingSaidHtml(route) + '</p>' +
         field(
           'Receptionist brief',
-          '<textarea rows="6" data-key="persona" placeholder="e.g. We are a small hair salon. Cuts take 45 minutes.">' +
+          '<textarea rows="6" data-key="persona" maxlength="' + TEXT_LIMITS.persona + '" placeholder="e.g. We are a small hair salon. Cuts take 45 minutes.">' +
             esc(settings.persona) + '</textarea>'
         ) +
+        counterHtml('persona') +
         hint(
           route === 'oaiy'
             ? 'Business notes sent with every call, inside Aokie’s fixed call rules. OAIY gives them to the Front desk agent as the receptionist brief; the Front desk’s own /brief.md and call instructions take precedence. Blank = short built-in notes: a small business taking questions, booking requests and messages.'
@@ -704,12 +844,15 @@
         '<div class="set-dongle-only"' + (settings.transportMode !== 'native' ? '' : ' hidden') + '>' +
         field('Bluetooth audio codec', '<select data-key="hfpCodec">' + codecOpts.join('') + '</select>') +
         hint('Dongle mode only. Some dongles only work reliably with CVSD; mSBC gives better speech-recognition accuracy where supported.') +
-        field(
-          'Re-enumerate at start (hardware id)',
-          '<input type="text" class="is-mono" data-key="reenumerateHwid" maxlength="200" placeholder="USB\\VID_0A5C&amp;PID_21EC" value="' +
-            esc(settings.reenumerateHwid) + '" />'
-        ) +
-        hint('Dongle mode only. For a dongle whose call audio stays silent after Windows starts: Aokie re-enumerates this device before opening it, as if it were unplugged and plugged back in. Leave blank for none; takes effect the next time the phone line starts.') +
+        // (a Windows device path, for a Windows quirk: on a Mac or Linux it does nothing, so it is not shown there)
+        (ON_WINDOWS
+          ? field(
+              'Re-enumerate at start (hardware id)',
+              '<input type="text" class="is-mono" data-key="reenumerateHwid" maxlength="200" placeholder="USB\\VID_0A5C&amp;PID_21EC" value="' +
+                esc(settings.reenumerateHwid) + '" />'
+            ) +
+            hint('Dongle mode only. For a dongle whose call audio stays silent after Windows starts: Aokie re-enumerates this device before opening it, as if it were unplugged and plugged back in. Leave blank for none; takes effect the next time the phone line starts.')
+          : '') +
         '</div>' +
         // The test tone is not played on realtime calls, so it only shows
         // where it does something.
@@ -744,14 +887,26 @@
       // form-action 'none') BLOCKS native form submission BEFORE the submit
       // event fires — a submit button would be dead. Save rides the click
       // delegate; Enter-to-save rides the keydown handler in wire().
-      '<div class="rcp-form__actions rcp-wide">' +
+      '<div class="rcp-form__actions rcp-wide" id="set-bar">' +
+      // Saved, but it applies once the receptionist restarts: said here, by
+      // Save, where it is seen (at the top it was out of view on a phone).
+      restartNoticeHtml() +
       '<div class="rcp-actions">' +
       '<button type="button" class="rcp-button is-primary" id="set-save" data-act="set-save"' + (saving || loading ? ' disabled' : '') + '>' +
       (saving ? 'Saving…' : 'Save') +
       '</button>' +
-      '<button type="button" class="rcp-button" data-act="set-reload"' + (loading || saving ? ' disabled' : '') + '>Reload</button>' +
+      '<button type="button" class="rcp-button" data-act="set-reload"' + (loading || saving || reloadArm ? ' disabled' : '') + '>Reload</button>' +
       '</div>' +
       dirtyHtml() +
+      (reloadArm
+        ? '<div class="rcp-confirm" role="group" aria-label="Reload over unsaved changes">' +
+          '<p><strong>Throw away your unsaved changes?</strong> Reload puts back the settings as they are saved now.</p>' +
+          '<div class="rcp-actions">' +
+          '<button type="button" class="rcp-button is-danger" data-act="set-reload-confirm">Discard and reload</button>' +
+          '<button type="button" class="rcp-button" data-act="set-reload-cancel">Keep editing</button>' +
+          '</div>' +
+          '</div>'
+        : '') +
       // A failed save or reload, by the buttons that were pressed.
       (error ? '<p class="rcp-error" role="alert">' + esc(error) + '</p>' : '') +
       '</div>' +
@@ -776,27 +931,76 @@
     } else {
       body = formHtml();
     }
-    root.innerHTML =
-      restartNoticeHtml() +
-      appManagedNoticeHtml() +
-      body;
+    // The form is drawn anew (a save, a read): the control in use, and its
+    // caret, are given back, so what is typed next is not lost.
+    // (one that cannot take focus yet, Save while saving, is held for the next drawing)
+    var at = U.focusOf(root) || (U.focusLost(root) ? heldFocus : null);
+    heldFocus = null;
+    root.innerHTML = appManagedNoticeHtml() + body;
+    if (at && !U.restoreFocus(root, at)) heldFocus = at;
+    measureBar();
   }
 
   /** Saved, but where calls go applies only once the receptionist restarts:
-   *  the step, and its button, at the top where the change was made. */
+   *  the step, and its button, in the Save bar, which stays in view. */
   function restartNoticeHtml() {
     if (!loaded || !pendingRestart) return '';
     return (
-      '<div class="rcp-notice rcp-notice--warn rcp-wide" role="status">' +
-      '<strong>Saved. One more step:</strong> the change applies when the receptionist restarts. ' +
-      'The phone reconnects by itself, in about 15 seconds.' +
-      '<div class="rcp-actions">' +
+      '<div class="rcp-notice rcp-notice--warn rcp-bar-notice" role="status">' +
+      '<span><strong>Saved. One more step:</strong> it applies when the receptionist restarts. ' +
+      'The phone reconnects by itself, in about 15 seconds.</span>' +
       '<button type="button" class="rcp-button is-primary" data-act="set-apply-restart"' + (saving || loading || restarting ? ' disabled' : '') + '>' +
       (restarting ? 'Restarting…' : 'Restart receptionist now') +
       '</button>' +
-      '</div>' +
       '</div>'
     );
+  }
+
+  // ---- the Save bar's height -------------------------------------------------
+  // It is sticky at the foot of the window, so a field the keyboard moves to
+  // must stop above it, not under it: the page keeps that much clear below
+  // (scroll-padding and the fields' scroll-margin read --rcp-bar-h), and a
+  // field focused under it is scrolled up anyway.
+
+  var barObserver = null;
+
+  function measureBar() {
+    var bar = root && root.querySelector ? root.querySelector('#set-bar') : null;
+    var docEl = document.documentElement;
+    if (!docEl || !docEl.style) return;
+    if (!bar) {
+      forgetBar();
+      return;
+    }
+    var set = function () {
+      docEl.style.setProperty('--rcp-bar-h', Math.ceil(bar.getBoundingClientRect().height) + 'px');
+    };
+    set();
+    if (barObserver) barObserver.disconnect();
+    barObserver = typeof ResizeObserver === 'function' ? new ResizeObserver(set) : null;
+    if (barObserver) barObserver.observe(bar);
+  }
+
+  function forgetBar() {
+    if (barObserver) barObserver.disconnect();
+    barObserver = null;
+    var docEl = document.documentElement;
+    if (docEl && docEl.style) docEl.style.removeProperty('--rcp-bar-h');
+  }
+
+  /** A field focused under the Save bar (where the browser left it) is
+   *  scrolled up to sit just above it. */
+  function keepAboveBar(e) {
+    var t = e.target;
+    var bar = root && root.querySelector ? root.querySelector('#set-bar') : null;
+    if (!t || !bar || bar.contains(t) || !t.getBoundingClientRect) return;
+    window.requestAnimationFrame(function () {
+      var r = t.getBoundingClientRect();
+      var top = bar.getBoundingClientRect().top;
+      var tall = r.height > top * 0.6; // (a field taller than the room above the bar: its top in view is enough)
+      var over = (tall ? r.top + 40 : r.bottom) - (top - 8);
+      if (over > 0) window.scrollBy(0, over);
+    });
   }
 
   /** Beside Save: whether the form holds edits not saved yet. */
@@ -867,6 +1071,15 @@
           short.hidden = !short.textContent;
         }
       }
+      // (near a field's cap, how much of it is used)
+      if (TEXT_LIMITS[key] && root && root.querySelector) {
+        var count = root.querySelector('#set-count-' + key);
+        if (count) {
+          count.textContent = counterText(key);
+          count.hidden = !count.textContent;
+        }
+      }
+      if (key === 'allowedNumbers' || key === 'otherCallers') updateEmptyList();
       return;
     }
     var num = t.getAttribute('data-num');
@@ -885,8 +1098,19 @@
       if (boolKey === 'callsAllowedOnly' && root) {
         var others = root.querySelector('select[data-key="otherCallers"]');
         if (others) others.disabled = !t.checked;
+        updateEmptyList();
       }
     }
+  }
+
+  /** The empty-list warning, as the list and its switch are changed. */
+  function updateEmptyList() {
+    var warn = root && root.querySelector ? root.querySelector('#set-allowed-empty') : null;
+    if (!warn) return;
+    var text = emptyListText();
+    var words = warn.querySelector('span');
+    if (words) words.textContent = text;
+    warn.hidden = !text;
   }
 
   function wire(el) {
@@ -895,6 +1119,7 @@
     el.addEventListener('input', onInputOrChange);
     el.addEventListener('change', onInputOrChange);
     el.addEventListener('focusout', onInputOrChange);
+    el.addEventListener('focusin', keepAboveBar);
     // Defensive only: in the production sandbox (allow-scripts, CSP
     // form-action 'none') a native submission is blocked BEFORE this event
     // would fire — Save is driven by the click/keydown handlers below.
@@ -922,8 +1147,30 @@
       if (act === 'set-save') save();
       else if (act === 'set-route-oaiy') routeToOaiy();
       else if (act === 'set-apply-restart') applyRestart();
-      else if (act === 'set-reload' || act === 'set-retry') load(false);
+      else if (act === 'set-reload' && hasUnsavedEdits()) {
+        // Reload throws the edits away: asked first, in the bar.
+        reloadArm = true;
+        render();
+        var keepBtn = root && root.querySelector ? root.querySelector('[data-act="set-reload-cancel"]') : null;
+        if (keepBtn) keepBtn.focus();
+      } else if (act === 'set-reload-cancel') {
+        reloadArm = false;
+        focusReloadAfter();
+        render();
+      } else if (act === 'set-reload' || act === 'set-reload-confirm' || act === 'set-retry') {
+        reloadArm = false;
+        if (act !== 'set-retry') focusReloadAfter();
+        load(false);
+      }
     });
+  }
+
+  /** The confirm's buttons go with it: Reload has focus once the form is
+   *  drawn again (and enabled, once a read is over). */
+  function focusReloadAfter() {
+    var a = document.activeElement;
+    if (a && root && root.contains(a) && typeof a.blur === 'function') a.blur();
+    heldFocus = { sel: '[data-act="set-reload"]' };
   }
 
   /** Apply start-only settings by restarting THIS plugin through the host
@@ -1010,6 +1257,9 @@
     },
     unmount: function () {
       root = null;
+      reloadArm = false;
+      heldFocus = null;
+      forgetBar();
     },
   });
 })();

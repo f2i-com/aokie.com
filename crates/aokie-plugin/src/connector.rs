@@ -6239,7 +6239,7 @@ fn validate_realtime_voice_consent(
     });
     if !granted {
         return Err(format!(
-            "realtimeVoiceDestination: {destination} is not a consented destination — re-run the FormLogic consent wizard"
+            "realtimeVoiceDestination: {destination} is not a consented destination — review consent in Aokie's Consent tab"
         ));
     }
     Ok(())
@@ -6290,8 +6290,8 @@ fn validate_effective_destinations(
         });
         if !granted {
             return Err(format!(
-                "{key}: {destination} is not a consented destination — re-run the \
-                 FormLogic consent wizard to add it before use"
+                "{key}: {destination} is not a consented destination — review consent \
+                 in Aokie's Consent tab to add it before use"
             ));
         }
     }

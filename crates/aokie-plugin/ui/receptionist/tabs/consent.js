@@ -25,6 +25,10 @@
   var esc = U.esc;
   var errMsg = U.errMsg;
   var ICONS = U.icons;
+  var OAIY = TABS.oaiy;
+  /** Inside OAIY Desktop (not FormLogic Desktop): its words, and its own
+   *  voice gateway as where calls go. */
+  var IN_OAIY = !!(OAIY && OAIY.isHost);
 
   // The Desktop is a loopback broker, but these two reserved provider routes
   // delegate transcript text to OpenAI. They therefore share one stable,
@@ -164,6 +168,9 @@
       label: 'Companion live captions',
       detail:
         'Send permission-filtered live caption text to authorised Companion users through the selected FormLogic or custom signalling server.',
+      // (inside OAIY there is no FormLogic server: the one the apps connect through)
+      oaiyDetail:
+        'Send permission-filtered live caption text to authorised Companion users through the signalling server your Companion apps connect through.',
       defaultOn: false,
     },
     {
@@ -203,10 +210,18 @@
   var settingsBag = {}; // live settings (endpoints become the destination list)
   var scopes = {};
   var scopesSeeded = false;
+  // How long call records are kept: the grant's own when there is one (a
+  // 30-day grant reopened at 90), as typed (retentionText), 1 to 3650 days.
+  var RETENTION_MAX = 3650;
   var retentionDays = 90;
+  var retentionText = '90';
+  var retentionSeeded = false;
   var wizardOpen = false;
   var submitting = false;
-  var error = null;
+  var error = null; // the consent form's own: an Accept that failed or was held back
+  var loadError = null; // consent.get's: the next good read clears it
+  var loadingNow = false;
+  var pollTimer = null;
   var codexProviderAvailable = false;
   var codexDestinationOptIn = false;
   var destinationSeeded = false;
@@ -215,13 +230,14 @@
   for (var i = 0; i < SCOPE_ROWS.length; i++) scopes[SCOPE_ROWS[i].key] = SCOPE_ROWS[i].defaultOn;
 
   function load() {
+    loadingNow = true;
     var consentP = HOST.consent.get().then(
       function (s) {
         status = s || null;
-        // A previous load's failure must not haunt a now-healthy status
-        // readout (accept-flow errors render while the wizard is open and
-        // accept() manages its own error slot before calling load()).
-        error = null;
+        // A previous read's failure must not haunt a now-healthy status
+        // readout. (The form's own error is not the read's: accept() keeps
+        // it, and the poll below must not clear it before it is read.)
+        loadError = null;
         // Re-consent starts from what was previously granted.
         if (!scopesSeeded && s && s.grant && s.grant.scopes) {
           for (var i = 0; i < SCOPE_ROWS.length; i++) {
@@ -229,6 +245,14 @@
             if (typeof s.grant.scopes[key] === 'boolean') scopes[key] = s.grant.scopes[key];
           }
           scopesSeeded = true;
+        }
+        if (!retentionSeeded && s && s.grant && s.grant.scopes) {
+          var kept = s.grant.scopes.retentionDays;
+          if (typeof kept === 'number' && kept === Math.floor(kept) && kept >= 1 && kept <= RETENTION_MAX) {
+            retentionDays = kept;
+            retentionText = String(kept);
+          }
+          retentionSeeded = true;
         }
         if (!destinationSeeded && s && s.grant && s.grant.scopes) {
           var grantedDestinations = Array.isArray(s.grant.scopes.destinations)
@@ -245,7 +269,7 @@
       },
       function (e) {
         if (status === undefined) status = null;
-        error = errMsg(e);
+        loadError = errMsg(e);
       }
     );
     // The settings bag feeds the "where call data goes" destination list —
@@ -262,6 +286,7 @@
     // only Aokie's own older speech path sent text there, and Aokie has no
     // speech of its own now (calls go to OAIY), so nothing new is offered.
     return Promise.all([consentP, settingsP]).then(function () {
+      loadingNow = false;
       if (isCodexLiveCallEndpoint(settingsBag.aiEndpoint)) {
         codexProviderAvailable = true;
         codexDestinationOptIn = true;
@@ -305,6 +330,11 @@
 
   function consentDestinations() {
     var out = uniqueDestinations();
+    // Inside OAIY, calls go to OAIY's own voice gateway on this computer,
+    // named by this origin (the setup wizard's last step, Answer calls with
+    // OAIY, points them there after this one has run). Granted with the rest,
+    // so that step does not find it missing and pause the phone line.
+    if (IN_OAIY && OAIY.destination && out.indexOf(OAIY.destination) === -1) out.push(OAIY.destination);
     if (codexDestinationOptIn && out.indexOf(CODEX_DESTINATION) === -1) {
       out.push(CODEX_DESTINATION);
     }
@@ -320,8 +350,28 @@
   /** Accept: a grant without Bluetooth or transcription takes the phone line
    *  down at once (the plugin stops the radio, which ends a call on it), so
    *  with a call on the line that is said first, and a second press goes on. */
+  /** What is wrong with the days typed for keeping records, '' when nothing. */
+  function retentionProblem() {
+    var t = String(retentionText).trim();
+    if (!/^\d+$/.test(t)) return 'Enter a whole number of days, from 1 to ' + RETENTION_MAX + '.';
+    var n = Number(t);
+    if (n < 1) return 'Keep call records for at least 1 day.';
+    if (n > RETENTION_MAX) return 'Keep call records for at most ' + RETENTION_MAX + ' days (10 years).';
+    return '';
+  }
+
   function accept() {
     if (submitting) return;
+    // (days that are not 1 to 3650 are said by the field, not sent as 90)
+    var bad = retentionProblem();
+    if (bad) {
+      error = 'Not recorded: ' + bad;
+      render();
+      var field = root && root.querySelector ? root.querySelector('#cns-retention') : null;
+      if (field) field.focus();
+      return;
+    }
+    retentionDays = Number(String(retentionText).trim());
     var takesLineDown = !scopes.bluetooth || !scopes.transcription;
     submitting = true;
     error = null;
@@ -511,7 +561,7 @@
   function statusCardHtml() {
     if (status === undefined) return U.loadingHtml;
     if (status === null) {
-      return U.problemHtml(error || 'The consent could not be read.');
+      return U.problemHtml(loadError || 'The consent could not be read.');
     }
     var r = review(status);
     var grant = r.grant;
@@ -546,7 +596,7 @@
       var expires = day(grant.expiresAt);
       var expired = !!grant.expiresAt && !isNaN(Date.parse(grant.expiresAt)) && Date.parse(grant.expiresAt) <= Date.now();
       var dests = Array.isArray(scopes.destinations) ? scopes.destinations.filter(function (d) { return typeof d === 'string' && d; }) : [];
-      var ownOrigin = TABS.oaiy && TABS.oaiy.destination;
+      var ownOrigin = OAIY && OAIY.destination;
       var destNames = dests.map(function (d) {
         return d === ownOrigin ? 'OAIY on this computer (' + d + ')' : d;
       });
@@ -607,8 +657,7 @@
     }
     if (realtimeConfigured) {
       var realtimeDestination = effectiveDestination(settingsBag.realtimeVoiceDestination);
-      var oaiy = TABS.oaiy;
-      if (oaiy && oaiy.callRoute(settingsBag) === 'oaiy') {
+      if (OAIY && OAIY.callRoute(settingsBag) === 'oaiy') {
         // OAIY's own gateway: the audio goes to OAIY Desktop on this computer,
         // which names itself by this origin in the signed grant.
         codexChoice +=
@@ -631,7 +680,7 @@
         '<label class="rcp-scope-row">' +
           '<input type="checkbox" data-scope="' + row.key + '"' + (scopes[row.key] ? ' checked' : '') + ' />' +
           '<span><strong>' + esc(row.label) + '</strong>' +
-          '<span class="rcp-scope-detail">' + esc(row.detail) + '</span></span>' +
+          '<span class="rcp-scope-detail">' + esc(IN_OAIY && row.oaiyDetail ? row.oaiyDetail : row.detail) + '</span></span>' +
           '</label>'
       );
     }
@@ -644,7 +693,11 @@
     } else {
       var items = [];
       for (var d = 0; d < dests.length; d++) {
-        items.push('<li><code>' + esc(dests[d]) + '</code></li>');
+        items.push(
+          '<li><code>' + esc(dests[d]) + '</code>' +
+            (OAIY && dests[d] === OAIY.destination ? ' — OAIY on this computer, which answers the calls' : '') +
+            '</li>'
+        );
       }
       destBlock =
         '<p class="rcp-hint">Call data (audio and transcripts) goes here to be processed. Sending it anywhere new later ' +
@@ -667,13 +720,15 @@
       (status && status.signatureRequired === true
         ? "signed by this computer, so it can't be copied to another install. "
         : 'kept by Aokie on this computer; once recorded, no settings change can turn its enforcement off. ') +
-      'Privacy and data handling: <code>formlogic.com/privacy</code></p>' +
+      // (FormLogic's privacy page only where FormLogic Desktop is the host)
+      (IN_OAIY
+        ? 'Call audio and transcripts are handled on this computer, by Aokie and OAIY, and go nowhere else unless listed under Where call data goes.</p>'
+        : 'Privacy and data handling: <code>formlogic.com/privacy</code></p>') +
       '<div class="rcp-scope-list">' + scopeRows.join('') + '</div>' +
       '<h4 class="rcp-subhead">Where call data goes</h4>' +
       codexChoice +
       destBlock +
-      '<label class="rcp-field rcp-field--short"><span>Keep call records for (days)</span>' +
-      '<input type="number" id="cns-retention" min="1" max="3650" value="' + esc(retentionDays) + '" /></label>' +
+      retentionHtml() +
       '<div class="rcp-callout is-warn">' + ICONS.alert +
       '<span><strong>Your callers, your responsibility:</strong> laws on call recording, transcription and AI ' +
       "disclosure differ from place to place. Many require you to tell callers they're speaking with an AI or " +
@@ -690,9 +745,48 @@
     );
   }
 
+  /** Days to keep call records: as typed, said at once when it is not 1 to 3650. */
+  function retentionHtml() {
+    var bad = retentionProblem();
+    return (
+      '<label class="rcp-field rcp-field--short"><span>Keep call records for (days)</span>' +
+      '<input type="number" id="cns-retention" min="1" max="' + RETENTION_MAX + '" step="1" inputmode="numeric" required' +
+      ' aria-describedby="cns-retention-note"' + (bad ? ' aria-invalid="true"' : '') + ' value="' + esc(retentionText) + '" /></label>' +
+      '<p class="' + (bad ? 'rcp-error' : 'rcp-hint') + '" id="cns-retention-note">' +
+      esc(bad || 'From 1 day to ' + RETENTION_MAX + ' (10 years).') +
+      '</p>'
+    );
+  }
+
+  /** The days' note and mark, as typed (the field is not drawn again). */
+  function updateRetentionNote(input) {
+    var bad = retentionProblem();
+    var note = root && root.querySelector ? root.querySelector('#cns-retention-note') : null;
+    if (note) {
+      note.className = bad ? 'rcp-error' : 'rcp-hint';
+      note.textContent = bad || 'From 1 day to ' + RETENTION_MAX + ' (10 years).';
+    }
+    if (input) {
+      if (bad) input.setAttribute('aria-invalid', 'true');
+      else input.removeAttribute('aria-invalid');
+    }
+  }
+
+  /** One of the tab's two parts drawn again, only when it changed, keeping
+   *  the control in use focused (the status is read every 10 s, while the
+   *  form may be half filled in). */
+  function drawZone(id, html) {
+    var zone = root && root.querySelector('#' + id);
+    if (!zone || zone.__cnsHtml === html) return;
+    var at = U.focusOf(zone);
+    zone.__cnsHtml = html;
+    zone.innerHTML = html;
+    U.restoreFocus(zone, at);
+  }
+
   function render() {
     if (!root) return;
-    root.innerHTML =
+    var statusHtml =
       '<section class="rcp-card">' +
       '<div class="rcp-card__heading">' +
       '<div class="rcp-card__heading-copy">' +
@@ -701,11 +795,19 @@
       '</div>' +
       '</div>' +
       statusCardHtml() +
-      (!wizardOpen && status !== undefined && status !== null && error
-        ? '<p class="rcp-error">' + esc(error) + '</p>'
-        : '') +
-      '</section>' +
-      wizardHtml();
+      // (a read that failed after a good one: the status above is the last known)
+      (status !== undefined && status !== null && loadError ? U.problemHtml(loadError) : '') +
+      '</section>';
+    // (a container that cannot be searched, as in the isolated checks, is drawn whole)
+    if (typeof root.querySelector !== 'function') {
+      root.innerHTML = statusHtml + wizardHtml();
+      return;
+    }
+    if (!root.querySelector('#cns-status-zone')) {
+      root.innerHTML = '<div class="rcp-zone" id="cns-status-zone"></div><div class="rcp-zone" id="cns-form-zone"></div>';
+    }
+    drawZone('cns-status-zone', statusHtml);
+    drawZone('cns-form-zone', wizardHtml());
   }
 
   // ---- wiring -------------------------------------------------------------
@@ -743,7 +845,16 @@
         return;
       }
       if (t.id === 'cns-retention') {
-        retentionDays = Math.max(1, Number(t.value) || 90);
+        retentionText = t.value;
+        updateRetentionNote(t);
+      }
+    });
+    // The days are checked as they are typed, not only when the field is left.
+    el.addEventListener('input', function (e) {
+      var t = e.target;
+      if (t && t.id === 'cns-retention') {
+        retentionText = t.value;
+        updateRetentionNote(t);
       }
     });
   }
@@ -754,10 +865,23 @@
       wire(el);
       render();
       load();
+      // Read again while the tab is open, as the other tabs do, so a pause
+      // (an expired grant, a destination no longer covered) shows here too.
+      // Not in OAIY's setup wizard, which checks the step itself.
+      var S = TABS.setup;
+      if (pollTimer == null && !(S && S.active())) {
+        pollTimer = window.setInterval(function () {
+          if (!document.hidden && root && !submitting && !loadingNow) load();
+        }, 10000);
+      }
     },
     unmount: function () {
       root = null;
       callWarned = false;
+      if (pollTimer != null) {
+        window.clearInterval(pollTimer);
+        pollTimer = null;
+      }
     },
   });
 })();

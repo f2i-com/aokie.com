@@ -23,8 +23,10 @@
   --canvas: #f8f5ee;
 
   --text: #171717;
-  --muted: #68645e;
-  --faint: #6f6a63;
+  /* A shade deeper than the host's, so the small type (10.5–12px) keeps
+     4.5:1 on the soft and tinted surfaces it sits on here. */
+  --muted: #5f5b55;
+  --faint: #65615b;
 
   --border: #cec8be;
   --strong-border: #9f998f;
@@ -32,15 +34,20 @@
   --primary: #2457e6;
   --primary-2: #2457e6;
   --primary-soft: rgba(36, 87, 230, 0.1);
-  --green: #218450;
-  --green-soft: rgba(33, 132, 80, 0.1);
-  --amber: #9c6a08;
+  /* The primary as WORDS (links, the open tab): the primary itself on paper. */
+  --primary-text: var(--primary);
+  /* Green and amber as words in 10.5px pills and on their own tints: the
+     host's #218450 and #9c6a08 read under 4.5:1 there, so a deeper shade. */
+  --green: #196c40;
+  --green-soft: rgba(25, 108, 64, 0.1);
+  --amber: #865a04;
   --amber-soft: rgba(245, 181, 44, 0.14);
   --danger: #e94b3c;
   --danger-soft: rgba(233, 75, 60, 0.08);
   /* Danger as WORDS: #e94b3c is ~3.8:1 on paper, under the 4.5:1 body-text
-     floor, so error text and danger buttons use a deeper shade of it. */
-  --danger-text: #c23526;
+     floor, so error text and danger buttons use a deeper shade of it (deep
+     enough for a danger button inside a danger confirm, tint on tint). */
+  --danger-text: #b02f20;
 
   --focus: #2457e6;
   /* Paper Circuit's signature: a hard, un-blurred offset instead of a glow. */
@@ -76,6 +83,8 @@ html.fl-dark {
   --primary: #7167ff;
   --primary-2: #4d8bff;
   --primary-soft: rgba(113, 103, 255, 0.14);
+  /* #7167ff as words is about 4.1:1 on the night surfaces: a lighter tint of it. */
+  --primary-text: #8f88ff;
   --green: #45d6a2;
   --green-soft: rgba(69, 214, 162, 0.12);
   --amber: #f2b84b;
@@ -185,7 +194,7 @@ code { font-family: var(--font-mono); font-size: 0.92em; }
 }
 
 .rcp-tab-btn:hover { background: var(--surface-soft); color: var(--text); }
-.rcp-tab-btn.is-active { background: var(--primary-soft); color: var(--primary); }
+.rcp-tab-btn.is-active { background: var(--primary-soft); color: var(--primary-text); }
 html.fl-dark .rcp-tab-btn.is-active { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--primary) 30%, transparent); }
 .rcp-tab-btn:focus-visible { outline-offset: -2px; }
 
@@ -209,10 +218,12 @@ html.fl-dark .rcp-tab-btn.is-active { box-shadow: inset 0 0 0 1px color-mix(in s
 /* Cards side by side share a height on the Overview. */
 .rcp-overview { align-items: stretch; }
 
-/* Full-width rows: a panel's lone card, marked rows, and stacked panels. */
+/* Full-width rows: a panel's lone card, marked rows, and stacked panels
+   (a stacked panel's cards drawn in zones too: .rcp-zone, below). */
 .rcp-tab-panel > :only-child,
 .rcp-wide,
-.rcp-stack > * { grid-column: 1 / -1; }
+.rcp-stack > *,
+.rcp-stack > .rcp-zone > * { grid-column: 1 / -1; }
 
 /* ── Section card (the dashboard's .service-section) ────────────────────── */
 
@@ -292,7 +303,24 @@ html.fl-dark .rcp-group-title::before { box-shadow: 0 0 8px var(--primary); }
 
 /* Zones a tab fills later take no room while empty. */
 .rcp-card__body > :empty,
-.rcp-card__content > :empty { display: none; }
+.rcp-card__content > :empty,
+.rcp-details > :empty { display: none; }
+
+/* A tab's parts drawn on their own (the Consent tab's status and form):
+   their cards are the panel's grid items, as if the zones were not there. */
+.rcp-zone { display: contents; }
+
+/* An action's failure on its card, with Dismiss at its end. */
+.rcp-action-error {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 4px 12px;
+}
+
+.rcp-action-error > span { flex: 1 1 220px; min-width: 0; }
+.rcp-action-error .rcp-link-btn { font-size: 12px; }
 
 .rcp-card__body p { overflow-wrap: anywhere; }
 
@@ -664,7 +692,7 @@ html.fl-dark .rcp-call-action.is-answer { color: #06281c; }
   display: inline;
   border: 0;
   background: none;
-  color: var(--primary);
+  color: var(--primary-text);
   padding: 0;
   font: inherit;
   font-weight: 600;
@@ -1000,7 +1028,8 @@ html.fl-dark .rcp-call-action.is-answer { color: #06281c; }
 
 .rcp-form > * { min-width: 0; }
 
-/* Save and Reload: kept in view at the foot of the window while the form scrolls. */
+/* Save and Reload: kept in view at the foot of the window while the form
+   scrolls. Opaque, so its words read the same over whatever scrolls under. */
 .rcp-form__actions {
   position: sticky;
   bottom: 10px;
@@ -1013,13 +1042,38 @@ html.fl-dark .rcp-call-action.is-answer { color: #06281c; }
   padding: 10px 14px;
   border: 1px solid var(--border);
   border-radius: var(--r-card);
-  background: color-mix(in srgb, var(--surface-solid) 94%, transparent);
+  background: var(--surface-solid);
   box-shadow: var(--shadow-card);
-  backdrop-filter: blur(6px);
 }
 
 .rcp-form__actions .rcp-actions { margin-top: 0; }
-.rcp-form__actions .rcp-error { flex: 1 1 100%; }
+.rcp-form__actions .rcp-error,
+.rcp-form__actions .rcp-confirm,
+.rcp-form__actions .rcp-bar-notice { flex: 1 1 100%; }
+
+/* "Saved. One more step": the restart, by Save, its button beside the words. */
+.rcp-bar-notice {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  padding: 9px 12px;
+}
+
+.rcp-bar-notice > span { flex: 1 1 260px; min-width: 0; }
+
+/* The page keeps the Save bar's height clear below a field the keyboard
+   moves to (the settings tab sets --rcp-bar-h while it is open). */
+html { scroll-padding-bottom: calc(var(--rcp-bar-h, 0px) + 18px); }
+
+.rcp-form input,
+.rcp-form select,
+.rcp-form textarea,
+.rcp-form .rcp-button,
+.rcp-form .rcp-link-btn { scroll-margin-bottom: calc(var(--rcp-bar-h, 0px) + 18px); }
+
+/* How much of a field's cap is used, near it. */
+.rcp-count { font-variant-numeric: tabular-nums; }
 
 .rcp-dirty {
   color: var(--faint);
@@ -1405,7 +1459,7 @@ html.fl-dark .rcp-call-action.is-answer { color: #06281c; }
 
 .rcp-stepper li.is-current .rcp-stepper__mark {
   border-color: var(--primary);
-  color: var(--primary);
+  color: var(--primary-text);
   box-shadow: 0 0 0 3px var(--primary-soft);
 }
 

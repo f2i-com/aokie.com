@@ -187,7 +187,7 @@ and the starter and its flows in [FormLogic](https://github.com/f2i-com/formlogi
    | Hearing and speaking | OAIY checks for the OAIY Voice service and a language model in Engines. |
    | Bluetooth dongle | Install the dongle's WinUSB driver. Shown only while the transport is the dongle; done once the radio is up. |
    | Pair your phone | On the phone, pair with **Aokie AI Assistant** and confirm that the codes match. Done once the phone is connected. |
-   | How calls are handled | Optional: pick up by itself, let callers interrupt, let the agent end calls. |
+   | How calls are handled | Optional: pick up by itself, let the agent end calls. Callers can always talk over the receptionist. |
    | Your business | Its name, opening hours and services, as callers hear them. |
    | Answer calls and texts with OAIY | Sends calls and texts to OAIY's Front desk. |
 

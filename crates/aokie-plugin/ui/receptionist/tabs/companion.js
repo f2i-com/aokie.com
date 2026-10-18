@@ -52,10 +52,16 @@
     return value || '-';
   }
 
+  /** The card's pill: ready (an app approved and this computer's key at
+   *  hand), approved but not ready (the key is not), or none approved. It
+   *  said "No app approved yet" beside "Apps approved: 1" when the key was
+   *  missing. */
   function companionPairingSummary(status) {
+    var approved = (status && status.approvedMobiles && status.approvedMobiles.length) || 0;
+    var ready = !!(status && status.remoteAccessReady);
     return {
-      label: status && status.remoteAccessReady ? 'Ready' : 'No app approved yet',
-      tone: status && status.remoteAccessReady ? 'is-ok' : 'is-neutral',
+      label: ready ? 'Ready' : approved > 0 ? (approved === 1 ? '1 app approved' : approved + ' apps approved') + ' · not ready' : 'No app approved yet',
+      tone: ready ? 'is-ok' : approved > 0 ? 'is-warn' : 'is-neutral',
       canGenerateOffer: !status || status.available !== false,
     };
   }
@@ -65,7 +71,12 @@
   var root = null;
   var status = undefined; // undefined = loading, null = failed, else the status
   var offer = null;
-  var error = null;
+  var error = null; // the status read's own failure (the next good read clears it)
+  // An action's failure, by the card its button is on, until the next action
+  // there or Dismiss: 'key' (new key), 'offer' (pairing QR), 'reply' (a
+  // pasted reply), 'apps' (approve, deny, remove). The status poll every
+  // 3 s once cleared them with its own error slot, before they could be read.
+  var actionErrors = { key: null, offer: null, reply: null, apps: null };
   var busy = false;
   var form = { appId: '', workspaceId: '', connectionId: '', responseJson: '' };
   var approveArm = null; // pending-approval id with the inline confirm open
@@ -94,10 +105,22 @@
 
   // ---- actions ------------------------------------------------------------
 
-  function createOffer() {
+  /** An action starts: its card's last failure is dropped. */
+  function startAction(card) {
     busy = true;
-    error = null;
+    actionErrors[card] = null;
     renderDynamic();
+  }
+
+  /** An action failed: said on its card, by its button. */
+  function actionFailed(card, e) {
+    busy = false;
+    actionErrors[card] = errMsg(e);
+    renderDynamic();
+  }
+
+  function createOffer() {
+    startAction('offer');
     HOST.companionPairing
       .createOffer({
         appId: form.appId.trim() || undefined,
@@ -111,7 +134,7 @@
           HOST.toast('success', 'Pairing QR ready: scan it with the Companion app within 10 minutes.');
         },
         function (e) {
-          error = errMsg(e);
+          actionErrors.offer = errMsg(e);
         }
       )
       .then(function () {
@@ -150,16 +173,12 @@
   function submitResponse() {
     var raw = form.responseJson.trim();
     if (raw === '') return;
-    busy = true;
-    error = null;
-    renderDynamic();
+    startAction('reply');
     var parsed;
     try {
       parsed = JSON.parse(raw);
     } catch (e) {
-      busy = false;
-      error = 'That is not a Companion reply (it should start with {"kind":"aokie_mobile_pairing_response"): ' + errMsg(e);
-      renderDynamic();
+      actionFailed('reply', 'That is not a Companion reply (it should start with {"kind":"aokie_mobile_pairing_response"): ' + errMsg(e));
       return;
     }
     HOST.companionPairing.receiveResponse(parsed).then(
@@ -172,17 +191,14 @@
         refresh();
       },
       function (e) {
-        busy = false;
-        error = errMsg(e);
-        renderDynamic();
+        actionFailed('reply', e);
       }
     );
   }
 
   function approve(id) {
-    busy = true;
     approveArm = null;
-    renderDynamic();
+    startAction('apps');
     HOST.companionPairing.approve(id).then(
       function () {
         HOST.toast('success', 'Companion app approved.');
@@ -190,33 +206,27 @@
         refresh();
       },
       function (e) {
-        busy = false;
-        error = errMsg(e);
-        renderDynamic();
+        actionFailed('apps', e);
       }
     );
   }
 
   function deny(id) {
-    busy = true;
-    renderDynamic();
+    startAction('apps');
     HOST.companionPairing.deny(id).then(
       function () {
         busy = false;
         refresh();
       },
       function (e) {
-        busy = false;
-        error = errMsg(e);
-        renderDynamic();
+        actionFailed('apps', e);
       }
     );
   }
 
   function revoke(thumbprint) {
-    busy = true;
     revokeArm = null;
-    renderDynamic();
+    startAction('apps');
     HOST.companionPairing.revoke(thumbprint).then(
       function () {
         HOST.toast('success', 'Companion app removed.');
@@ -224,18 +234,15 @@
         refresh();
       },
       function (e) {
-        busy = false;
-        error = errMsg(e);
-        renderDynamic();
+        actionFailed('apps', e);
       }
     );
   }
 
   function rotate() {
-    busy = true;
     rotateOpen = false;
     rotateText = '';
-    renderDynamic();
+    startAction('key');
     HOST.companionPairing.rotateDesktopKey().then(
       function () {
         offer = null;
@@ -245,9 +252,7 @@
         refresh();
       },
       function (e) {
-        busy = false;
-        error = errMsg(e);
-        renderDynamic();
+        actionFailed('key', e);
       }
     );
   }
@@ -287,6 +292,7 @@
       '<div id="cmp-warning"></div>' +
       '<div id="cmp-error"></div>' +
       '<div id="cmp-rotate"></div>' +
+      '<div id="cmp-key-error"></div>' +
       '</div>' +
       '</section>' +
       // Pairing a new app. The fields are static: typing must survive polls.
@@ -298,6 +304,7 @@
       '<div class="rcp-actions">' +
       '<button type="button" class="rcp-button is-primary" id="cmp-generate">Make a pairing QR</button>' +
       '</div>' +
+      '<div id="cmp-offer-error"></div>' +
       '<div id="cmp-offer"></div>' +
       '<details class="rcp-details"><summary>Custom server (optional)</summary>' +
       '<p>Only for a Companion that connects through a server of your own. Leave these blank otherwise.</p>' +
@@ -311,10 +318,12 @@
       '<details class="rcp-details"><summary>Paste a Companion’s reply</summary>' +
       '<p>For testing on this computer, or a server that does not pass the Companion’s reply on by itself: paste the signed reply here. ' +
       'It is checked in full (the app’s key, this computer, its one-use code and expiry) before it shows up for approval.</p>' +
-      '<textarea id="cmp-response" class="is-mono" rows="4" placeholder=\'{"kind":"aokie_mobile_pairing_response", ...}\'></textarea>' +
+      '<label class="rcp-field"><span>The Companion’s reply</span>' +
+      '<textarea id="cmp-response" class="is-mono" rows="4" placeholder=\'{"kind":"aokie_mobile_pairing_response", ...}\'></textarea></label>' +
       '<div class="rcp-actions">' +
       '<button type="button" class="rcp-button" id="cmp-verify">Check the reply</button>' +
       '</div>' +
+      '<div id="cmp-reply-error"></div>' +
       '</details>' +
       '</div>' +
       '</section>' +
@@ -322,6 +331,7 @@
       '<section class="rcp-card">' +
       cardHead('Apps', 'Companion apps') +
       '<div class="rcp-card__body">' +
+      '<div id="cmp-apps-error"></div>' +
       '<div id="cmp-pending"></div>' +
       '<div id="cmp-approved"></div>' +
       '</div>' +
@@ -333,6 +343,16 @@
     root.querySelector('#cmp-response').value = form.responseJson;
     renderOffer();
     renderDynamic();
+  }
+
+  /** An action's failure on its card, with Dismiss. */
+  function actionErrorHtml(card) {
+    var msg = actionErrors[card];
+    if (!msg) return '';
+    return (
+      '<div class="rcp-error rcp-action-error" role="alert"><span>' + U.esc(msg) + '</span>' +
+      '<button type="button" class="rcp-link-btn" data-act="cmp-dismiss" data-card="' + card + '">Dismiss</button></div>'
+    );
   }
 
   function setZone(id, html) {
@@ -388,7 +408,7 @@
         pill.className = 'rcp-pill is-warn';
         pillText.textContent = 'Unknown';
       } else {
-        pill.className = 'rcp-pill ' + (summary.tone === 'is-ok' ? 'is-ok' : 'is-neutral');
+        pill.className = 'rcp-pill ' + summary.tone;
         pillText.textContent = summary.label;
       }
     }
@@ -420,6 +440,9 @@
         : ''
     );
     setZone('cmp-error', error ? U.problemHtml(error) : '');
+    for (var card in actionErrors) {
+      if (Object.prototype.hasOwnProperty.call(actionErrors, card)) setZone('cmp-' + card + '-error', actionErrorHtml(card));
+    }
 
     var gen = root.querySelector('#cmp-generate');
     if (gen) {
@@ -568,7 +591,10 @@
       var btn = t && t.closest ? t.closest('[data-act]') : null;
       if (!btn || btn.disabled) return;
       var act = btn.getAttribute('data-act');
-      if (act === 'cmp-copy') copyPayload();
+      if (act === 'cmp-dismiss') {
+        actionErrors[btn.getAttribute('data-card')] = null;
+        renderDynamic();
+      } else if (act === 'cmp-copy') copyPayload();
       else if (act === 'cmp-deny') deny(btn.getAttribute('data-id'));
       else if (act === 'cmp-approve-arm') {
         approveArm = btn.getAttribute('data-id');

@@ -54,7 +54,7 @@ const document = {
 const context = vm.createContext({ window, document, URL, setTimeout, clearTimeout });
 const appSource = await readFile(new URL('app.js', base), 'utf8');
 vm.runInContext(appSource.replace(/\}\)\(\);\s*$/, `
-  window.testApp = { state, refreshSnapshot, refreshPhoneStatus, refreshPhones, refreshSettings, refreshSources, refreshOaiyStatus, refreshSwitchboard, renderLive, replyOwner };
+  window.testApp = { state, refreshSnapshot, refreshPhoneStatus, refreshPhones, refreshSettings, refreshSources, refreshOaiyStatus, refreshSwitchboard, renderLive, renderPhones, replyOwner, callAct, disconnectWarning };
 })();`), context);
 const app = window.testApp;
 app.state.call = { callId: 'fixture', state: 'active' };
@@ -173,18 +173,19 @@ await Promise.all([app.refreshSnapshot(), app.refreshSettings(), app.refreshSour
 assert.match(element('readiness').innerHTML, /OAIY Front desk/);
 assert.match(element('readiness').innerHTML, /OAIY Voice running/);
 assert.match(element('settings-body').innerHTML, /OAIY Front desk/);
-assert.match(element('settings-body').innerHTML, /Chosen in Calendar/);
+// The voice card (How the phone sounds) is on OAIY's Hours & Services page, its `hours` view, not Calendar's.
+assert.match(element('settings-body').innerHTML, /data-nav="hours">Chosen in Hours &amp; Services</);
 assert.doesNotMatch(element('settings-body').innerHTML, /Pocket|Sherpa|old-model|LLM/);
 assert.equal(element('settings-title').textContent, 'Calls go to OAIY');
 // The host's live values and links: the chosen voice and the engines' model,
 // each a link to the dashboard page where it is set.
 await app.refreshOaiyStatus();
-assert.match(element('settings-body').innerHTML, /data-nav="calendar">receptionist</);
+assert.match(element('settings-body').innerHTML, /data-nav="hours">receptionist</);
 assert.match(element('settings-body').innerHTML, /data-nav="engines">engine-model · ready</);
 assert.equal(rootClasses.has('rcp-no-nav'), false);
 oaiyStatus = { voice: null, llm: { running: false, state: null, resident: null } };
 await app.refreshOaiyStatus();
-assert.match(element('settings-body').innerHTML, /Chosen in Calendar/);
+assert.match(element('settings-body').innerHTML, /Chosen in Hours &amp; Services/);
 assert.match(element('settings-body').innerHTML, /engines stopped/);
 failed = true;
 await app.refreshOaiyStatus();
@@ -219,9 +220,59 @@ assert.doesNotMatch(element('readiness').innerHTML + element('settings-body').in
 assert.equal(element('settings-title').textContent, 'Calls go to OAIY');
 assert.equal(element('hero-headline').textContent, 'Ready for calls');
 
+// Review 2026-10-19. No dongle: the radio is not running, said once in plain words, and the Dongle tab offered
+// rather than a pairing that cannot happen; the live call card is calm, not a red refusal.
+{
+  const savedPhone = payloads['phone.status'];
+  const cause = 'no supported USB Bluetooth dongle was found';
+  payloads['phone.status'] = { paired: false, device: null, pairingOpen: false, connected: false, error: cause, source: 'config' };
+  await app.refreshPhoneStatus();
+  assert.doesNotMatch(element('readiness').innerHTML, /Pair a phone/);
+  assert.match(element('readiness').innerHTML, /data-tabgo="dongle">Dongle setup/);
+  assert.match(element('hero-sub').textContent, /phone line is not running: no supported USB Bluetooth dongle was found/);
+  app.state.call = null;
+  app.state.callKnown = false;
+  app.state.callError = 'The radio is not running (' + cause + ') — command not performed';
+  app.renderLive();
+  assert.equal(element('live-title').textContent, 'No phone line');
+  assert.doesNotMatch(element('live-body').innerHTML, /rcp-error|command not performed/);
+  // Paused for consent: the Phone tile goes to Consent, and the headline leads with the pause.
+  payloads['phone.status'] = { paired: true, device: { address: 'AA:BB' }, connected: false, error: 'consent required: consent expired', source: 'config' };
+  await app.refreshPhoneStatus();
+  assert.match(element('readiness').innerHTML, /data-tabgo="consent">Review consent/);
+  assert.equal(element('hero-headline').textContent, 'Paused until consent is reviewed');
+  payloads['phone.status'] = savedPhone;
+  app.state.callKnown = true;
+  app.state.callError = '';
+  await app.refreshPhoneStatus();
+  assert.equal(element('hero-headline').textContent, 'Ready for calls');
+}
+// Disconnect with a call on the line asks first, naming the call; with none it asks nothing.
+app.state.call = { callId: 'live', state: 'active', from: '0491 570 156' };
+assert.equal(app.disconnectWarning(), 'This ends the call with 0491 570 156.');
+app.state.call = null;
+assert.equal(app.disconnectWarning(), '');
+// stale_call as OAIY's bridge hands it on (the plugin's typed `code`, words without it): refreshed, not an error.
+{
+  const toasts = [];
+  const { command, toast } = host;
+  host.toast = (kind, message) => toasts.push([kind, message]);
+  host.command = async (name) => {
+    if (name === 'call.answer') throw Object.assign(new Error('callId "fixture" is stale: there is no current call'), { code: 'stale_call' });
+    return command(name);
+  };
+  payloads['call.current'] = { call: null };
+  app.state.call = { callId: 'fixture', state: 'ringing' };
+  assert.equal(await app.callAct('call.answer'), false);
+  assert.deepEqual(toasts, [['info', 'The call changed meanwhile: showing it as it is now.']]);
+  host.command = command;
+  host.toast = toast;
+  delete payloads['call.current'];
+}
+
 const settingsSource = await readFile(new URL('tabs/settings.js', base), 'utf8');
 vm.runInContext(settingsSource.replace(/\}\)\(\);\s*$/, `
-  window.testSettings = { settingsPatch, withAokieDefaults, personalGreeting, DEFAULT_GREETING, shortAllowedText,
+  window.testSettings = { settingsPatch, withAokieDefaults, personalGreeting, DEFAULT_GREETING, shortAllowedText, fieldWords,
     formFor(bag) { baseline = withAokieDefaults(bag); settings = withAokieDefaults(bag); return formHtml(); },
     noticeAfterBump(changed) { loaded = true; appManaged = false; configVersion = 1; noteConfigVersion(2, false, changed); return appManagedNoticeHtml(); } };
 })();`), context);
@@ -278,10 +329,30 @@ for (const [greeting, name, said] of [
   assert.match(toOaiy, /with its area code/);
   assert.doesNotMatch(toOaiy, /Auto-answer is off/);
   assert.doesNotMatch(settings.formFor({ ...oaiyBag, autoAnswer: true }), /Auto-answer is off/);
-  const shortList = settings.formFor({ ...oaiyBag, allowedNumbers: '0400 111 222\n123\n9876 5432' });
+  const shortList = settings.formFor({ ...oaiyBag, allowedNumbers: '0491 570 156\n123\n491 570 15' });
   assert.match(shortList, /These match nobody: 123\./);
-  assert.match(shortList, /These may miss the caller: 9876 5432\./);
-  assert.match(settings.formFor({ ...oaiyBag, allowedNumbers: '0400 111 222' }), /id="set-allowed-short"[^>]* hidden/);
+  assert.match(shortList, /These may miss the caller: 491 570 15\./);
+  assert.match(settings.formFor({ ...oaiyBag, allowedNumbers: '0491 570 156' }), /id="set-allowed-short"[^>]* hidden/);
+  // Review 2026-10-19: the list's placeholder is plainly an example, in the reserved fictional range, not a number
+  // that reads as already on the list; and with "Answer calls only from these numbers" on, an empty list says what
+  // it does (with "Reject them", every caller is refused) before it can be saved.
+  assert.match(toOaiy, /placeholder="For example:&#10;0491 570 156&#10;\+61 491 570 157"/);
+  assert.doesNotMatch(toOaiy, /0400 111 222|9876 5432/);
+  assert.match(settings.formFor({ ...oaiyBag, allowedNumbers: '0491 570 156', callsAllowedOnly: true }), /id="set-allowed-empty"[^>]* hidden/);
+  const emptyReject = settings.formFor({ ...oaiyBag, allowedNumbers: ' \n ', callsAllowedOnly: true, otherCallers: 'reject' });
+  assert.doesNotMatch(emptyReject, /id="set-allowed-empty"[^>]* hidden/);
+  assert.match(emptyReject, /The list is empty, so every caller is rejected/);
+  assert.match(settings.formFor({ ...oaiyBag, callsAllowedOnly: true }), /The list is empty, so the receptionist answers nobody/);
+  // The brief and the list are capped where the plugin caps them, and its refusals name the form's fields.
+  assert.match(toOaiy, /data-key="persona" maxlength="4000"/);
+  assert.match(toOaiy, /data-key="allowedNumbers" maxlength="4000"/);
+  assert.equal(settings.fieldWords('persona must be at most 4000 characters'), 'The receptionist brief must be at most 4000 characters');
+  assert.equal(settings.fieldWords('the persona is fine'), 'the persona is fine');
+  // The voice card is on Hours & Services (OAIY's `hours` view); the Windows-only re-enumerate field is not shown
+  // where the screen does not run on Windows (no navigator here: not Windows).
+  assert.match(toOaiy, /data-nav="hours">Hours &amp; Services<\/button> \(Calendar\) › How the phone sounds/);
+  assert.doesNotMatch(toOaiy, /data-nav="calendar"/);
+  assert.doesNotMatch(toOaiy, /data-key="reenumerateHwid"/);
   assert.equal(settings.shortAllowedText('+61 491 570 156, +61 491 570 157'), '');
   // The "changed outside this form" notice: only when the greeting or brief
   // changed under it, never for a bare version bump (any other tab's write).
@@ -297,7 +368,7 @@ for (const [greeting, name, said] of [
   const consentWindow = { PluginHost: consentHost, __aokieTabs: window.__aokieTabs, addEventListener() {}, setInterval() {}, clearInterval() {} };
   const consentContext = vm.createContext({ window: consentWindow, document, URL, setTimeout, clearTimeout });
   vm.runInContext(consentSource.replace(/\}\)\(\);\s*$/, `
-  window.testConsent = { review, uniqueDestinations, setStatus(s) { status = s; } };
+  window.testConsent = { review, uniqueDestinations, consentDestinations, setStatus(s) { status = s; } };
 })();`), consentContext);
   const consent = consentWindow.testConsent;
   const grant = { version: 3, scopes: { bluetooth: true, destinations: [] } };
@@ -314,6 +385,13 @@ for (const [greeting, name, said] of [
   assert.equal(consent.review({ ...good, bluetooth: { allowed: true, reason: null } }).ok, true);
   consent.setStatus({ ...good, destinations: ['OpenAI ChatGPT via Codex'] });
   assert.equal(JSON.stringify(consent.uniqueDestinations()), JSON.stringify(['OpenAI ChatGPT via Codex']));
+  // Inside OAIY the grant names OAIY's own voice gateway too, though the settings do not point calls there yet: the
+  // setup wizard's last step (Answer calls with OAIY) points them there after the consent step, and the plugin
+  // pauses the phone line for a destination the grant does not name (review 2026-10-19).
+  consent.setStatus({ ...good, destinations: [] });
+  assert.equal(JSON.stringify(consent.consentDestinations()), JSON.stringify([oaiy.destination]));
+  consent.setStatus({ ...good, destinations: [oaiy.destination] });
+  assert.equal(JSON.stringify(consent.consentDestinations()), JSON.stringify([oaiy.destination]));
 }
 const phoneSource = await readFile(new URL('tabs/phone.js', base), 'utf8');
 vm.runInContext(phoneSource.replace(/\}\)\(\);\s*$/, `
@@ -374,6 +452,13 @@ payloads['phone.listPaired'] = { devices: [{ address: 'test-device', connected: 
   payloads['settings.get'] = { settings: oaiyBag };
   await olderWindow.testApp.refreshOaiyStatus();
   await olderWindow.testApp.refreshSettings();
-  assert.match(element('settings-body').innerHTML, /tabindex="-1">Chosen in Calendar</);
+  assert.match(element('settings-body').innerHTML, /tabindex="-1">Chosen in Hours &amp; Services</);
+}
+// The setup wizard's fields: no "Let callers interrupt" (bargeIn). On the OAIY route, the only one now, OAIY Voice
+// stops a reply when the caller talks over it, so the switch did nothing (its stored value is kept and ignored).
+{
+  const manifest = JSON.parse(await readFile(new URL('../crates/aokie-plugin/manifest.json', import.meta.url), 'utf8'));
+  const fields = manifest.setup.steps.flatMap((step) => step.fields || []);
+  assert.ok(!fields.some((f) => f.key === 'bargeIn'), 'no bargeIn field in the setup wizard');
 }
 console.log('Receptionist UI checks passed (isolated host; no live commands).');

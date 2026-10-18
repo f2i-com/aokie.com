@@ -347,12 +347,6 @@
             "help": "The receptionist answers when a call comes in."
           },
           {
-            "key": "bargeIn",
-            "label": "Let callers interrupt",
-            "type": "bool",
-            "help": "Stop speaking when the caller talks over it."
-          },
-          {
             "key": "agentHangup",
             "label": "Let the agent end calls",
             "type": "bool"
