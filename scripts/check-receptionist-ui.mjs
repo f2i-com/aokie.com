@@ -59,7 +59,11 @@ vm.runInContext(appSource.replace(/\}\)\(\);\s*$/, `
 const app = window.testApp;
 app.state.call = { callId: 'fixture', state: 'active' };
 await Promise.all([app.refreshSnapshot(), app.refreshPhoneStatus(), app.refreshPhones(), app.refreshSettings()]);
-assert.equal(element('hero-headline').textContent, 'Ready for calls');
+// A healthy plugin whose calls go nowhere (no AI receptionist: Aokie has no
+// voice of its own) is not ready for calls, and the headline says why.
+assert.equal(element('hero-headline').textContent, 'Not ready for calls');
+assert.match(element('hero-sub').textContent, /Calls do not go to OAIY, so nobody answers them/);
+assert.equal(element('hero-pill-text').textContent, 'Not ready');
 assert.match(element('readiness').innerHTML, /Bluetooth linked/);
 // Operator mode: what is typed would be said in Aokie's own voice, which it
 // does not have (OAIY Voice speaks on calls that go to OAIY).
@@ -94,7 +98,7 @@ assert.equal(element('hero-headline').textContent, 'Aokie is not running');
 assert.equal(element('hero-sub').textContent, 'Process exited');
 snapshot = { state: 'running', lastHealth: { status: 'ok' }, manifest: { version: '0.2.1' } };
 await app.refreshSnapshot();
-assert.equal(element('hero-headline').textContent, 'Ready for calls');
+assert.equal(element('hero-headline').textContent, 'Not ready for calls');
 assert.equal(element('hero-version').textContent, 'Aokie v0.2.1');
 failed = true;
 await Promise.all([app.refreshSnapshot(), app.refreshPhoneStatus(), app.refreshPhones(), app.refreshSettings()]);
@@ -105,7 +109,7 @@ assert.equal(app.replyOwner(), 'unknown');
 assert.equal(element('speak-send').disabled, true);
 failed = false;
 await Promise.all([app.refreshSnapshot(), app.refreshPhoneStatus(), app.refreshPhones(), app.refreshSettings()]);
-assert.equal(element('hero-headline').textContent, 'Ready for calls');
+assert.equal(element('hero-headline').textContent, 'Not ready for calls');
 assert.equal(element('speak-send').disabled, true);
 for (const [value, owner] of [[true, 'agent'], ['true', 'agent'], [false, 'operator'], ['false', 'operator'], [undefined, 'unknown'], ['invalid', 'unknown']]) {
   app.state.settings = { settings: { aiReceptionist: value } };
@@ -200,6 +204,9 @@ assert.equal(element('settings-title').textContent, 'Calls do not go to OAIY');
 
 // Calls that do not go to OAIY: nobody answers them (Aokie has no speech of
 // its own), on the Overview's summary too; the OAIY route reads as before.
+payloads['settings.get'] = { settings: { aiReceptionist: false } };
+await app.refreshSettings();
+assert.equal(element('settings-title').textContent, 'Calls do not go to OAIY');
 payloads['settings.get'] = { settings: { aiReceptionist: true, realtimeVoiceMode: 'legacy' } };
 await app.refreshSettings();
 assert.match(element('settings-body').innerHTML, /Nobody: calls ring through/);
@@ -210,6 +217,7 @@ await Promise.all([app.refreshSnapshot(), app.refreshSettings()]);
 assert.match(element('readiness').innerHTML, /OAIY Front desk/);
 assert.doesNotMatch(element('readiness').innerHTML + element('settings-body').innerHTML, /no speech of its own|Nobody/);
 assert.equal(element('settings-title').textContent, 'Calls go to OAIY');
+assert.equal(element('hero-headline').textContent, 'Ready for calls');
 
 const settingsSource = await readFile(new URL('tabs/settings.js', base), 'utf8');
 vm.runInContext(settingsSource.replace(/\}\)\(\);\s*$/, `
@@ -297,6 +305,13 @@ for (const [greeting, name, said] of [
   assert.equal(consent.review(good).ok, true);
   assert.equal(consent.review({ ...good, blocked: 'transcription consent denied' }).ok, false);
   assert.equal(consent.review({ ...good, destinationsCovered: false }).ok, false);
+  // The plugin's own gate for the phone line: an expired grant read green
+  // until the radio was stopped for it. A grant that leaves Bluetooth out on
+  // purpose is the person's choice, not a grant to review.
+  const expired = { ...good, bluetooth: { allowed: false, reason: 'consent expired at 2026-10-01T09:12:00Z — re-consent needed' } };
+  assert.equal(consent.review(expired).ok, false);
+  assert.equal(consent.review({ ...expired, grant: { ...grant, scopes: { ...grant.scopes, bluetooth: false } } }).ok, true);
+  assert.equal(consent.review({ ...good, bluetooth: { allowed: true, reason: null } }).ok, true);
   consent.setStatus({ ...good, destinations: ['OpenAI ChatGPT via Codex'] });
   assert.equal(JSON.stringify(consent.uniqueDestinations()), JSON.stringify(['OpenAI ChatGPT via Codex']));
 }

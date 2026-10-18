@@ -813,7 +813,7 @@
       (radioStarting ? 'Starting Aokie — opening the dongle…' : 'Start Aokie with this dongle') +
       '</button>' +
       '</div>' +
-      (radioStartError && !radioStarting ? '<div class="rcp-error" style="padding: 10px 0 0;">' + esc(radioStartError) + '</div>' : '')
+      (radioStartError && !radioStarting ? '<p class="rcp-error" role="alert">' + esc(radioStartError) + '</p>' : '')
     );
   }
 
@@ -920,7 +920,7 @@
     return (
       '<div class="rcp-error" role="alert">' + esc(error) +
       (step === 'verify'
-        ? ' <button type="button" class="rcp-button" data-act="dg-verify-again"' + (busy ? ' disabled' : '') + '>Check again</button>'
+        ? '<span class="rcp-actions"><button type="button" class="rcp-button" data-act="dg-verify-again"' + (busy ? ' disabled' : '') + '>Check again</button></span>'
         : '') +
       '</div>'
     );
@@ -940,14 +940,18 @@
       );
     }
     if (list === null && loading) {
-      html.push('<p class="rcp-loading">Scanning USB devices…</p>');
+      html.push('<p class="rcp-loading">Looking for USB devices…</p>');
+    } else if (list === null) {
+      // The list could not be read (the error below says why): that is not
+      // the same as no dongle plugged in.
+      html.push('<p class="rcp-step-meta">The USB devices could not be listed, so Aokie cannot tell whether a dongle is plugged in.</p>');
     } else if (offered.length === 0) {
       html.push(
         '<p class="rcp-step-meta">' +
           (loading
-            ? 'Scanning USB devices…'
-            : 'No supported dongle detected. Plug the USB Bluetooth dongle in, then rescan. ' +
-              'Supported chipsets: Broadcom BCM20702 (certified), Realtek RTL8761 and CSR8510 (beta).') +
+            ? 'Looking for USB devices…'
+            : 'No supported dongle is plugged in. Plug the USB Bluetooth dongle in, then press Rescan. ' +
+              'Supported chips: Broadcom BCM20702 (certified), Realtek RTL8761 and CSR8510 (beta).') +
           '</p>'
       );
     } else {
@@ -998,7 +1002,7 @@
       }
       right.push(
         '<button type="button" class="rcp-button is-warn" data-act="dg-restore-arm" data-pick="' + esc(key(sel)) + '"' +
-          (busy ? ' disabled' : '') + '>Restore Windows driver</button>'
+          (busy || restoreArm === key(sel) ? ' disabled' : '') + '>Restore Windows driver</button>'
       );
     } else if (sel) {
       right.push('<button type="button" class="rcp-button is-primary" data-act="dg-continue">Continue</button>');
@@ -1009,7 +1013,7 @@
         '<div class="rcp-confirm is-danger">' +
           '<p><strong>Restore the Windows Bluetooth driver?</strong> ' + esc(dongleLabel(sel)) +
           ' will be handed back to the standard Windows driver (BTHUSB). Aokie will no longer be able to use it ' +
-          'until you install the WinUSB driver again. Windows will show an elevation prompt.</p>' +
+          'until you install the WinUSB driver again. Windows asks for permission (User Account Control) first.</p>' +
           '<div class="rcp-actions">' +
           '<button type="button" class="rcp-button is-danger" data-act="dg-restore" data-pick="' + esc(key(sel)) + '"' + (busy ? ' disabled' : '') + '>Restore driver</button>' +
           '<button type="button" class="rcp-button" data-act="dg-restore-cancel">Cancel</button>' +
@@ -1051,7 +1055,8 @@
       'Windows driver at any time.</p>' +
       (jobKind === 'install'
         ? '<p class="rcp-step-meta" role="status">Installing: answer the Windows prompt if one is open (it may be behind ' +
-          'this window). The install can take a minute or two; this waits for it to finish.</p>'
+          'this window). The install can take a minute or two; this waits for it to finish.</p>' +
+          '<span class="rcp-dongle__wait" aria-hidden="true"><i></i></span>'
         : '') +
       signingHtml() +
       errorHtml() +
@@ -1060,7 +1065,7 @@
         [
           '<button type="button" class="rcp-button is-primary" data-act="dg-install"' +
             (busy || (signingNeedsAcceptance() && !acceptSigning) ? ' disabled' : '') + '>' +
-            (busy ? 'Installing — watch for the Windows prompt…' : 'Install WinUSB driver') +
+            (busy ? 'Installing…' : 'Install WinUSB driver') +
             '</button>',
         ]
       )
@@ -1088,9 +1093,9 @@
       'the certificate’s private key, and Windows then trusts that certificate on this whole computer (in Local Machine ' +
       '<em>Root</em> and <em>Trusted Publishers</em>). It cannot sign anything else, since its private key is gone, and it ' +
       'stays trusted after the install. <strong>Restore driver</strong> gives the dongle back to the standard Windows driver.' +
-      '<label class="rcp-check" style="display: block; margin-top: 8px;">' +
-      '<input type="checkbox" data-act="dg-accept-signing"' + (acceptSigning ? ' checked' : '') + (busy ? ' disabled' : '') + ' /> ' +
-      'I understand, and want Windows to trust a driver signed on this computer for this dongle.' +
+      '<label class="rcp-check">' +
+      '<input type="checkbox" data-act="dg-accept-signing"' + (acceptSigning ? ' checked' : '') + (busy ? ' disabled' : '') + ' />' +
+      '<span>I understand, and want Windows to trust a driver signed on this computer for this dongle.</span>' +
       '</label></span>' +
       '</div>'
     );
@@ -1153,8 +1158,8 @@
         : noDriver()
           ? '<p class="rcp-inline-note">Plug the USB Bluetooth dongle in. This computer needs no driver for it: ' +
             'Aokie opens the dongle when it starts.</p>'
-          : '<p class="rcp-inline-note">Guided setup for the USB Bluetooth dongle: pick the device, install the WinUSB ' +
-            "driver (one Windows prompt), and verify it's ready.</p>") +
+          : '<p class="rcp-inline-note">Set up the USB Bluetooth dongle in three steps: choose it, install its WinUSB ' +
+            'driver (Windows asks once), and check it is ready.</p>') +
       setupStatusHtml() +
       firmwareHtml() +
       stepperHtml() +
@@ -1165,8 +1170,8 @@
         : noDriver()
           ? '<p class="rcp-footnote">Aokie talks to the dongle directly over USB. Nothing is installed on this computer ' +
             'for it, and closing Aokie gives the dongle back.</p>'
-          : '<p class="rcp-footnote">All device work happens in the plugin and its elevated helper — this screen only ' +
-            'sequences it. Restoring the Windows driver at any time hands the dongle back to BTHUSB.</p>') +
+          : '<p class="rcp-footnote">Aokie changes only the dongle you choose. Restore the Windows driver at any time ' +
+            'to give the dongle back to Windows (BTHUSB).</p>') +
       '</section>' +
       // Recovery for a working receptionist, not part of setting one up.
       (setup ? '' : resetCardHtml());
@@ -1196,7 +1201,7 @@
           ? '<p class="rcp-status-ok">' + ICONS.check + ' ' + esc(resetNote.text) + '</p>'
           : '<p class="rcp-step-meta">' + esc(resetNote.text) + '</p>'
         : '') +
-      (resetError && !resetting ? '<div class="rcp-error" style="padding: 10px 0 0;">' + esc(resetError) + '</div>' : '') +
+      (resetError && !resetting ? '<p class="rcp-error" role="alert">' + esc(resetError) + '</p>' : '') +
       '</div>' +
       '</section>'
     );

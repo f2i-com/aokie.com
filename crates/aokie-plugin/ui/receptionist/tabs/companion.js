@@ -34,11 +34,13 @@
 
   var COMPANION_ENROLLMENT_HEADING = 'Connect a Companion app';
 
+  // (Said plainly here: the compiled panel's words were for developers —
+  // WebRTC, TURN packets, decoded PCM, admission bearers.)
   var COMPANION_TOPOLOGY_COPY =
-    'The Aokie plugin receives the caller audio from the Bluetooth phone link. Desktop bridges that audio over encrypted WebRTC to an approved Companion app, which uses its own microphone and speakers. This screen enrolls and trusts the app; it does not pair audio hardware.';
+    'Aokie takes the caller’s audio from the phone over Bluetooth, and this computer passes it, encrypted, to an approved Companion app, which plays it on that device’s own speaker and microphone. Here you pair Companion apps and decide which to trust; no audio hardware is paired here.';
 
   var COMPANION_MEDIA_PRIVACY_COPY =
-    'The server routes signalling and may relay encrypted TURN packets; it never receives decoded call PCM.';
+    'The server that connects the two only passes messages between them, and may relay the encrypted audio; it can never hear the call.';
 
   function shortEndpointThumbprint(value) {
     if (!value) return '-';
@@ -52,7 +54,7 @@
 
   function companionPairingSummary(status) {
     return {
-      label: status && status.remoteAccessReady ? 'Companion trusted' : 'Companion approval required',
+      label: status && status.remoteAccessReady ? 'Ready' : 'No app approved yet',
       tone: status && status.remoteAccessReady ? 'is-ok' : 'is-neutral',
       canGenerateOffer: !status || status.available !== false,
     };
@@ -106,10 +108,7 @@
         function (next) {
           offer = next || null;
           showPayloadText = false;
-          HOST.toast(
-            'success',
-            'Pairing QR ready — scan it in the Companion app. It expires in 10 minutes and contains no bearer token.'
-          );
+          HOST.toast('success', 'Pairing QR ready: scan it with the Companion app within 10 minutes.');
         },
         function (e) {
           error = errMsg(e);
@@ -136,14 +135,14 @@
     }
     write.then(
       function () {
-        HOST.toast('success', 'Pairing payload copied');
+        HOST.toast('success', 'Pairing text copied.');
       },
       function () {
         // Opaque-origin sandbox: clipboard access can be refused — fall back
         // to a selectable textarea instead of failing silently.
         showPayloadText = true;
         renderOffer();
-        HOST.toast('info', 'Clipboard unavailable in this sandboxed screen — select the payload below and copy it manually.');
+        HOST.toast('info', 'This screen cannot copy for you: select the pairing text below and copy it yourself.');
       }
     );
   }
@@ -159,7 +158,7 @@
       parsed = JSON.parse(raw);
     } catch (e) {
       busy = false;
-      error = 'That is not valid JSON: ' + errMsg(e);
+      error = 'That is not a Companion reply (it should start with {"kind":"aokie_mobile_pairing_response"): ' + errMsg(e);
       renderDynamic();
       return;
     }
@@ -168,7 +167,7 @@
         form.responseJson = '';
         var ta = root && root.querySelector('#cmp-response');
         if (ta) ta.value = '';
-        HOST.toast('success', 'Mobile proof verified — compare its fingerprint, then approve it locally.');
+        HOST.toast('success', 'Reply checked: compare its fingerprint with the Companion, then approve it.');
         busy = false;
         refresh();
       },
@@ -186,7 +185,7 @@
     renderDynamic();
     HOST.companionPairing.approve(id).then(
       function () {
-        HOST.toast('success', 'Companion endpoint approved');
+        HOST.toast('success', 'Companion app approved.');
         busy = false;
         refresh();
       },
@@ -220,7 +219,7 @@
     renderDynamic();
     HOST.companionPairing.revoke(thumbprint).then(
       function () {
-        HOST.toast('success', 'Companion endpoint revoked');
+        HOST.toast('success', 'Companion app removed.');
         busy = false;
         refresh();
       },
@@ -241,7 +240,7 @@
       function () {
         offer = null;
         renderOffer();
-        HOST.toast('success', 'Desktop key rotated — pair each Companion again.');
+        HOST.toast('success', 'New key made for this computer: pair each Companion app again.');
         busy = false;
         refresh();
       },
@@ -254,54 +253,78 @@
   }
 
   // ---- rendering ----------------------------------------------------------
-  // The shell (heading, form inputs, relay textarea) renders ONCE per mount
+  // The shell (headings, form inputs, relay textarea) renders ONCE per mount
   // so typing survives the 3 s status poll; the dynamic zones (pill, identity
   // grid, lists, offer, errors) re-render via innerHTML with change guards.
+  // Three cards: this computer's identity (and its key), pairing a new app,
+  // and the apps waiting for approval or approved.
+
+  function cardHead(label, title, extra) {
+    return (
+      '<div class="rcp-card__heading">' +
+      '<div class="rcp-card__heading-copy">' +
+      '<small>' + label + '</small>' +
+      '<h3>' + title + '</h3>' +
+      '</div>' +
+      (extra || '') +
+      '</div>'
+    );
+  }
 
   function renderShell() {
     root.innerHTML =
-      '<section class="rcp-card">' +
-      '<div class="rcp-card__heading">' +
-      '<div class="rcp-card__heading-copy">' +
-      '<small>Companion device trust</small>' +
-      '<h3>' + esc(COMPANION_ENROLLMENT_HEADING) + '</h3>' +
-      '</div>' +
-      '<span id="cmp-pill" class="rcp-pill is-neutral"><i></i><span id="cmp-pill-text">Checking</span></span>' +
-      '</div>' +
+      '<section class="rcp-card rcp-wide">' +
+      cardHead(
+        'Companion app',
+        esc(COMPANION_ENROLLMENT_HEADING),
+        '<span id="cmp-pill" class="rcp-pill is-neutral"><i></i><span id="cmp-pill-text">Checking</span></span>'
+      ) +
       '<div class="rcp-card__body">' +
       '<p class="rcp-inline-note">' + esc(COMPANION_TOPOLOGY_COPY) + '</p>' +
       '<div class="rcp-callout">' + smartphoneIcon + '<span>' + esc(COMPANION_MEDIA_PRIVACY_COPY) +
-      ' The QR contains public binding data plus a one-use expiry; no API key or admission bearer.</span></div>' +
+      ' A pairing QR holds only public details and works once; it carries no password or key.</span></div>' +
       '<div id="cmp-identity"></div>' +
       '<div id="cmp-warning"></div>' +
       '<div id="cmp-error"></div>' +
-      // Enrollment form (static — typing must survive polls).
-      '<div class="rcp-form" style="padding: 0; margin-top: 12px;">' +
-      '<label class="rcp-field" style="margin-top: 0;"><span>App id <small>(leave blank to use Aokie\'s assignment)</small></span>' +
-      '<input type="text" id="cmp-appid" placeholder="app identifier" /></label>' +
-      '<label class="rcp-field"><span>Workspace id <small>(optional/custom servers)</small></span>' +
-      '<input type="text" id="cmp-workspaceid" placeholder="workspace identifier" /></label>' +
-      '<label class="rcp-field"><span>Desktop connection id <small>(managed link or stable local id)</small></span>' +
-      '<input type="text" id="cmp-connectionid" placeholder="filled from FormLogic when linked" /></label>' +
-      '<div class="rcp-actions">' +
-      '<button type="button" class="rcp-button is-primary" id="cmp-generate">Generate one-use enrollment QR</button>' +
-      '</div>' +
-      '</div>' +
-      '<div id="cmp-offer"></div>' +
-      '<div id="cmp-pending"></div>' +
-      '<div id="cmp-approved"></div>' +
-      '<details class="rcp-details"><summary>Custom relay / local testing</summary>' +
-      '<p>Paste a signed mobile response here when a custom server or same-PC test app does not forward it automatically. ' +
-      'Desktop still verifies the mobile key, app, Desktop binding, nonce, JTI and expiry before it appears above.</p>' +
-      '<textarea id="cmp-response" class="rcp-textarea" rows="4" placeholder=\'{"kind":"aokie_mobile_pairing_response", ...}\'></textarea>' +
-      '<div class="rcp-actions">' +
-      '<button type="button" class="rcp-button" id="cmp-verify">Verify signed response</button>' +
-      '</div>' +
-      '</details>' +
       '<div id="cmp-rotate"></div>' +
       '</div>' +
-      '<p class="rcp-footnote">Same-PC use is deliberately supported for development; production can relay the signed ' +
-      'pairing response through FormLogic or a custom signalling service.</p>' +
+      '</section>' +
+      // Pairing a new app. The fields are static: typing must survive polls.
+      '<section class="rcp-card">' +
+      cardHead('Pair', 'Pair a new Companion app') +
+      '<div class="rcp-card__body">' +
+      '<p class="rcp-step-meta">Make a QR code here, then scan it with the Companion app on the device to pair. ' +
+      'Each code works once, for 10 minutes. The app then shows up under Companion apps for you to approve.</p>' +
+      '<div class="rcp-actions">' +
+      '<button type="button" class="rcp-button is-primary" id="cmp-generate">Make a pairing QR</button>' +
+      '</div>' +
+      '<div id="cmp-offer"></div>' +
+      '<details class="rcp-details"><summary>Custom server (optional)</summary>' +
+      '<p>Only for a Companion that connects through a server of your own. Leave these blank otherwise.</p>' +
+      '<label class="rcp-field"><span>App id <small>(blank: Aokie’s own)</small></span>' +
+      '<input type="text" class="is-mono" id="cmp-appid" placeholder="app identifier" /></label>' +
+      '<label class="rcp-field"><span>Workspace id <small>(custom servers)</small></span>' +
+      '<input type="text" class="is-mono" id="cmp-workspaceid" placeholder="workspace identifier" /></label>' +
+      '<label class="rcp-field"><span>Desktop connection id <small>(a managed link, or a fixed local id)</small></span>' +
+      '<input type="text" class="is-mono" id="cmp-connectionid" placeholder="connection identifier" /></label>' +
+      '</details>' +
+      '<details class="rcp-details"><summary>Paste a Companion’s reply</summary>' +
+      '<p>For testing on this computer, or a server that does not pass the Companion’s reply on by itself: paste the signed reply here. ' +
+      'It is checked in full (the app’s key, this computer, its one-use code and expiry) before it shows up for approval.</p>' +
+      '<textarea id="cmp-response" class="is-mono" rows="4" placeholder=\'{"kind":"aokie_mobile_pairing_response", ...}\'></textarea>' +
+      '<div class="rcp-actions">' +
+      '<button type="button" class="rcp-button" id="cmp-verify">Check the reply</button>' +
+      '</div>' +
+      '</details>' +
+      '</div>' +
+      '</section>' +
+      // The apps: waiting for approval, and approved.
+      '<section class="rcp-card">' +
+      cardHead('Apps', 'Companion apps') +
+      '<div class="rcp-card__body">' +
+      '<div id="cmp-pending"></div>' +
+      '<div id="cmp-approved"></div>' +
+      '</div>' +
       '</section>';
     // Seed the sticky form values (they survive tab switches).
     root.querySelector('#cmp-appid').value = form.appId;
@@ -327,23 +350,23 @@
       var qrSrc = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(offer.qrSvg || '');
       var expires = '';
       try {
-        expires = new Date(offer.payload.expiresAt * 1000).toLocaleTimeString();
+        expires = new Date(offer.payload.expiresAt * 1000).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
       } catch (e) {
         expires = '';
       }
       html =
         '<div class="rcp-qr">' +
-        (offer.qrSvg ? '<img src="' + qrSrc.replace(/"/g, '&quot;') + '" alt="One-use Aokie Companion enrollment QR" />' : '') +
+        (offer.qrSvg ? '<img src="' + qrSrc.replace(/"/g, '&quot;') + '" alt="One-use Aokie Companion pairing QR" />' : '') +
         '<div class="rcp-qr__meta">' +
-        '<strong>Scan in the Companion app</strong>' +
-        '<p>Expires ' + esc(expires) + '.</p>' +
-        '<small>Desktop thumbprint - compare this complete value in Companion</small>' +
+        '<strong>Scan this with the Companion app</strong>' +
+        '<p>' + (expires ? 'It works once, until ' + esc(expires) + '.' : 'It works once.') + '</p>' +
+        '<small>The Companion shows this computer’s key fingerprint: check all of it matches.</small>' +
         '<code class="rcp-code">' +
         esc(fullEndpointThumbprint(offer.payload && offer.payload.desktopEndpointKey && offer.payload.desktopEndpointKey.thumbprint)) +
         '</code>' +
-        '<div class="rcp-actions"><button type="button" class="rcp-button" data-act="cmp-copy">Copy JSON payload</button></div>' +
+        '<div class="rcp-actions"><button type="button" class="rcp-button is-small" data-act="cmp-copy">Copy as text</button></div>' +
         (showPayloadText
-          ? '<textarea class="rcp-textarea" rows="4" readonly style="width:100%;margin-top:8px;">' + esc(offer.encodedPayload) + '</textarea>'
+          ? '<textarea class="is-mono" rows="4" readonly aria-label="Pairing text">' + esc(offer.encodedPayload) + '</textarea>'
           : '') +
         '</div>' +
         '</div>';
@@ -361,6 +384,9 @@
       if (status === undefined) {
         pill.className = 'rcp-pill is-neutral';
         pillText.textContent = 'Checking';
+      } else if (status === null) {
+        pill.className = 'rcp-pill is-warn';
+        pillText.textContent = 'Unknown';
       } else {
         pill.className = 'rcp-pill ' + (summary.tone === 'is-ok' ? 'is-ok' : 'is-neutral');
         pillText.textContent = summary.label;
@@ -370,16 +396,19 @@
     // Identity grid.
     var idHtml = '';
     if (status === undefined) {
-      idHtml = '<p class="rcp-loading" style="padding: 12px 0 0;">Loading…</p>';
+      idHtml = U.loadingHtml;
     } else if (status) {
       idHtml =
         '<div class="rcp-id-grid">' +
-        '<span class="is-wide"><small>Desktop thumbprint (compare in full)</small><code>' +
+        '<span class="is-wide"><small>This computer’s key fingerprint</small><code>' +
         esc(fullEndpointThumbprint(status.endpointKey && status.endpointKey.thumbprint)) +
         '</code></span>' +
-        '<span><small>Key protection</small><strong>' + esc(status.protectionLabel || 'Unavailable') + '</strong></span>' +
-        '<span><small>Roster revision</small><strong>' + esc(status.rosterRevision) + '</strong></span>' +
-        '<span><small>Approved endpoints</small><strong>' + esc((status.approvedMobiles || []).length) + '</strong></span>' +
+        '</div>' +
+        // (a grid of their own, so three fill the row rather than leave a gap)
+        '<div class="rcp-id-grid">' +
+        '<span><small>Key kept in</small><strong>' + esc(status.protectionLabel || 'Not known') + '</strong></span>' +
+        '<span><small>Apps approved</small><strong>' + esc((status.approvedMobiles || []).length) + '</strong></span>' +
+        '<span><small>Trust list version</small><strong>' + esc(status.rosterRevision == null ? '—' : status.rosterRevision) + '</strong></span>' +
         '</div>';
     }
     setZone('cmp-identity', idHtml);
@@ -390,10 +419,13 @@
         ? '<div class="rcp-callout is-warn">' + ICONS.alert + '<span>' + esc(status.warning) + '</span></div>'
         : ''
     );
-    setZone('cmp-error', error ? '<p class="rcp-error" style="padding: 10px 0 0;">' + esc(error) + '</p>' : '');
+    setZone('cmp-error', error ? U.problemHtml(error) : '');
 
     var gen = root.querySelector('#cmp-generate');
-    if (gen) gen.disabled = busy || !summary.canGenerateOffer;
+    if (gen) {
+      gen.disabled = busy || !summary.canGenerateOffer;
+      gen.textContent = offer ? 'Make a new QR' : 'Make a pairing QR';
+    }
     var verify = root.querySelector('#cmp-verify');
     if (verify) verify.disabled = busy || form.responseJson.trim() === '';
 
@@ -412,19 +444,21 @@
             '<small>' + esc(p.deviceId) + '</small>' +
             '<code>' + esc(p.fingerprint) + '</code>' +
             '</span>' +
-            '<button type="button" class="rcp-button" data-act="cmp-deny" data-id="' + esc(p.id) + '"' + (busy ? ' disabled' : '') + '>Deny</button>' +
-            '<button type="button" class="rcp-button is-primary" data-act="cmp-approve-arm" data-id="' + esc(p.id) + '"' + (busy ? ' disabled' : '') + '>Approve</button>' +
-            '</div>' +
+            '<span class="rcp-person-row__actions">' +
+            '<button type="button" class="rcp-button is-small" data-act="cmp-deny" data-id="' + esc(p.id) + '"' + (busy ? ' disabled' : '') + '>Deny</button>' +
+            '<button type="button" class="rcp-button is-small is-primary" data-act="cmp-approve-arm" data-id="' + esc(p.id) + '"' + (busy || approveArm === p.id ? ' disabled' : '') + '>Approve…</button>' +
+            '</span>' +
             (approveArm === p.id
               ? '<div class="rcp-confirm">' +
-                '<p><strong>Approve ' + esc(p.displayName) + '?</strong> Confirm this fingerprint on the Companion before approving:</p>' +
-                '<code class="rcp-code" style="margin-bottom: 8px;">' + esc(p.fingerprint) + '</code>' +
+                '<p><strong>Approve ' + esc(p.displayName) + '?</strong> Check the Companion shows this same fingerprint first:</p>' +
+                '<code class="rcp-code">' + esc(p.fingerprint) + '</code>' +
                 '<div class="rcp-actions">' +
-                '<button type="button" class="rcp-button is-primary" data-act="cmp-approve" data-id="' + esc(p.id) + '"' + (busy ? ' disabled' : '') + '>Approve endpoint</button>' +
+                '<button type="button" class="rcp-button is-primary" data-act="cmp-approve" data-id="' + esc(p.id) + '"' + (busy ? ' disabled' : '') + '>They match — approve</button>' +
                 '<button type="button" class="rcp-button" data-act="cmp-approve-cancel">Cancel</button>' +
                 '</div>' +
                 '</div>'
-              : '')
+              : '') +
+            '</div>'
         );
       }
       pendHtml = '<div class="rcp-list">' + rows.join('') + '</div>';
@@ -435,7 +469,7 @@
     var apprHtml = '';
     var approved = (status && status.approvedMobiles) || [];
     if (approved.length > 0) {
-      var arows = ['<h4>Approved Companion apps</h4>'];
+      var arows = ['<h4>Approved</h4>'];
       for (var a = 0; a < approved.length; a++) {
         var m = approved[a];
         var thumb = (m.endpointKey && m.endpointKey.thumbprint) || '';
@@ -444,47 +478,55 @@
             '<span class="rcp-person-row__icon is-ok">' + ICONS.check + '</span>' +
             '<span class="rcp-person-row__id">' +
             '<strong>' + esc(m.displayName) + '</strong>' +
-            '<small>' + esc(m.deviceId) + ' / ' + esc(shortEndpointThumbprint(thumb)) + '</small>' +
+            '<small>' + esc(m.deviceId) + ' · ' + esc(shortEndpointThumbprint(thumb)) + '</small>' +
             '</span>' +
-            '<button type="button" class="rcp-button is-danger" data-act="cmp-revoke-arm" data-thumb="' + esc(thumb) + '"' + (busy ? ' disabled' : '') + '>Revoke</button>' +
-            '</div>' +
+            '<span class="rcp-person-row__actions">' +
+            '<button type="button" class="rcp-button is-small is-danger" data-act="cmp-revoke-arm" data-thumb="' + esc(thumb) + '"' + (busy || revokeArm === thumb ? ' disabled' : '') + '>Remove…</button>' +
+            '</span>' +
             (revokeArm === thumb
               ? '<div class="rcp-confirm is-danger">' +
-                '<p><strong>Revoke ' + esc(m.displayName) + '?</strong> Its current and future remote media admissions will be rejected. ' +
-                'Reconnecting requires a fresh pairing ceremony.</p>' +
+                '<p><strong>Remove ' + esc(m.displayName) + '?</strong> It is cut off at once, from a call too, ' +
+                'and can only connect again once it is paired and approved again.</p>' +
                 '<div class="rcp-actions">' +
-                '<button type="button" class="rcp-button is-danger" data-act="cmp-revoke" data-thumb="' + esc(thumb) + '"' + (busy ? ' disabled' : '') + '>Revoke endpoint</button>' +
+                '<button type="button" class="rcp-button is-danger" data-act="cmp-revoke" data-thumb="' + esc(thumb) + '"' + (busy ? ' disabled' : '') + '>Remove app</button>' +
                 '<button type="button" class="rcp-button" data-act="cmp-revoke-cancel">Cancel</button>' +
                 '</div>' +
                 '</div>'
-              : '')
+              : '') +
+            '</div>'
         );
       }
       apprHtml = '<div class="rcp-list">' + arows.join('') + '</div>';
+    } else if (status === undefined) {
+      apprHtml = U.loadingHtml;
+    } else if (!pending.length) {
+      apprHtml =
+        '<p class="rcp-empty">' +
+        (status ? 'No Companion app is approved yet. Pair one, and it shows up here for you to approve.' : 'The apps show here once their list can be read.') +
+        '</p>';
     }
     setZone('cmp-approved', apprHtml);
 
-    // Rotate block.
-    var rotateDisabled = busy || (status && status.available === false);
+    // This computer's key: made new only after a suspected copy.
+    // (not while the key's state cannot be read: a new key needs the one there is)
+    var rotateDisabled = busy || !status || status.available === false;
     var rotHtml =
-      '<div class="rcp-person-row" style="border-top: 1px solid var(--line); margin-top: 12px;">' +
-      '<span class="rcp-person-row__id">' +
-      '<strong>Desktop endpoint key</strong>' +
-      '<code style="font-family: inherit; color: var(--ink-faint);">Rotate only after suspected compromise. Every Companion app must enroll again.</code>' +
-      '</span>' +
-      '<button type="button" class="rcp-button is-danger" data-act="cmp-rotate-arm"' + (rotateDisabled ? ' disabled' : '') + '>Rotate key</button>' +
+      '<div class="rcp-danger-row">' +
+      '<span><strong>Make a new key for this computer</strong>' +
+      '<small>Only if you think this computer’s key has been copied. Every Companion app must then be paired again.</small></span>' +
+      '<button type="button" class="rcp-button is-danger" data-act="cmp-rotate-arm"' + (rotateDisabled || rotateOpen ? ' disabled' : '') + '>New key…</button>' +
       '</div>' +
       (rotateOpen
         ? '<div class="rcp-confirm is-danger">' +
-          '<p><strong>Rotate the Desktop endpoint key?</strong> All approved Companion endpoints will be revoked locally. ' +
-          'This build intentionally requires fresh owner-confirmed pairing instead of accepting an unsigned key replacement.</p>' +
+          '<p><strong>Make a new key for this computer?</strong> Every approved Companion app is removed here, ' +
+          'and each must be paired and approved again: the old key is not handed on.</p>' +
           '<p>Type <strong>ROTATE</strong> to confirm:</p>' +
           '<div class="rcp-actions">' +
           // The input's live value is NOT baked into this HTML — the 3 s poll
           // re-renders unchanged markup, so typing keeps its focus; the input
           // handler drives the button's disabled state imperatively.
-          '<input type="text" id="cmp-rotate-text" class="rcp-input" style="min-height: 30px; padding: 0 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg-0); color: var(--ink); font-size: 11.5px;" />' +
-          '<button type="button" class="rcp-button is-danger" data-act="cmp-rotate" disabled>Rotate and revoke all</button>' +
+          '<input type="text" id="cmp-rotate-text" aria-label="Type ROTATE to confirm" autocomplete="off" />' +
+          '<button type="button" class="rcp-button is-danger" data-act="cmp-rotate" disabled>Make a new key</button>' +
           '<button type="button" class="rcp-button" data-act="cmp-rotate-cancel">Cancel</button>' +
           '</div>' +
           '</div>'

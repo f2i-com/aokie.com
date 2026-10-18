@@ -43,7 +43,7 @@
   /** The dongle takes one phone at a time: the radio turns a second phone
    *  away while one is connected, pairing included. */
   var ONE_PHONE_NOTE =
-    'The dongle takes one phone at a time: a new phone cannot pair while another is connected. To pair another, first turn Bluetooth off on the connected phone (one only disconnected here reconnects on its own).';
+    'The dongle takes one phone at a time: a new phone cannot pair while another is connected. To pair another, first turn Bluetooth off on the connected phone (a phone only disconnected here reconnects by itself).';
 
   function formatSeconds(total) {
     var m = Math.floor(total / 60);
@@ -138,7 +138,9 @@
         afterPoll();
       },
       function (e) {
-        error = errMsg(e);
+        // A failed read is shown by the card it is for (the status, the
+        // paired list); `error` is for a failure neither of them says.
+        error = statusError || bondedError ? null : errMsg(e);
         known = true;
         render();
       }
@@ -220,7 +222,7 @@
               confirmed = false;
               HOST.toast(
                 'success',
-                'Phone paired. Check the phone connection and receptionist readiness before testing calls.'
+                'Phone paired. The Overview shows when the receptionist is ready for calls.'
               );
               return refreshAll();
             });
@@ -286,7 +288,7 @@
         function (d) {
           d = d || {};
           if (d.simulated) {
-            HOST.toast('success', 'Simulated pairing session — dev mode has no radio, so no real pairing window was opened.');
+            HOST.toast('info', 'No pairing window opened: this Aokie runs without a radio (a test build).');
             return;
           }
           secondsLeft = typeof d.windowSeconds === 'number' ? d.windowSeconds : PAIRING_WINDOW_SECONDS;
@@ -294,8 +296,8 @@
           HOST.toast(
             'success',
             transportMode === 'dongle'
-              ? 'Discoverable for 5 minutes — on your phone: Bluetooth → Pair new device → "Aokie AI Assistant".'
-              : 'This PC is discoverable for 5 minutes — finish the pairing in Windows Settings → Bluetooth & devices → Add device.'
+              ? 'Pairing open for 5 minutes. On your phone: Bluetooth › Pair new device › “Aokie AI Assistant”.'
+              : 'This PC can be found for 5 minutes. Finish the pairing in Windows Settings › Bluetooth & devices › Add device.'
           );
         },
         function (e) {
@@ -350,7 +352,7 @@
           }
           confirmPrompt = null;
           if (!accept) {
-            HOST.toast('success', 'Pairing refused — the phone was not paired. The window stays open if you want to try again.');
+            HOST.toast('info', 'Pairing refused: the phone was not paired. Pairing stays open if you want to try again.');
           }
         },
         function (e) {
@@ -402,15 +404,15 @@
           HOST.toast(
             'info',
             command === 'phone.connect'
-              ? 'Reconnect requested for ' + address + ' — watching for the phone to come back.'
-              : 'Disconnect requested for ' + address + ' — the phone may take a moment to drop.'
+              ? 'Reconnecting the phone (' + address + '): it shows as connected once it is back.'
+              : 'Disconnecting the phone (' + address + '): it may take a moment.'
           );
           return refreshAll();
         },
         function (e) {
           HOST.toast(
             'error',
-            (command === 'phone.connect' ? 'Reconnect failed: ' : 'Disconnect failed: ') + errMsg(e)
+            (command === 'phone.connect' ? 'The phone could not be reconnected: ' : 'The phone could not be disconnected: ') + errMsg(e)
           );
         }
       )
@@ -445,14 +447,14 @@
   // ---- rendering ----------------------------------------------------------
 
   function pairingCardBody() {
-    if (!known) return '<p class="rcp-loading">Loading…</p>';
+    if (!known) return U.loadingHtml;
     if (statusError) return '<p class="rcp-hint">The phone status could not be verified. Retrying automatically…</p>';
 
     if (confirmPrompt) {
       return (
         '<div class="rcp-card__body">' +
         '<p class="rcp-step-meta">Phone <strong>' + esc(confirmPrompt.address) + '</strong> wants to pair. ' +
-        'Confirm ONLY if your phone shows this same code:</p>' +
+        'Confirm only if your phone shows this same code:</p>' +
         '<div class="rcp-paircode">' + esc(String(confirmPrompt.numericValue).padStart(6, '0')) + '</div>' +
         '<div class="rcp-actions">' +
         '<button type="button" class="rcp-button is-primary" data-act="pair-confirm"' + (busy ? ' disabled' : '') + '>Codes match — pair</button>' +
@@ -468,10 +470,10 @@
       // the actual pairing dialog and the code confirmation.
       var windowCopy =
         transportMode === 'dongle'
-          ? 'Discoverable as “Aokie AI Assistant” — <strong>' + esc(formatSeconds(secondsLeft)) + '</strong> left. ' +
-            'On your phone: Bluetooth → Pair new device, then confirm the matching code here.'
-          : 'This PC is discoverable to nearby phones — <strong>' + esc(formatSeconds(secondsLeft)) + '</strong> left. ' +
-            'Finish the pairing in Windows Settings → Bluetooth &amp; devices → Add device; Windows shows the pairing dialog and the code to confirm.';
+          ? 'Phones nearby can see “Aokie AI Assistant” for <strong>' + esc(formatSeconds(secondsLeft)) + '</strong> more. ' +
+            'On your phone: Bluetooth › Pair new device › Aokie AI Assistant, then confirm the matching code here.'
+          : 'This PC can be found by nearby phones for <strong>' + esc(formatSeconds(secondsLeft)) + '</strong> more. ' +
+            'Finish the pairing in Windows Settings › Bluetooth &amp; devices › Add device; Windows shows the code to confirm.';
       return (
         '<div class="rcp-card__body">' +
         '<p class="rcp-step-meta">' + windowCopy + '</p>' +
@@ -486,11 +488,13 @@
     }
 
     if (connected) {
+      var name = device && (device.name || device.address);
       return (
         '<div class="rcp-card__body">' +
-        '<p class="rcp-status-ok">' + ICONS.check + ' Phone connected' +
-        (device && device.address ? ' (' + esc(device.address) + ')' : '') +
-        ' — check receptionist readiness before testing calls.</p>' +
+        '<p class="rcp-status-ok">' + ICONS.check + '<span>Phone connected' +
+        (name ? ': <strong>' + esc(name) + '</strong>' : '') +
+        (device && device.name && device.address ? ' <small>' + esc(device.address) + '</small>' : '') +
+        '</span></p>' +
         (transportMode === 'dongle' ? '<p class="rcp-hint">' + esc(ONE_PHONE_NOTE) + '</p>' : '') +
         '<div class="rcp-actions">' +
         '<button type="button" class="rcp-button" data-act="pair-start"' + (busy ? ' disabled' : '') + '>' +
@@ -502,10 +506,9 @@
 
     var idleCopy =
       transportMode === 'dongle'
-        ? "New phones can't see the dongle until you open a pairing window " +
-          '(already-paired phones reconnect on their own).'
-        : 'Pair the phone in Windows Settings → Bluetooth &amp; devices → Add device — opening a pairing window here makes this PC discoverable while you do ' +
-          '(already-paired phones reconnect on their own).';
+        ? 'A new phone can find the dongle only while pairing is open. Phones already paired reconnect by themselves.'
+        : 'Pair the phone in Windows Settings › Bluetooth &amp; devices › Add device. Opening pairing here lets the phone find this PC while you do. ' +
+          'Phones already paired reconnect by themselves.';
     return (
       '<div class="rcp-card__body">' +
       '<p class="rcp-step-meta">' + idleCopy + '</p>' +
@@ -518,12 +521,12 @@
   }
 
   function bondedCardBody() {
-    if (bondedError) return '<p class="rcp-error">' + esc(bondedError) + '</p>';
-    if (!known) return '<p class="rcp-loading">Loading…</p>';
+    if (bondedError) return U.problemHtml(bondedError);
+    if (!known) return U.loadingHtml;
     if (bonded.length === 0) {
       return transportMode === 'dongle'
-        ? '<p class="rcp-loading">No phones are bonded yet — open a pairing window above and pair your handset.</p>'
-        : '<p class="rcp-loading">No phones are bonded yet — pair your handset in Windows Settings → Bluetooth &amp; devices → Add device (a pairing window above makes this PC discoverable while you do).</p>';
+        ? '<p class="rcp-empty">No phone is paired yet. Press Pair a phone, then pair your phone with “Aokie AI Assistant”.</p>'
+        : '<p class="rcp-empty">No phone is paired yet. Pair your phone in Windows Settings › Bluetooth &amp; devices › Add device.</p>';
     }
     var rows = [];
     for (var i = 0; i < bonded.length; i++) {
@@ -536,25 +539,27 @@
       rows.push(
         '<div class="rcp-phone-row">' +
           '<span class="rcp-phone-row__id">' +
-          '<strong>' + esc(d.name || 'Unknown phone') + '</strong>' +
+          '<strong>' + esc(d.name || 'Unnamed phone') + '</strong>' +
           '<small>' + esc(addr) + '</small>' +
           '</span>' +
+          '<span class="rcp-phone-row__actions">' +
           '<span class="rcp-pill ' + (isConn ? 'is-ok' : 'is-neutral') + '"><i></i>' + (isConn ? 'Connected' : 'Offline') + '</span>' +
-          '<button type="button" class="rcp-button" data-act="' + (isConn ? 'ph-disconnect' : 'ph-connect') + '" data-addr="' + esc(addr) + '"' +
+          '<button type="button" class="rcp-button is-small" data-act="' + (isConn ? 'ph-disconnect' : 'ph-connect') + '" data-addr="' + esc(addr) + '"' +
           (rowBusy ? ' disabled' : '') + '>' +
           (busyPhones[addr] ? (isConn ? 'Disconnecting…' : 'Reconnecting…') : isConn ? 'Disconnect' : 'Reconnect') +
           '</button>' +
-          '<button type="button" class="rcp-button is-danger" data-act="ph-forget" data-addr="' + esc(addr) + '"' + (rowBusy ? ' disabled' : '') + '>Forget</button>' +
-          '</div>' +
+          '<button type="button" class="rcp-button is-small is-danger" data-act="ph-forget" data-addr="' + esc(addr) + '"' + (rowBusy || forgetArm === addr ? ' disabled' : '') + '>Forget</button>' +
+          '</span>' +
           (forgetArm === addr
-            ? '<div class="rcp-confirm is-danger" style="margin: 0 15px 10px;">' +
-              '<p><strong>Forget this phone?</strong> ' + esc(addr) + " won't be able to reconnect until you pair it again.</p>" +
+            ? '<div class="rcp-confirm is-danger">' +
+              '<p><strong>Forget ' + esc(d.name || 'this phone') + '?</strong> It cannot reconnect until you pair it again.</p>' +
               '<div class="rcp-actions">' +
-              '<button type="button" class="rcp-button is-danger" data-act="ph-forget-confirm" data-addr="' + esc(addr) + '"' + (busy ? ' disabled' : '') + '>Forget</button>' +
+              '<button type="button" class="rcp-button is-danger" data-act="ph-forget-confirm" data-addr="' + esc(addr) + '"' + (busy ? ' disabled' : '') + '>Forget phone</button>' +
               '<button type="button" class="rcp-button" data-act="ph-forget-cancel">Cancel</button>' +
               '</div>' +
               '</div>'
-            : '')
+            : '') +
+          '</div>'
       );
     }
     return '<div class="rcp-phone-list">' + rows.join('') + '</div>';
@@ -563,6 +568,12 @@
   function render() {
     if (!root) return;
     reportSetup();
+    // The pairing card's own errors: an action that failed, and the radio's
+    // last Bluetooth error (the status's own read failing is said above).
+    var problems =
+      (error ? '<p class="rcp-error">' + esc(error) + '</p>' : '') +
+      (statusError ? U.problemHtml(statusError) : '') +
+      (radioError && !statusError ? '<p class="rcp-error">Last Bluetooth error: ' + esc(radioError) + '</p>' : '');
     var html =
       '<section class="rcp-card">' +
       '<div class="rcp-card__heading">' +
@@ -589,20 +600,20 @@
           : '') +
       '</div>' +
       pairingCardBody() +
-      (error || statusError || radioError ? '<p class="rcp-error">' + esc(error || statusError || radioError) + '</p>' : '') +
+      problems +
       '</section>' +
       '<section class="rcp-card">' +
       '<div class="rcp-card__heading">' +
       '<div class="rcp-card__heading-copy">' +
-      '<small>Bonded phones</small>' +
+      '<small>Paired phones</small>' +
       '<h3>' +
-      (bondedError ? 'Paired phones unavailable' : known ? bonded.length + ' phone' + (bonded.length === 1 ? '' : 's') + ' bonded' : 'Loading…') +
+      (bondedError ? 'Paired phones unavailable' : known ? bonded.length + ' phone' + (bonded.length === 1 ? '' : 's') + ' paired' : 'Checking paired phones…') +
       '</h3>' +
       '</div>' +
       '</div>' +
       bondedCardBody() +
-      '<p class="rcp-footnote">Forget removes the bond — that phone must pair again before it can reconnect. ' +
-      'Already-paired phones reconnect on their own.</p>' +
+      '<p class="rcp-footnote">Forget unpairs a phone: it must be paired again before it can reconnect. ' +
+      'Phones still paired reconnect by themselves.</p>' +
       '</section>';
     if (html === lastHtml) return;
     lastHtml = html;

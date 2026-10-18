@@ -45,6 +45,10 @@
     });
   }
 
+  /** What errMsg says when Aokie itself is not running. Cards show it as a
+   *  quiet note, not an error: OAIY says so above the screen, with Start. */
+  var NOT_RUNNING = "Aokie is not running, so this can't be read yet. Start it and this fills in by itself.";
+
   function errMsg(e) {
     var m = e && e.message ? e.message : String(e);
     // The host's words when Aokie itself is not running ("503: The "aokie"
@@ -52,9 +56,44 @@
     // already says so above the screen, with a Start button, so say it once
     // and plainly here rather than repeat the status code and its internals.
     if (/connector is not available|not started yet/i.test(m)) {
-      return "Aokie is not running, so this can't be read yet. Start it and this fills in by itself.";
+      return NOT_RUNNING;
     }
+    // A plugin refusal leads with the command it refused ("settings.get: …",
+    // "dongle.reset refused: …"): the person did not type a command, so the
+    // reason alone, as a sentence.
+    var lead = /^[a-z]+(?:\.[A-Za-z]+)+(?: refused)?:\s+(\S)/.exec(m);
+    if (lead) m = lead[1].toUpperCase() + m.slice(lead[0].length);
     return m;
+  }
+
+  /** A card's line for a failed read: the error, or the quiet note when
+   *  Aokie is not running (the same words on every card read as alarm). */
+  function problemHtml(msg) {
+    if (msg === NOT_RUNNING) return '<p class="rcp-empty">Shown once Aokie is running.</p>';
+    return '<p class="rcp-error">' + esc(msg) + '</p>';
+  }
+
+  /** Grey bars while a card's first read is out. */
+  var LOADING_HTML =
+    '<div class="rcp-skeleton" role="status"><span class="rcp-sr">Loading</span><i></i><i></i><i></i></div>';
+
+  /** Times in plugin reasons ("consent expired at 2026-10-01T09:12:00Z") in
+   *  the person's own way of writing them. */
+  function plainTimes(text) {
+    return String(text == null ? '' : text).replace(
+      /\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})/g,
+      function (iso) {
+        var t = new Date(iso);
+        if (isNaN(t.getTime())) return iso;
+        return t.toLocaleString(undefined, { day: 'numeric', month: 'short', year: 'numeric', hour: 'numeric', minute: '2-digit' });
+      }
+    );
+  }
+
+  /** A reason as a sentence of its own: times made plain, a capital first. */
+  function sentence(text) {
+    var s = plainTimes(text).trim();
+    return s ? s.charAt(0).toUpperCase() + s.slice(1) : s;
   }
 
   /** innerHTML with a change guard so a poll re-render never resets hover
@@ -302,7 +341,10 @@
       tabRegistry[id] = def || {};
     },
     /** Shared helpers for tab modules (defined above in this file). */
-    util: { esc: esc, errMsg: errMsg, setHtml: setHtml, svg: svg, icons: ICONS, navLink: navLink },
+    util: {
+      esc: esc, errMsg: errMsg, setHtml: setHtml, svg: svg, icons: ICONS, navLink: navLink,
+      problemHtml: problemHtml, loadingHtml: LOADING_HTML, plainTimes: plainTimes, sentence: sentence, notRunning: NOT_RUNNING,
+    },
     /** Where calls go, shared by the Overview, Settings and Consent tabs. */
     oaiy: OAIY,
     /** Setup mode: whether the screen is a step of OAIY's setup wizard, and
@@ -424,7 +466,7 @@
       }
     } else {
       el.innerHTML =
-        '<p class="rcp-error">This tab did not register — the screen bundle may be incomplete.</p>';
+        '<p class="rcp-error">This tab did not load: the Aokie screen is incomplete. Reinstall the Aokie plugin, then open it again.</p>';
       setupApi.fail('The Aokie screen for this step did not load. Reinstall the Aokie plugin, then try again.');
     }
   }
@@ -569,7 +611,10 @@
         state.phoneError = errMsg(e);
         state.phone = null;
       }
-    ).then(renderReadiness);
+    ).then(function () {
+      renderHero(); // a phone that is not connected is not ready for calls
+      renderReadiness();
+    });
   }
 
   function refreshDiag() {
@@ -588,6 +633,7 @@
         state.diag = null;
       }
     ).then(function () {
+      renderHero(); // a line paused for consent is not ready for calls
       renderReadiness();
       renderDelivery();
     });
@@ -609,6 +655,7 @@
       }
     ).then(function () {
       renderPhones();
+      renderHero();
       renderReadiness(); // the bonded count says "Paired, offline"
     });
   }
@@ -650,6 +697,7 @@
       }
     ).then(function () {
       renderSettings();
+      renderHero(); // calls that go nowhere are not ready for calls
       renderReadiness(); // the call route names who answers
       renderLive(); // agent-mode gates the operator composer
     });
@@ -815,10 +863,16 @@
     var health = pluginHealth();
     var status = health ? String(health.status || '') : '';
 
+    // A healthy plugin is not by itself ready for calls: with no phone on the
+    // line, or calls sent where nobody answers, the headline said "Ready for
+    // calls" over tiles that said otherwise.
+    var gaps = status === 'ok' ? readinessGaps() : [];
+
     if (!running) {
       headline.textContent = 'Aokie is not running';
       sub.textContent = snap.reason || 'Start the plugin from the Plugins workspace to take calls.';
-      setPill(pill, pillText, snap.state === 'crashed' ? 'is-err' : 'is-neutral', snap.state || 'Stopped');
+      var stateName = String(snap.state || 'stopped');
+      setPill(pill, pillText, snap.state === 'crashed' ? 'is-err' : 'is-neutral', stateName.charAt(0).toUpperCase() + stateName.slice(1));
     } else if (snap.lastHealthError || (snap.state === 'unhealthy' && !health)) {
       headline.textContent = 'Running — needs attention';
       sub.textContent = snap.lastHealthError || snap.reason || 'The plugin is running, but its health could not be verified.';
@@ -827,22 +881,52 @@
       headline.textContent = 'Starting up';
       sub.textContent = 'No health report from the plugin yet.';
       setPill(pill, pillText, 'is-neutral', 'Starting');
+    } else if (status === 'ok' && gaps.length) {
+      headline.textContent = 'Not ready for calls';
+      sub.textContent = gaps.join(' ');
+      setPill(pill, pillText, 'is-warn', 'Not ready');
     } else if (status === 'ok') {
       headline.textContent = 'Ready for calls';
-      sub.textContent = health.detail || 'The phone bridge and voice pipeline are healthy.';
+      sub.textContent = sentence(health.detail) || 'Aokie is running and its phone line is up.';
       setPill(pill, pillText, 'is-ok', 'Healthy');
     } else if (status === 'degraded') {
       headline.textContent = 'Running — needs attention';
-      sub.textContent = health.detail || 'The plugin reports a degraded component.';
+      sub.textContent = sentence(health.detail) || 'The plugin reports a degraded component.';
       setPill(pill, pillText, 'is-warn', 'Degraded');
     } else {
       headline.textContent = 'Plugin health: ' + (status || 'unknown');
-      sub.textContent = health.detail || 'See the readiness checks below.';
+      sub.textContent = sentence(health.detail) || 'See the readiness checks below.';
       setPill(pill, pillText, status === 'error' ? 'is-err' : 'is-warn', status || 'Unknown');
     }
 
     var pluginVersion = snap.version || (snap.manifest && snap.manifest.version);
     version.textContent = pluginVersion ? 'Aokie v' + pluginVersion : '';
+  }
+
+  /** What keeps a healthy plugin from taking calls, as far as it is known
+   *  (a read still out, or failed, is not counted against it). */
+  function readinessGaps() {
+    var gaps = [];
+    var phone = state.phone;
+    if (phone && typeof phone === 'object') {
+      if (phone.pairingConfirm) gaps.push('A phone is waiting for its pairing code to be confirmed in Phone setup.');
+      else if (!phone.connected) {
+        gaps.push(
+          (Array.isArray(state.phones) && state.phones.length) || phone.paired
+            ? 'The paired phone is not connected.'
+            : 'No phone is paired yet: pair one in Phone setup.'
+        );
+      }
+    }
+    var route = state.settings ? OAIY.callRoute(state.settings.settings) : 'unknown';
+    if (route === 'local' || route === 'flows') {
+      gaps.push('Calls do not go to OAIY, so nobody answers them: send them to OAIY in Settings.');
+    }
+    var radio = state.diag && state.diag.radio;
+    if (radio && radio.paused && radio.blockedBy === 'consent') {
+      gaps.push('The phone line is paused until consent is given again.');
+    }
+    return gaps;
   }
 
   // ---- readiness grid -----------------------------------------------------
@@ -857,12 +941,14 @@
 
     // Phone bridge (phone.status)
     (function () {
+      var label = 'Phone';
       if (phone === undefined) {
-        items.push({ icon: ICONS.smartphone, label: 'Phone bridge', value: '…', note: 'checking phone.status', ok: null });
+        items.push({ icon: ICONS.smartphone, label: label, value: '…', note: 'Checking…', ok: null });
         return;
       }
       if (phone === null) {
-        items.push({ icon: ICONS.smartphone, label: 'Phone bridge', value: 'Unavailable', note: state.phoneError || 'phone.status failed', ok: false });
+        var off = state.phoneError === NOT_RUNNING;
+        items.push({ icon: ICONS.smartphone, label: label, value: off ? '—' : 'Unavailable', note: off ? 'Aokie is not running' : state.phoneError || 'The phone status could not be read', ok: off ? null : false });
         return;
       }
       // Linked is what phone.status says of the link: an old error it still
@@ -883,9 +969,16 @@
       var device = phone.device || null;
       var named = device && (device.name || device.address);
       var note = linked
-        ? (named || 'phone connected') + (phone.error ? ' · last error: ' + phone.error : '')
-        : phone.error || named || (bondedCount > 0 ? 'the paired phone is not connected' : 'pair a phone with "Aokie AI Assistant"');
-      items.push({ icon: ICONS.smartphone, label: 'Phone bridge', value: value, note: note, ok: linked });
+        ? (named || 'Phone connected') + (phone.error ? ' · last error: ' + phone.error : '')
+        : phone.error || named || (bondedCount > 0 ? 'The paired phone is not connected' : 'Pair a phone with “Aokie AI Assistant”');
+      items.push({
+        icon: ICONS.smartphone,
+        label: label,
+        value: value,
+        note: note,
+        ok: linked,
+        go: linked ? null : ['phone', phone.pairingConfirm ? 'Confirm the code' : bondedCount > 0 || phone.paired ? 'Phone setup' : 'Pair a phone'],
+      });
     })();
 
     // Who answers, from the plugin's health report. Its realtime error is the
@@ -895,15 +988,21 @@
       var label = 'Calls answered by';
       var responder = health && health.components && health.components.responder;
       if (!running) {
-        items.push({ icon: ICONS.server, label: label, value: '—', note: 'plugin not running', ok: null });
+        items.push({
+          icon: ICONS.server,
+          label: label,
+          value: snap === undefined ? '…' : '—',
+          note: snap === undefined ? 'Checking…' : snap === null ? 'The plugin status could not be read' : 'Aokie is not running',
+          ok: null,
+        });
         return;
       }
       if (snap.lastHealthError || (snap.state === 'unhealthy' && !health)) {
-        items.push({ icon: ICONS.server, label: label, value: 'Unavailable', note: snap.lastHealthError || snap.reason || 'health check unavailable', ok: false });
+        items.push({ icon: ICONS.server, label: label, value: 'Unavailable', note: snap.lastHealthError || snap.reason || 'The health check did not answer', ok: false });
         return;
       }
       if (!responder) {
-        items.push({ icon: ICONS.server, label: label, value: '…', note: health ? 'no responder details in the latest health report' : 'no health report yet', ok: null });
+        items.push({ icon: ICONS.server, label: label, value: '…', note: health ? 'Not in the latest health report' : 'No health report yet', ok: null });
         return;
       }
       if (responder.mode === 'desktop_realtime') {
@@ -918,8 +1017,9 @@
             icon: ICONS.server,
             label: label,
             value: bag ? 'Another realtime provider' : 'Realtime provider',
-            note: failure || (bag ? 'not OAIY — send calls to OAIY in Settings' : 'checking where calls go'),
+            note: failure || (bag ? 'Not OAIY — send calls to OAIY in Settings' : 'Checking where calls go'),
             ok: failure ? false : null,
+            go: bag ? ['settings', 'Settings'] : null,
           });
           return;
         }
@@ -934,7 +1034,7 @@
           note:
             failure ||
             (voiceDown ? 'OAIY Voice is ' + voice.status + ' — start it in OAIY Services' : '') ||
-            (voice ? 'OAIY Voice running · the Front desk agent replies' : 'the Front desk agent replies through OAIY'),
+            (voice ? 'OAIY Voice running · the Front desk agent replies' : 'The Front desk agent replies through OAIY'),
           ok: failure || voiceDown ? false : voice ? true : null,
         });
         return;
@@ -946,48 +1046,62 @@
         icon: ICONS.server,
         label: label,
         value: 'Nobody',
-        note: NO_OWN_SPEECH + '. Calls ring through to you until you send them to OAIY in Settings.',
+        note: 'Calls ring through to you until you send them to OAIY in Settings.',
         ok: false,
+        go: ['settings', 'Send calls to OAIY'],
       });
     })();
 
     // Radio & dongle (dongle.diagnostics)
     (function () {
+      var label = 'Radio & dongle';
       if (diag === undefined) {
-        items.push({ icon: ICONS.radio, label: 'Radio & dongle', value: '…', note: 'checking diagnostics', ok: null });
+        items.push({ icon: ICONS.radio, label: label, value: '…', note: 'Checking…', ok: null });
         return;
       }
       var radio = diag && diag.radio;
       if (!radio) {
-        items.push({ icon: ICONS.radio, label: 'Radio & dongle', value: 'Unavailable', note: state.diagError || 'no radio diagnostics', ok: false });
+        var off = state.diagError === NOT_RUNNING;
+        items.push({
+          icon: ICONS.radio,
+          label: label,
+          value: off ? '—' : 'Unavailable',
+          note: off ? 'Aokie is not running' : state.diagError || 'The radio did not report',
+          ok: off ? null : false,
+          go: off || transportMode === 'native' ? null : ['dongle', 'Dongle setup'],
+        });
         return;
       }
       var consentPaused = !!radio.paused && radio.blockedBy === 'consent';
       // (Its voice slots always say Aokie has no speech of its own: that is
       // not a radio fault, and "Calls answered by" says what it means.)
-      var value = consentPaused ? 'Paused for consent' : radio.initialized ? 'Ready' : 'Not initialised';
+      var value = consentPaused ? 'Paused for consent' : radio.initialized ? 'Ready' : 'Not started';
       var note =
-        (consentPaused ? radio.reason : '') ||
+        (consentPaused ? sentence(radio.reason) : '') ||
         radio.error ||
-        (radio.initialized ? 'radio up' : 'connect a supported dongle');
+        (radio.initialized ? 'The radio is up' + (radio.localAddress ? ' (' + radio.localAddress + ')' : '') : 'Plug in a supported dongle');
       items.push({
         icon: ICONS.radio,
-        label: 'Radio & dongle',
+        label: label,
         value: value,
         note: note,
         ok: !consentPaused && !!radio.initialized && !radio.error,
+        // (no Dongle tab on the built-in transport: nothing to link to there)
+        go: consentPaused ? ['consent', 'Review consent'] : radio.initialized && !radio.error || transportMode === 'native' ? null : ['dongle', 'Dongle setup'],
       });
     })();
 
-    // Data delivery (outbox counts)
+    // Call and text records on their way to OAIY (outbox counts)
     (function () {
+      var label = 'Call & text records';
       if (diag === undefined) {
-        items.push({ icon: ICONS.cloud, label: 'Data delivery', value: '…', note: 'checking outbox', ok: null });
+        items.push({ icon: ICONS.cloud, label: label, value: '…', note: 'Checking…', ok: null });
         return;
       }
       var outbox = outboxCounts(diag);
       if (!outbox) {
-        items.push({ icon: ICONS.cloud, label: 'Data delivery', value: 'Unknown', note: state.diagError || 'no outbox counts', ok: null });
+        var off = state.diagError === NOT_RUNNING;
+        items.push({ icon: ICONS.cloud, label: label, value: off ? '—' : 'Unknown', note: off ? 'Aokie is not running' : 'Aokie did not report its delivery counts', ok: null });
         return;
       }
       var pending = Number(outbox.pending) || 0;
@@ -996,9 +1110,9 @@
       var healthy = dead === 0 && failed === 0;
       items.push({
         icon: ICONS.cloud,
-        label: 'Data delivery',
+        label: label,
         value: healthy ? (pending > 0 ? 'Delivering…' : 'All delivered') : 'Needs attention',
-        note: pending + ' pending · ' + failed + ' failed · ' + dead + ' dead',
+        note: pending + ' waiting · ' + failed + ' retrying · ' + dead + ' gave up',
         ok: healthy,
       });
     })();
@@ -1011,15 +1125,17 @@
       .map(function (it) {
         var stateCls = it.ok == null ? 'is-unknown' : it.ok ? 'is-ok' : 'is-bad';
         var stateIcon = it.ok == null ? '' : it.ok ? ICONS.check : ICONS.alert;
+        var note = plainTimes(it.note);
         return (
           // The dashboard's status tile: icon, the value (coloured by its
           // state), what it is, then the detail, clamped with the full text
-          // in its title.
+          // in its title, and where to put it right when it needs it.
           '<div class="rcp-ready ' + stateCls + '">' +
           '<span class="rcp-ready__icon">' + it.icon + '</span>' +
           '<strong>' + esc(it.value) + '</strong>' +
           '<small>' + esc(it.label) + '</small>' +
-          '<p title="' + esc(it.note) + '">' + esc(it.note) + '</p>' +
+          '<p title="' + esc(note) + '">' + esc(note) + '</p>' +
+          (it.go ? '<button type="button" class="rcp-link-btn" data-tabgo="' + it.go[0] + '">' + esc(it.go[1]) + ' ›</button>' : '') +
           '<span class="rcp-ready__state ' + stateCls + '">' + stateIcon + '</span>' +
           '</div>'
         );
@@ -1066,7 +1182,7 @@
       title.textContent = 'Checking for a live call…';
       pill.hidden = true;
       speakRow.hidden = true;
-      setHtml(body, '<p class="rcp-loading">Loading…</p>');
+      setHtml(body, LOADING_HTML);
       return;
     }
 
@@ -1075,7 +1191,7 @@
       speakRow.hidden = true;
       if (!state.callKnown) {
         title.textContent = 'Live call unavailable';
-        setHtml(body, '<p class="rcp-error">' + esc(state.callError || 'call.current failed.') + '</p>');
+        setHtml(body, problemHtml(state.callError || 'The current call could not be read.'));
         return;
       }
       if (state.callPauseReason) {
@@ -1083,10 +1199,10 @@
         setHtml(
           body,
           '<div class="rcp-empty-call">' +
-            '<span class="rcp-empty-call__icon">' + ICONS.alert + '</span>' +
-            '<h4>Consent review required</h4>' +
-            '<p>' + esc(state.callPauseReason) + '</p>' +
-            '<button type="button" class="rcp-link-btn" data-tabgo="consent">Review consent</button>' +
+            '<span class="rcp-empty-call__icon is-warn">' + ICONS.alert + '</span>' +
+            '<h4>Consent needs review</h4>' +
+            '<p>' + esc(sentence(state.callPauseReason).replace(/\.+$/, '')) + '. Calls ring through to you until consent is given again.</p>' +
+            '<div class="rcp-actions"><button type="button" class="rcp-button is-primary" data-tabgo="consent">Review consent</button></div>' +
             '</div>'
         );
         return;
@@ -1097,7 +1213,7 @@
         '<div class="rcp-empty-call">' +
           '<span class="rcp-empty-call__icon">' + ICONS.phoneBig + '</span>' +
           '<h4>Waiting for the next call</h4>' +
-          '<p>When a call rings on the paired phone it appears here with answer, reject and hang-up controls.</p>' +
+          '<p>When a call rings on the paired phone it shows here, with Answer and Reject.</p>' +
           '</div>'
       );
       return;
@@ -1105,15 +1221,14 @@
 
     var caller = call.from || 'Unknown caller';
     var outbound = call.direction === 'outbound';
-    title.textContent = caller;
 
     if (call.state === 'ringing') {
+      title.textContent = outbound ? 'Calling out' : 'Incoming call';
       setPill(pill, pillText, 'is-warn', outbound ? 'Dialing' : 'Ringing');
       speakRow.hidden = true;
       setHtml(
         body,
         '<div class="rcp-ringing">' +
-          '<small>' + (outbound ? 'OUTBOUND CALL' : 'INCOMING CALL') + '</small>' +
           '<h4>' + esc(caller) + '</h4>' +
           (outbound
             ? '<p>Waiting for the other person to answer.</p>'
@@ -1134,6 +1249,7 @@
     }
 
     // Active call.
+    title.textContent = 'On a call';
     setPill(pill, pillText, 'is-live', callDuration(call) || 'Live call');
     // A call left ringing for the owner that they answered on the phone is
     // theirs: the receptionist neither speaks nor listens.
@@ -1143,23 +1259,27 @@
     // not have: OAIY Voice speaks on calls that go to OAIY.
     var voiceless = owner === 'operator';
     var note = taken
-      ? 'You answered this call on the phone — the receptionist stays out of it'
+      ? 'You answered this call on the phone, so the receptionist stays out of it.'
       : owner === 'agent'
-        ? 'The AI receptionist owns this conversation — operator speech is muted'
+        ? 'The AI receptionist is handling this call.'
         : voiceless
-          ? NO_OWN_SPEECH + ', so nothing can be said to the caller from here'
-          : 'Checking who owns replies…';
+          ? NO_OWN_SPEECH + ', so nothing can be said to the caller from here.'
+          : 'Checking who is handling this call…';
     setHtml(
       body,
-      '<div class="rcp-active">' +
+      '<div class="rcp-ringing is-active">' +
         '<small>' + (outbound ? 'OUTBOUND CALL' : 'INCOMING CALL') + '</small>' +
-        '<span class="rcp-active__note">' + esc(note) + '</span>' +
+        '<h4>' + esc(caller) + '</h4>' +
+        '<p>' + esc(note) + '</p>' +
+        '<div class="rcp-call-actions">' +
         '<button type="button" class="rcp-call-action is-reject" data-act="call-hangup"' + (state.busyCall ? ' disabled' : '') + '>' +
         ICONS.phone + ' Hang up</button>' +
-        '</div>'
+        '</div></div>'
     );
-    speakRow.hidden = taken;
     var muted = owner !== 'operator' || voiceless;
+    // A composer that can never speak is not shown: with no voice of its own
+    // Aokie cannot say what is typed, and the note above says why.
+    speakRow.hidden = taken || muted;
     input.disabled = state.busyCall || muted;
     input.placeholder = voiceless
       ? 'Aokie has no voice of its own'
@@ -1174,7 +1294,11 @@
   function renderSwitchboard() {
     var body = $('switchboard-body');
     var board = state.switchboard;
-    body.hidden = board === undefined || !!(board && !board.waiting && !board.parked && !board.switchInProgress);
+    // (Aokie not running: the live call card says so already, once is enough)
+    body.hidden =
+      board === undefined ||
+      !!(board && !board.waiting && !board.parked && !board.switchInProgress) ||
+      (!board && state.switchboardError === NOT_RUNNING);
     if (body.hidden) {
       setHtml(body, '');
       return;
@@ -1200,17 +1324,22 @@
     var diag = state.diag;
 
     if (diag === undefined) {
-      title.textContent = 'Loading…';
+      title.textContent = 'Checking delivery…';
       setPill(pill, pillText, 'is-neutral', 'Checking');
-      setHtml(body, '<p class="rcp-loading">Loading…</p>');
+      setHtml(body, LOADING_HTML);
       return;
     }
 
     var outbox = outboxCounts(diag);
     if (!outbox) {
-      title.textContent = 'Outbox unavailable';
+      title.textContent = 'Delivery counts unavailable';
       setPill(pill, pillText, 'is-neutral', 'Unknown');
-      setHtml(body, '<p class="rcp-error">' + esc(state.diagError || 'dongle.diagnostics returned no outbox counts.') + '</p>');
+      setHtml(
+        body,
+        state.diagError === NOT_RUNNING || !state.diagError
+          ? problemHtml(state.diagError || 'Aokie did not report its delivery counts.')
+          : '<p class="rcp-error">Aokie could not report its delivery counts: ' + esc(state.diagError) + '</p>'
+      );
       return;
     }
 
@@ -1222,32 +1351,39 @@
 
     title.textContent = healthy
       ? pending > 0
-        ? 'Delivering…'
-        : 'All events delivered'
-      : 'Delivery needs attention';
+        ? 'Delivering to OAIY…'
+        : 'All delivered to OAIY'
+      : dead > 0
+        ? 'Some records were not delivered'
+        : 'Retrying delivery';
     if (healthy) setPill(pill, pillText, 'is-ok', 'Healthy');
-    else if (dead > 0) setPill(pill, pillText, 'is-warn', dead + ' dead');
-    else setPill(pill, pillText, 'is-warn', failed + ' failed');
+    else if (dead > 0) setPill(pill, pillText, 'is-warn', dead + ' gave up');
+    else setPill(pill, pillText, 'is-warn', failed + ' retrying');
 
     var html =
       '<div class="rcp-metrics">' +
-      '<span><strong>' + pending + '</strong><small>Pending</small></span>' +
-      '<span><strong>' + failed + '</strong><small>Failed</small></span>' +
-      '<span><strong>' + dead + '</strong><small>Dead</small></span>' +
+      '<span><strong>' + pending + '</strong><small>Waiting</small></span>' +
+      '<span' + (failed ? ' class="is-warn"' : '') + '><strong>' + failed + '</strong><small>Retrying</small></span>' +
+      '<span' + (dead ? ' class="is-warn"' : '') + '><strong>' + dead + '</strong><small>Gave up</small></span>' +
       '</div>';
+    if (dead > 0) {
+      html +=
+        '<p class="rcp-delivery-note">OAIY did not take ' + (dead === 1 ? 'one record' : dead + ' records') +
+        ' after days of trying. Send ' + (dead === 1 ? 'it' : 'them') + ' again once OAIY is running.</p>';
+    }
     if (collisions > 0) {
       html +=
         '<p class="rcp-delivery-note is-warn">' +
-        collisions + ' idempotency key collision' + (collisions === 1 ? '' : 's') +
-        ' rejected — a key-derivation bug; check the plugin logs.</p>';
+        (collisions === 1 ? 'One record was' : collisions + ' records were') +
+        ' turned away as a copy of another. That is a fault in Aokie: its log has the details.</p>';
     }
     if (dead > 0) {
       html +=
-        '<div class="rcp-delivery-actions">' +
+        '<div class="rcp-actions">' +
         '<button type="button" class="rcp-button" data-act="redrive"' + (state.busyRedrive ? ' disabled' : '') + '>' +
         (state.busyRedrive
-          ? 'Redriving…'
-          : 'Redrive ' + dead + ' dead event' + (dead === 1 ? '' : 's')) +
+          ? 'Sending again…'
+          : 'Send ' + (dead === 1 ? 'it' : 'the ' + dead) + ' again') +
         '</button></div>';
     }
     setHtml(body, html);
@@ -1261,27 +1397,26 @@
     var phones = state.phones;
 
     if (phones === undefined) {
-      title.textContent = 'Loading…';
-      setHtml(body, '<p class="rcp-loading">Loading…</p>');
+      title.textContent = 'Checking paired phones…';
+      setHtml(body, LOADING_HTML);
       return;
     }
     if (phones === null) {
       title.textContent = 'Paired phones unavailable';
-      setHtml(body, '<p class="rcp-error">' + esc(state.phonesError || 'phone.listPaired failed.') + '</p>');
+      setHtml(body, problemHtml(state.phonesError || 'The paired phones could not be read.'));
       return;
     }
     if (phones.length === 0) {
       title.textContent = 'No phones paired';
       setHtml(
         body,
-        '<p class="rcp-loading">No phones are bonded yet. Open the ' +
-          '<button type="button" class="rcp-link-btn" data-tabgo="phone">Phone setup tab</button>' +
-          ' to pair one.</p>'
+        '<p class="rcp-empty">No phone is paired with Aokie yet.</p>' +
+          '<div class="rcp-actions"><button type="button" class="rcp-button" data-tabgo="phone">Pair a phone</button></div>'
       );
       return;
     }
 
-    title.textContent = phones.length + ' phone' + (phones.length === 1 ? '' : 's') + ' bonded';
+    title.textContent = phones.length + ' phone' + (phones.length === 1 ? '' : 's') + ' paired';
     var html =
       '<div class="rcp-phone-list">' +
       phones
@@ -1292,13 +1427,14 @@
           return (
             '<div class="rcp-phone-row">' +
             '<span class="rcp-phone-row__id">' +
-            '<strong>' + esc(d.name || 'Unknown phone') + '</strong>' +
+            '<strong>' + esc(d.name || 'Unnamed phone') + '</strong>' +
             '<small>' + esc(addr) + '</small>' +
             '</span>' +
+            '<span class="rcp-phone-row__actions">' +
             '<span class="rcp-pill ' + (connected ? 'is-ok' : 'is-neutral') + '"><i></i>' +
             (connected ? 'Connected' : 'Offline') +
             '</span>' +
-            '<button type="button" class="rcp-button" data-act="' +
+            '<button type="button" class="rcp-button is-small" data-act="' +
             (connected ? 'phone-disconnect' : 'phone-connect') +
             '" data-addr="' + esc(addr) + '"' + (busy ? ' disabled' : '') + '>' +
             (busy
@@ -1309,6 +1445,7 @@
                 ? 'Disconnect'
                 : 'Reconnect') +
             '</button>' +
+            '</span>' +
             '</div>'
           );
         })
@@ -1342,13 +1479,13 @@
     var s = state.settings;
 
     if (s === undefined) {
-      title.textContent = 'Loading…';
-      setHtml(body, '<p class="rcp-loading">Loading…</p>');
+      title.textContent = 'Checking the settings…';
+      setHtml(body, LOADING_HTML);
       return;
     }
     if (s === null) {
       title.textContent = 'Settings unavailable';
-      setHtml(body, '<p class="rcp-error">' + esc(state.settingsError || 'settings.get failed.') + '</p>');
+      setHtml(body, problemHtml(state.settingsError || 'The settings could not be read.'));
       return;
     }
 
@@ -1358,9 +1495,10 @@
     var briefSet = typeof bag.persona === 'string' && bag.persona.trim() !== '';
     var autoAnswer = bag.autoAnswer === true || bag.autoAnswer === 'true';
 
+    // (No AI receptionist is not "flow-driven replies": flows spoke in
+    // Aokie's own voice, which is gone, so those calls go nowhere too.)
     title.textContent =
       route === 'oaiy' ? 'Calls go to OAIY' :
-      route === 'flows' ? 'Flow-driven replies' :
       route === 'unknown' ? 'Receptionist settings' : 'Calls do not go to OAIY';
 
     // [label, value, page?] — with a page, the value opens the dashboard page
@@ -1376,8 +1514,7 @@
     rows.push(
       ['Greeting', greetingSet ? 'Custom greeting set' : 'Default greeting'],
       ['Receptionist brief', briefSet ? 'Custom brief set' : 'Built-in brief'],
-      ['Auto-answer', autoAnswer ? 'On' : 'Off'],
-      ['Config version', s.configVersion != null ? 'v' + s.configVersion : '—']
+      ['Auto-answer', autoAnswer ? 'On' : 'Off']
     );
     var html =
       '<div class="rcp-settings-list">' +
@@ -1418,12 +1555,12 @@
         function (e) {
           var msg = errMsg(e);
           if (msg.indexOf('stale_call') !== -1) {
-            HOST.toast('info', 'The call changed — refreshing the live state before more actions.');
+            HOST.toast('info', 'The call changed meanwhile: showing it as it is now.');
             return refreshCall().then(function () {
               return false;
             });
           }
-          HOST.toast('error', 'Call control failed: ' + msg);
+          HOST.toast('error', 'The call could not be changed: ' + msg);
           return false;
         }
       )
@@ -1455,15 +1592,15 @@
           HOST.toast(
             'info',
             command === 'phone.connect'
-              ? 'Reconnect requested for ' + address + ' — watching for the phone to come back.'
-              : 'Disconnect requested for ' + address + ' — the phone may take a moment to drop.'
+              ? 'Reconnecting the phone (' + address + '): it shows as connected once it is back.'
+              : 'Disconnecting the phone (' + address + '): it may take a moment.'
           );
           return refreshPhones().then(refreshPhoneStatus);
         },
         function (e) {
           HOST.toast(
             'error',
-            (command === 'phone.connect' ? 'Reconnect failed: ' : 'Disconnect failed: ') + errMsg(e)
+            (command === 'phone.connect' ? 'The phone could not be reconnected: ' : 'The phone could not be disconnected: ') + errMsg(e)
           );
         }
       )
@@ -1484,14 +1621,13 @@
           HOST.toast(
             revived > 0 ? 'success' : 'info',
             revived > 0
-              ? 'Redriving ' + revived + ' dead event' + (revived === 1 ? '' : 's') +
-                ' — they re-enter the delivery pipeline now.'
-              : 'Nothing to redrive — no dead events left.'
+              ? 'Sending ' + (revived === 1 ? 'the record' : revived + ' records') + ' to OAIY again.'
+              : 'Nothing to send again: every record has been delivered.'
           );
           return refreshDiag();
         },
         function (e) {
-          HOST.toast('error', 'Redrive failed: ' + errMsg(e));
+          HOST.toast('error', 'The records could not be sent again: ' + errMsg(e));
         }
       )
       .then(function () {
@@ -1604,7 +1740,7 @@
     })
     .catch(function (e) {
       // The polls cover everything the feed would tell us — say so once.
-      HOST.toast('info', 'Live events unavailable (' + errMsg(e) + ') — falling back to polling.');
+      HOST.toast('info', 'Live updates are unavailable (' + errMsg(e) + '), so this screen checks every few seconds instead.');
     });
 
   // ---- lifecycle ----------------------------------------------------------
@@ -1636,6 +1772,8 @@
     }
   });
 
+  // The tiles at once, each "Checking…", rather than an empty status card.
+  if (!SETUP) renderReadiness();
   if (SETUP) startSetup();
   else if (!document.hidden) startTimers();
 })();

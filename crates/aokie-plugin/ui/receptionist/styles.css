@@ -3,9 +3,9 @@
  *
  * The screen is a page of OAIY Desktop, so it wears the dashboard's own
  * design: the same tokens (by the same names, from desktop/src/styles.css),
- * the same section cards, section titles, status tiles, badges, buttons and
- * form controls. Prism Lab (dark) and Paper Circuit (light) differ only in
- * these tokens, exactly as on the host.
+ * the same section cards, section titles, status tiles, badges, buttons,
+ * segmented tabs and form controls. Prism Lab (dark) and Paper Circuit
+ * (light) differ only in these tokens, exactly as on the host.
  *
  * The host stamps `fl-dark` / data-theme on <html> and keeps them live on
  * theme flips, and supplies its fonts (Public Sans, JetBrains Mono) as data:
@@ -38,10 +38,14 @@
   --amber-soft: rgba(245, 181, 44, 0.14);
   --danger: #e94b3c;
   --danger-soft: rgba(233, 75, 60, 0.08);
+  /* Danger as WORDS: #e94b3c is ~3.8:1 on paper, under the 4.5:1 body-text
+     floor, so error text and danger buttons use a deeper shade of it. */
+  --danger-text: #c23526;
 
   --focus: #2457e6;
   /* Paper Circuit's signature: a hard, un-blurred offset instead of a glow. */
   --shadow-card: 2px 2px 0 rgba(50, 42, 30, 0.045);
+  --shadow-primary: 2px 2px 0 rgba(50, 42, 30, 0.14);
 
   --r-card: 8px;
   --r-ctl: 7px;
@@ -78,9 +82,11 @@ html.fl-dark {
   --amber-soft: rgba(242, 184, 75, 0.13);
   --danger: #ff6e78;
   --danger-soft: rgba(255, 110, 120, 0.1);
+  --danger-text: #ff6e78;
 
   --focus: #35d4e8;
   --shadow-card: 0 10px 26px rgba(0, 0, 0, 0.1);
+  --shadow-primary: 0 4px 14px color-mix(in srgb, var(--primary) 22%, transparent), inset 0 1px rgba(255, 255, 255, 0.18);
 
   /* Prism Lab is softer, Paper Circuit squarer. */
   --r-card: 11px;
@@ -129,6 +135,11 @@ select { cursor: pointer; }
   scrollbar-color: var(--strong-border) transparent;
 }
 
+::selection {
+  background: color-mix(in srgb, var(--primary) 24%, transparent);
+  color: var(--text);
+}
+
 h3,
 h4 { margin: 0; }
 
@@ -143,38 +154,42 @@ code { font-family: var(--font-mono); font-size: 0.92em; }
   padding: 2px 0 24px;
 }
 
-/* ── Tab bar: the dashboard's segmented control ─────────────────────────── */
+/* ── Tab bar: the dashboard's segmented tabs (desktop .seg-tabs) ────────── */
 
 .rcp-tabs {
   display: inline-flex;
   flex-wrap: wrap;
   align-self: flex-start;
+  gap: 2px;
   max-width: 100%;
-  overflow: hidden;
+  padding: 3px;
   border: 1px solid var(--border);
-  border-radius: var(--r-ctl);
-  background: var(--surface-soft);
+  border-radius: calc(var(--r-ctl) + 2px);
+  background: var(--canvas);
 }
 
 .rcp-tab-btn {
   appearance: none;
-  min-height: 36px;
+  display: inline-flex;
+  height: 30px;
+  align-items: center;
   border: 0;
+  border-radius: var(--r-sm);
   background: transparent;
   color: var(--muted);
-  padding: 0 14px;
+  padding: 0 13px;
   font-size: 12.5px;
   font-weight: 600;
   white-space: nowrap;
   transition: background 0.14s, color 0.14s;
 }
 
-.rcp-tab-btn + .rcp-tab-btn { border-left: 1px solid var(--border); }
-.rcp-tab-btn:hover { color: var(--text); }
+.rcp-tab-btn:hover { background: var(--surface-soft); color: var(--text); }
 .rcp-tab-btn.is-active { background: var(--primary-soft); color: var(--primary); }
+html.fl-dark .rcp-tab-btn.is-active { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--primary) 30%, transparent); }
 .rcp-tab-btn:focus-visible { outline-offset: -2px; }
 
-/* Hidden by the transport mode (the Dongle tab on the native/auto transports). */
+/* Hidden by the transport mode (the Dongle tab on the native transport). */
 .rcp-tab-btn[hidden] { display: none; }
 
 /* ── Tab panels: grids of cards that reflow with the width ──────────────── */
@@ -191,17 +206,8 @@ code { font-family: var(--font-mono); font-size: 0.92em; }
 .rcp-tab-panel[hidden] { display: none; }
 .rcp-tab-panel > * { min-width: 0; }
 
-/* Cards side by side share a height on the Overview and in the form. */
-.rcp-overview,
-.rcp-form { align-items: stretch; }
-
-.rcp-live-card > #live-body {
-  display: flex;
-  flex: 1 1 auto;
-  flex-direction: column;
-}
-
-.rcp-live-card .rcp-empty-call { flex: 1 1 auto; }
+/* Cards side by side share a height on the Overview. */
+.rcp-overview { align-items: stretch; }
 
 /* Full-width rows: a panel's lone card, marked rows, and stacked panels. */
 .rcp-tab-panel > :only-child,
@@ -236,6 +242,7 @@ code { font-family: var(--font-mono); font-size: 0.92em; }
   flex-direction: column;
   gap: 7px;
   min-width: 0;
+  flex: 1 1 220px;
 }
 
 /* The section title with the dashboard's accent dash. */
@@ -271,26 +278,53 @@ html.fl-dark .rcp-group-title::before { box-shadow: 0 0 8px var(--primary); }
   line-height: 1.3;
 }
 
-.rcp-card__body { min-width: 0; }
-.rcp-card__body > :first-child { margin-top: 0; }
+/* A card's parts one gap apart (the card's own gap is for its heading). */
+.rcp-card__body,
+.rcp-card__content {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+
+.rcp-card__body > *,
+.rcp-card__content > * { margin-top: 0; margin-bottom: 0; }
+
+/* Zones a tab fills later take no room while empty. */
+.rcp-card__body > :empty,
+.rcp-card__content > :empty { display: none; }
+
 .rcp-card__body p { overflow-wrap: anywhere; }
+
+/* A heading inside a card, over a list or a group of fields. */
+.rcp-subhead {
+  margin: 4px 0 0;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 650;
+}
 
 .rcp-loading,
 .rcp-empty,
 .rcp-inline-note {
   margin: 0;
-  color: var(--faint);
+  color: var(--muted);
   font-size: 12.5px;
   line-height: 1.55;
 }
 
+.rcp-loading,
+.rcp-empty { color: var(--faint); }
+
 .rcp-error {
   margin: 0;
-  color: var(--danger);
+  color: var(--danger-text);
   font-size: 12.5px;
   line-height: 1.55;
   overflow-wrap: anywhere;
 }
+
+.rcp-error > .rcp-actions { margin-top: 8px; }
 
 .rcp-footnote {
   margin: auto 0 0;
@@ -308,7 +342,36 @@ html.fl-dark .rcp-group-title::before { box-shadow: 0 0 8px var(--primary); }
   font-size: 13px;
 }
 
+/* Still loading: grey bars where the words will be. */
+.rcp-skeleton {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  padding: 2px 0;
+}
+
+.rcp-skeleton i {
+  display: block;
+  width: 100%;
+  height: 10px;
+  border-radius: 5px;
+  background: linear-gradient(90deg, var(--surface-soft) 25%, color-mix(in srgb, var(--strong-border) 35%, transparent) 50%, var(--surface-soft) 75%);
+  background-size: 200% 100%;
+  animation: rcp-shimmer 1.4s linear infinite;
+}
+
+.rcp-skeleton i:nth-of-type(2) { width: 72%; }
+.rcp-skeleton i:nth-of-type(3) { width: 48%; }
+
+@keyframes rcp-shimmer {
+  from { background-position: 100% 0; }
+  to { background-position: -100% 0; }
+}
+
 /* ── Status card + tiles (the dashboard's "Today" tiles) ────────────────── */
+
+/* The tiles count columns by the card's own width, not the window's. */
+.rcp-status-card { container-type: inline-size; }
 
 .rcp-status__meta {
   display: flex;
@@ -332,9 +395,17 @@ html.fl-dark .rcp-group-title::before { box-shadow: 0 0 8px var(--primary); }
 
 .rcp-grid {
   display: grid;
-  /* 4-up on a wide window, 2 x 2 on a narrow one, never 3 + 1. */
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr));
-  gap: 12px;
+  /* 4-up on a wide card, 2 x 2 on a narrower one, then one column: never 3 + 1. */
+  grid-template-columns: minmax(0, 1fr);
+  gap: 10px;
+}
+
+@container (min-width: 380px) {
+  .rcp-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+@container (min-width: 820px) {
+  .rcp-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 }
 
 .rcp-ready {
@@ -342,9 +413,9 @@ html.fl-dark .rcp-group-title::before { box-shadow: 0 0 8px var(--primary); }
   display: flex;
   flex-direction: column;
   align-items: flex-start;
-  gap: 5px;
+  gap: 4px;
   min-width: 0;
-  padding: 16px 18px;
+  padding: 13px 14px 14px;
   border: 1px solid var(--border);
   border-radius: var(--r-card);
   background: var(--surface-solid);
@@ -354,15 +425,16 @@ html.fl-dark .rcp-group-title::before { box-shadow: 0 0 8px var(--primary); }
 .rcp-ready__icon {
   display: inline-flex;
   margin-bottom: 4px;
-  color: var(--text);
+  color: var(--muted);
 }
 
 .rcp-ready strong {
   max-width: 100%;
-  font-size: 21px;
+  padding-right: 18px;
+  font-size: 18px;
   font-weight: 650;
   letter-spacing: -0.01em;
-  line-height: 1.2;
+  line-height: 1.25;
 }
 
 .rcp-ready.is-ok strong { color: var(--green); }
@@ -370,7 +442,7 @@ html.fl-dark .rcp-group-title::before { box-shadow: 0 0 8px var(--primary); }
 
 .rcp-ready small {
   color: var(--muted);
-  font-size: 13px;
+  font-size: 12px;
 }
 
 .rcp-ready p {
@@ -385,10 +457,17 @@ html.fl-dark .rcp-group-title::before { box-shadow: 0 0 8px var(--primary); }
   -webkit-line-clamp: 3;
 }
 
+/* What to do about it: a link to the tab where it is put right. */
+.rcp-ready .rcp-link-btn {
+  margin-top: auto;
+  padding-top: 4px;
+  font-size: 12px;
+}
+
 .rcp-ready__state {
   position: absolute;
-  top: 14px;
-  right: 14px;
+  top: 13px;
+  right: 13px;
   display: inline-flex;
 }
 
@@ -401,6 +480,7 @@ html.fl-dark .rcp-group-title::before { box-shadow: 0 0 8px var(--primary); }
 .rcp-pill,
 .rcp-badge {
   display: inline-flex;
+  flex: none;
   align-items: center;
   gap: 6px;
   border: 1px solid var(--strong-border);
@@ -412,6 +492,7 @@ html.fl-dark .rcp-group-title::before { box-shadow: 0 0 8px var(--primary); }
   font-size: 10.5px;
   font-weight: 600;
   letter-spacing: 0.02em;
+  line-height: 1.4;
   white-space: nowrap;
 }
 
@@ -446,7 +527,7 @@ html.fl-dark .rcp-group-title::before { box-shadow: 0 0 8px var(--primary); }
 .rcp-pill.is-live {
   border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
   background: var(--danger-soft);
-  color: var(--danger);
+  color: var(--danger-text);
 }
 
 html.fl-dark .rcp-pill.is-ok i,
@@ -469,7 +550,7 @@ html.fl-dark .rcp-pill.is-live i { box-shadow: 0 0 7px var(--danger); }
 .rcp-button,
 .rcp-call-action {
   display: inline-flex;
-  min-height: 36px;
+  min-height: 34px;
   max-width: 100%;
   align-items: center;
   justify-content: center;
@@ -479,11 +560,11 @@ html.fl-dark .rcp-pill.is-live i { box-shadow: 0 0 7px var(--danger); }
   background: var(--surface-soft);
   color: var(--text);
   padding: 0 13px;
-  font-size: 12px;
-  font-weight: 580;
+  font-size: 12.5px;
+  font-weight: 600;
   line-height: 1.25;
   text-align: center;
-  transition: background 0.14s, border-color 0.14s, transform 0.06s, box-shadow 0.14s;
+  transition: background 0.14s, border-color 0.14s, transform 0.06s, box-shadow 0.14s, filter 0.14s;
 }
 
 .rcp-button:hover:not(:disabled),
@@ -501,24 +582,40 @@ html.fl-dark .rcp-pill.is-live i { box-shadow: 0 0 7px var(--danger); }
   opacity: 0.45;
 }
 
+/* A row's own small actions (the dashboard's .btn-tiny). */
+.rcp-button.is-small {
+  min-height: 28px;
+  border-color: var(--border);
+  border-radius: var(--r-sm);
+  padding: 0 10px;
+  font-size: 12px;
+}
+
 .rcp-button.is-primary {
   border-color: color-mix(in srgb, var(--primary) 80%, white);
   background: linear-gradient(115deg, var(--primary), var(--primary-2));
-  box-shadow: 0 8px 22px color-mix(in srgb, var(--primary) 25%, transparent), inset 0 1px rgba(255, 255, 255, 0.2);
+  box-shadow: var(--shadow-primary);
   color: #fff;
 }
 
 .rcp-button.is-primary:hover:not(:disabled) {
   border-color: color-mix(in srgb, var(--primary) 80%, white);
   background: linear-gradient(115deg, var(--primary), var(--primary-2));
-  transform: translateY(-1px);
+  filter: brightness(1.08);
+}
+
+/* Paper Circuit has no glow: a flat primary with its hard offset shadow. */
+html:not(.fl-dark) .rcp-button.is-primary,
+html:not(.fl-dark) .rcp-button.is-primary:hover:not(:disabled) {
+  border-color: var(--primary);
+  background: var(--primary);
 }
 
 .rcp-button.is-danger,
 .rcp-call-action.is-reject {
   border-color: color-mix(in srgb, var(--danger) 40%, var(--border));
   background: var(--danger-soft);
-  color: var(--danger);
+  color: var(--danger-text);
 }
 
 .rcp-button.is-danger:hover:not(:disabled),
@@ -544,10 +641,12 @@ html.fl-dark .rcp-pill.is-live i { box-shadow: 0 0 7px var(--danger); }
   color: #fff;
 }
 
+html.fl-dark .rcp-call-action.is-answer { color: #06281c; }
+
 .rcp-call-action.is-answer:hover:not(:disabled) {
   border-color: var(--green);
   background: var(--green);
-  transform: translateY(-1px);
+  filter: brightness(1.08);
 }
 
 .rcp-actions {
@@ -555,7 +654,7 @@ html.fl-dark .rcp-pill.is-live i { box-shadow: 0 0 7px var(--danger); }
   flex-wrap: wrap;
   align-items: center;
   gap: 8px;
-  margin-top: 4px;
+  margin-top: 2px;
 }
 
 /* A link, in the dashboard's link colour: to another tab of this screen
@@ -585,17 +684,36 @@ html.fl-dark .rcp-pill.is-live i { box-shadow: 0 0 7px var(--danger); }
 
 /* ── Live call ──────────────────────────────────────────────────────────── */
 
+.rcp-live-card > #live-body {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+}
+
+/* The call (or the wait for one) in a framed box that fills the card. */
 .rcp-empty-call,
 .rcp-ringing {
   display: flex;
+  flex: 1 1 auto;
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  min-height: 150px;
-  padding: 12px;
+  min-height: 170px;
+  padding: 18px 16px;
   border: 1px dashed var(--border);
   border-radius: var(--r-ctl);
   text-align: center;
+}
+
+.rcp-ringing {
+  border-style: solid;
+  border-color: color-mix(in srgb, var(--amber) 40%, var(--border));
+  background: color-mix(in srgb, var(--amber-soft) 55%, transparent);
+}
+
+.rcp-ringing.is-active {
+  border-color: color-mix(in srgb, var(--green) 35%, var(--border));
+  background: color-mix(in srgb, var(--green-soft) 55%, transparent);
 }
 
 .rcp-empty-call__icon {
@@ -609,6 +727,11 @@ html.fl-dark .rcp-pill.is-live i { box-shadow: 0 0 7px var(--danger); }
   color: var(--primary);
 }
 
+.rcp-empty-call__icon.is-warn {
+  background: var(--amber-soft);
+  color: var(--amber);
+}
+
 .rcp-empty-call h4 {
   margin-top: 12px;
   font-size: 14px;
@@ -616,15 +739,17 @@ html.fl-dark .rcp-pill.is-live i { box-shadow: 0 0 7px var(--danger); }
 }
 
 .rcp-empty-call p {
-  max-width: 340px;
+  max-width: 360px;
   margin: 5px 0 0;
   color: var(--muted);
   font-size: 12.5px;
   line-height: 1.55;
 }
 
+.rcp-empty-call .rcp-actions { justify-content: center; margin-top: 14px; }
+
 .rcp-ringing small {
-  color: var(--danger);
+  color: var(--muted);
   font-family: var(--font-mono);
   font-size: 10.5px;
   font-weight: 650;
@@ -632,12 +757,20 @@ html.fl-dark .rcp-pill.is-live i { box-shadow: 0 0 7px var(--danger); }
 }
 
 .rcp-ringing h4 {
-  margin-top: 5px;
-  font-size: 19px;
+  margin-top: 4px;
+  font-size: 20px;
   font-weight: 650;
+  letter-spacing: -0.01em;
+  line-height: 1.25;
 }
 
-.rcp-ringing p { margin: 5px 0 0; color: var(--muted); font-size: 12.5px; }
+.rcp-ringing p {
+  max-width: 400px;
+  margin: 6px 0 0;
+  color: var(--muted);
+  font-size: 12.5px;
+  line-height: 1.55;
+}
 
 .rcp-call-actions {
   display: flex;
@@ -645,27 +778,6 @@ html.fl-dark .rcp-pill.is-live i { box-shadow: 0 0 7px var(--danger); }
   justify-content: center;
   gap: 10px;
   margin-top: 16px;
-}
-
-.rcp-active {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-}
-
-.rcp-active small {
-  color: var(--faint);
-  font-family: var(--font-mono);
-  font-size: 10.5px;
-  letter-spacing: 0.06em;
-}
-
-.rcp-active__note {
-  min-width: 0;
-  color: var(--muted);
-  font-size: 12.5px;
 }
 
 .rcp-speak {
@@ -700,7 +812,7 @@ html.fl-dark .rcp-pill.is-live i { box-shadow: 0 0 7px var(--danger); }
 .rcp-metrics {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 10px;
+  gap: 8px;
 }
 
 .rcp-metrics span {
@@ -715,11 +827,13 @@ html.fl-dark .rcp-pill.is-live i { box-shadow: 0 0 7px var(--danger); }
 }
 
 .rcp-metrics strong {
-  font-size: 22px;
+  font-size: 20px;
   font-weight: 650;
   line-height: 1.15;
+  font-variant-numeric: tabular-nums;
 }
 
+.rcp-metrics span.is-warn strong { color: var(--amber); }
 .rcp-metrics small { color: var(--muted); font-size: 12px; }
 
 .rcp-delivery-note {
@@ -752,7 +866,7 @@ html.fl-dark .rcp-pill.is-live i { box-shadow: 0 0 7px var(--danger); }
 }
 
 .rcp-phone-row__id {
-  flex: 1 1 160px;
+  flex: 1 1 140px;
   min-width: 0;
 }
 
@@ -768,6 +882,19 @@ html.fl-dark .rcp-pill.is-live i { box-shadow: 0 0 7px var(--danger); }
   font-family: var(--font-mono);
   font-size: 11px;
 }
+
+/* The state and the row's buttons stay together, at the row's right. */
+.rcp-phone-row__actions {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+}
+
+/* "Forget this phone?" under its row, inside it. */
+.rcp-phone-row > .rcp-confirm { flex: 1 1 100%; }
 
 /* ── Settings lists (label · value rows) ────────────────────────────────── */
 
@@ -815,12 +942,50 @@ html.fl-dark .rcp-pill.is-live i { box-shadow: 0 0 7px var(--danger); }
 
 .rcp-set-in-oaiy .rcp-setting span {
   flex: 1 1 auto;
+  color: var(--muted);
   font-weight: 400;
   text-align: left;
 }
 
-.rcp-set-in-oaiy strong { font-weight: 650; }
+.rcp-set-in-oaiy strong { color: var(--text); font-weight: 650; }
 .rcp-set-in-oaiy em { color: var(--muted); font-style: normal; }
+
+/* Facts about a record (the consent grant): label over value, in a grid. */
+.rcp-facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 130px), 1fr));
+  gap: 8px;
+  margin: 0;
+}
+
+.rcp-facts > div {
+  min-width: 0;
+  padding: 9px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-ctl);
+  background: var(--surface-soft);
+}
+
+.rcp-facts > div.is-wide { grid-column: 1 / -1; }
+
+.rcp-facts dt {
+  color: var(--faint);
+  font-size: 10.5px;
+  font-weight: 680;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.rcp-facts dd {
+  margin: 2px 0 0;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.rcp-facts dd.is-warn { color: var(--amber); }
+.rcp-facts dd small { color: var(--muted); font-weight: 400; }
 
 /* ── Forms (the dashboard's form rows and controls) ─────────────────────── */
 
@@ -828,19 +993,42 @@ html.fl-dark .rcp-pill.is-live i { box-shadow: 0 0 7px var(--danger); }
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(min(100%, 440px), 1fr));
   gap: 18px;
-  align-items: start;
+  /* Cards side by side share a height. */
+  align-items: stretch;
   min-width: 0;
 }
 
 .rcp-form > * { min-width: 0; }
 
+/* Save and Reload: kept in view at the foot of the window while the form scrolls. */
 .rcp-form__actions {
+  position: sticky;
+  bottom: 10px;
+  z-index: 2;
   display: flex;
-  flex-direction: column;
-  gap: 10px;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  margin: 0 -2px;
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-card);
+  background: color-mix(in srgb, var(--surface-solid) 94%, transparent);
+  box-shadow: var(--shadow-card);
+  backdrop-filter: blur(6px);
 }
 
-/* Dongle-only Advanced fields — hidden on the native/auto transports. */
+.rcp-form__actions .rcp-actions { margin-top: 0; }
+.rcp-form__actions .rcp-error { flex: 1 1 100%; }
+
+.rcp-dirty {
+  color: var(--faint);
+  font-size: 12.5px;
+}
+
+.rcp-dirty.is-dirty { color: var(--amber); font-weight: 600; }
+
+/* Dongle-only Advanced fields — hidden on the native transport. */
 .set-dongle-only[hidden] { display: none; }
 
 .rcp-field {
@@ -850,17 +1038,21 @@ html.fl-dark .rcp-pill.is-live i { box-shadow: 0 0 7px var(--danger); }
   min-width: 0;
 }
 
+/* A field's label: small capitals in the body type, as on the dashboard. */
 .rcp-field > span {
-  color: var(--muted);
-  font-family: var(--font-mono);
-  font-size: 10px;
-  font-weight: 650;
-  letter-spacing: 0.06em;
+  color: var(--faint);
+  font-size: 10.5px;
+  font-weight: 680;
+  letter-spacing: 0.08em;
   text-transform: uppercase;
 }
 
+.rcp-field--short { max-width: 260px; }
+
 .rcp-field > span small {
+  font-size: 11px;
   font-weight: 500;
+  letter-spacing: normal;
   text-transform: none;
 }
 
@@ -883,8 +1075,10 @@ html.fl-dark .rcp-pill.is-live i { box-shadow: 0 0 7px var(--danger); }
   transition: border-color 0.14s, box-shadow 0.14s;
 }
 
-.rcp input[type='text'],
-.rcp input[type='number'] { font-family: var(--font-mono); }
+/* Identifiers and numbers keep the mono data voice; words are in the body type. */
+.rcp input.is-mono,
+.rcp input[type='number'],
+.rcp textarea.is-mono { font-family: var(--font-mono); }
 
 .rcp textarea {
   height: auto;
@@ -928,23 +1122,44 @@ html.fl-dark .rcp-pill.is-live i { box-shadow: 0 0 7px var(--danger); }
   overflow-wrap: anywhere;
 }
 
-/* What callers hear first, under the greeting box: the words in the page's text colour, their labels as a hint's. */
-.rcp-greeting-said { color: var(--text); font-size: 12.5px; }
-.rcp-said-label { display: inline-block; min-width: 11.5em; color: var(--faint); }
-.rcp-said-note { display: block; color: var(--faint); font-size: 11.5px; }
+.rcp-hint.is-warn { color: var(--amber); }
+.rcp-hint svg { flex: none; vertical-align: -2px; }
+
+/* What callers hear first, under the greeting box: each line's label in a
+   column of its own, the words in the page's text colour. */
+.rcp-greeting-said {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 3px 12px;
+  padding: 9px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-ctl);
+  background: var(--surface-soft);
+  color: var(--text);
+  font-size: 12.5px;
+}
+
+.rcp-said-label { color: var(--faint); }
+.rcp-said-note { grid-column: 1 / -1; color: var(--faint); font-size: 11.5px; }
+
+@media (max-width: 520px) {
+  .rcp-greeting-said { grid-template-columns: minmax(0, 1fr); }
+  .rcp-said-label { margin-top: 4px; }
+}
 
 /* A hint belongs to the control above it: closer than the card's gap. */
 .rcp-card > .rcp-field + .rcp-hint,
 .rcp-card > .rcp-check + .rcp-hint,
-.rcp-card > .rcp-hint + .rcp-hint { margin-top: -6px; }
+.rcp-card > .rcp-hint + .rcp-hint,
+.rcp-card > .rcp-hint + .rcp-greeting-said,
+.set-dongle-only > .rcp-field + .rcp-hint,
+.set-dongle-only > .rcp-check + .rcp-hint { margin-top: -6px; }
 
 .set-dongle-only {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 12px;
 }
-
-.rcp-hint.is-warn { color: var(--amber); }
 
 /* ── Banners ────────────────────────────────────────────────────────────── */
 
@@ -965,7 +1180,10 @@ html.fl-dark .rcp-pill.is-live i { box-shadow: 0 0 7px var(--danger); }
 .rcp-notice--ok {
   border-color: color-mix(in srgb, var(--green) 35%, var(--border));
   background: var(--green-soft);
+  color: var(--text);
 }
+
+.rcp-notice--ok strong { color: var(--green); }
 
 .rcp-notice--warn {
   border-color: color-mix(in srgb, var(--amber) 40%, var(--border));
@@ -974,6 +1192,9 @@ html.fl-dark .rcp-pill.is-live i { box-shadow: 0 0 7px var(--danger); }
 }
 
 .rcp-notice--warn strong { color: var(--amber); }
+
+/* A banner with its own action: the words, then the button under them. */
+.rcp-notice .rcp-actions { margin-top: 10px; }
 
 .rcp-callout {
   display: flex;
@@ -988,13 +1209,16 @@ html.fl-dark .rcp-pill.is-live i { box-shadow: 0 0 7px var(--danger); }
   line-height: 1.55;
 }
 
+.rcp-callout > span { min-width: 0; }
+
 .rcp-callout.is-warn {
   border-color: color-mix(in srgb, var(--amber) 40%, var(--border));
   background: var(--amber-soft);
 }
 
 .rcp-callout svg { flex: none; margin-top: 2px; }
-.rcp-callout.is-warn svg { color: var(--amber); }
+.rcp-callout.is-warn > svg { color: var(--amber); }
+.rcp-callout .rcp-check { margin-top: 8px; }
 
 /* Inline confirm (destructive actions — no host dialog in the sandbox). */
 .rcp-confirm {
@@ -1012,15 +1236,20 @@ html.fl-dark .rcp-pill.is-live i { box-shadow: 0 0 7px var(--danger); }
 }
 
 .rcp-confirm p { margin: 0 0 8px; overflow-wrap: anywhere; }
+.rcp-confirm .rcp-code { margin-bottom: 10px; }
 .rcp-confirm .rcp-actions { margin-top: 0; }
+.rcp-confirm input[type='text'] { width: 180px; max-width: 100%; font-family: var(--font-mono); }
 
 .rcp-status-ok {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 7px;
   color: var(--green);
   font-size: 13px;
 }
+
+.rcp-status-ok > svg { flex: none; margin-top: 3px; }
+.rcp-status-ok small { color: var(--muted); font-family: var(--font-mono); font-size: 11px; }
 
 /* ── Code / pairing code ────────────────────────────────────────────────── */
 
@@ -1037,11 +1266,12 @@ html.fl-dark .rcp-pill.is-live i { box-shadow: 0 0 7px var(--danger); }
 }
 
 .rcp-paircode {
-  margin: 8px 0;
+  margin: 4px 0;
   font-family: var(--font-mono);
-  font-size: 28px;
+  font-size: 30px;
   font-weight: 700;
   letter-spacing: 6px;
+  font-variant-numeric: tabular-nums;
 }
 
 /* ── Dongle wizard ──────────────────────────────────────────────────────── */
@@ -1052,8 +1282,6 @@ html.fl-dark .rcp-pill.is-live i { box-shadow: 0 0 7px var(--danger); }
   font-size: 12.5px;
   line-height: 1.55;
 }
-
-.rcp-step-meta + .rcp-step-meta { margin-top: 8px; }
 
 .rcp-wizard-list {
   display: flex;
@@ -1073,7 +1301,10 @@ html.fl-dark .rcp-pill.is-live i { box-shadow: 0 0 7px var(--danger); }
   border-radius: var(--r-card);
   background: var(--surface-raised);
   cursor: pointer;
+  transition: border-color 0.14s, background 0.14s;
 }
+
+.rcp-wizard-row:hover { border-color: var(--strong-border); }
 
 .rcp-wizard-row.is-selected {
   border-color: var(--primary);
@@ -1215,9 +1446,7 @@ html.fl-dark .rcp-pill.is-live i { box-shadow: 0 0 7px var(--danger); }
 .rcp-other-usb li { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 10px; color: var(--muted); font-size: 12.5px; }
 .rcp-other-usb li small { color: var(--faint); font-family: var(--font-mono); font-size: 11px; }
 
-/* The dongle card: its parts one gap apart, its buttons last, the way on at their right. */
-.rcp-dongle > .rcp-card__body { display: flex; flex-direction: column; gap: 10px; }
-.rcp-dongle > .rcp-card__body > * { margin-top: 0; margin-bottom: 0; }
+/* The dongle card: its buttons last, the way on at their right. */
 .rcp-dongle .rcp-wizard-list { margin-top: 0; }
 .rcp-dongle__bar { margin-top: 2px; }
 .rcp-dongle__bar-end { display: flex; flex-wrap: wrap; gap: 8px; margin-left: auto; }
@@ -1254,12 +1483,16 @@ html.fl-dark .rcp-pill.is-live i { box-shadow: 0 0 7px var(--danger); }
   flex-wrap: wrap;
   align-items: flex-start;
   gap: 16px;
-  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid color-mix(in srgb, var(--primary) 35%, var(--border));
+  border-radius: var(--r-ctl);
+  background: var(--primary-soft);
 }
 
 .rcp-qr img {
-  width: 180px;
-  height: 180px;
+  width: 168px;
+  height: 168px;
+  flex: none;
   padding: 8px;
   border: 1px solid var(--strong-border);
   border-radius: var(--r-card);
@@ -1267,41 +1500,40 @@ html.fl-dark .rcp-pill.is-live i { box-shadow: 0 0 7px var(--danger); }
   background: #ffffff;
 }
 
-.rcp-qr__meta { flex: 1 1 240px; min-width: 0; }
+.rcp-qr__meta { display: flex; flex: 1 1 220px; flex-direction: column; gap: 6px; min-width: 0; }
 .rcp-qr__meta strong { font-size: 13.5px; }
-.rcp-qr__meta p { margin: 3px 0 6px; color: var(--muted); font-size: 12.5px; }
+.rcp-qr__meta p { margin: 0; color: var(--muted); font-size: 12.5px; }
+.rcp-qr__meta .rcp-actions { margin-top: 2px; }
 
 .rcp-qr__meta small {
   display: block;
-  margin-bottom: 3px;
   color: var(--faint);
   font-size: 11.5px;
 }
 
 .rcp-id-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 200px), 1fr));
-  gap: 10px;
-  margin-top: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr));
+  gap: 8px;
 }
 
 .rcp-id-grid > span {
   min-width: 0;
-  padding: 10px 12px;
+  padding: 9px 12px;
   border: 1px solid var(--border);
   border-radius: var(--r-ctl);
   background: var(--surface-soft);
 }
 
 .rcp-id-grid > span.is-wide { grid-column: 1 / -1; }
+.rcp-id-grid + .rcp-id-grid { margin-top: 8px; }
 
 .rcp-id-grid small {
   display: block;
-  color: var(--muted);
-  font-family: var(--font-mono);
-  font-size: 10px;
-  font-weight: 650;
-  letter-spacing: 0.06em;
+  color: var(--faint);
+  font-size: 10.5px;
+  font-weight: 680;
+  letter-spacing: 0.08em;
   text-transform: uppercase;
 }
 
@@ -1314,19 +1546,21 @@ html.fl-dark .rcp-pill.is-live i { box-shadow: 0 0 7px var(--danger); }
   word-break: break-all;
 }
 
-.rcp-list { margin-top: 10px; }
-.rcp-list h4 { margin: 0 0 4px; font-size: 13px; font-weight: 650; }
+.rcp-list { display: flex; flex-direction: column; }
+.rcp-list h4 { margin: 0 0 2px; font-size: 13px; font-weight: 650; }
+.rcp-list + .rcp-list { margin-top: 6px; }
 
 .rcp-person-row {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 10px;
+  gap: 8px 10px;
   min-width: 0;
-  padding: 9px 0;
+  padding: 10px 0;
   border-top: 1px solid var(--border);
 }
 
-.rcp-person-row:first-of-type { border-top: 0; }
+.rcp-list h4 + .rcp-person-row { border-top: 0; }
 
 .rcp-person-row__icon {
   display: inline-flex;
@@ -1341,7 +1575,7 @@ html.fl-dark .rcp-pill.is-live i { box-shadow: 0 0 7px var(--danger); }
 }
 
 .rcp-person-row__icon.is-ok { background: var(--green-soft); color: var(--green); }
-.rcp-person-row__id { flex: 1; min-width: 0; }
+.rcp-person-row__id { flex: 1 1 180px; min-width: 0; }
 .rcp-person-row__id strong { display: block; font-size: 13px; }
 
 .rcp-person-row__id small {
@@ -1356,11 +1590,25 @@ html.fl-dark .rcp-pill.is-live i { box-shadow: 0 0 7px var(--danger); }
   display: block;
   color: var(--muted);
   font-size: 11px;
-  word-break: break-all;
+  overflow-wrap: anywhere;
 }
 
+.rcp-person-row__actions { display: flex; flex: none; gap: 6px; margin-left: auto; }
+.rcp-person-row > .rcp-confirm { flex: 1 1 100%; }
+
+/* A careful action kept apart at a card's foot (rotate the key). */
+.rcp-danger-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 14px;
+}
+
+.rcp-danger-row > span { flex: 1 1 240px; min-width: 0; }
+.rcp-danger-row strong { display: block; font-size: 13px; }
+.rcp-danger-row small { display: block; color: var(--muted); font-size: 12px; line-height: 1.5; }
+
 .rcp-details {
-  margin-top: 12px;
   padding: 9px 12px;
   border: 1px solid var(--border);
   border-radius: var(--r-ctl);
@@ -1373,10 +1621,15 @@ html.fl-dark .rcp-pill.is-live i { box-shadow: 0 0 7px var(--danger); }
   cursor: pointer;
 }
 
-.rcp-details p { margin: 8px 0 0; color: var(--faint); font-size: 12px; line-height: 1.5; }
-.rcp-details textarea { margin-top: 8px; font-family: var(--font-mono); font-size: 11.5px; }
+.rcp-details summary:hover { color: var(--text); }
+.rcp-details[open] > summary { margin-bottom: 10px; }
+.rcp-details > :not(summary) + :not(summary) { margin-top: 10px; }
+.rcp-details p { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
+.rcp-details textarea { font-family: var(--font-mono); font-size: 11.5px; }
 
 /* ── Consent ────────────────────────────────────────────────────────────── */
+
+.rcp-scope-list { display: flex; flex-direction: column; }
 
 .rcp-scope-row {
   display: flex;
@@ -1388,7 +1641,7 @@ html.fl-dark .rcp-pill.is-live i { box-shadow: 0 0 7px var(--danger); }
   cursor: pointer;
 }
 
-.rcp-scope-row:first-of-type { border-top: 0; }
+.rcp-scope-row:first-child { border-top: 0; padding-top: 2px; }
 .rcp-scope-row input { flex: none; margin-top: 3px; accent-color: var(--primary); }
 .rcp-scope-row strong { display: block; font-size: 13px; font-weight: 600; }
 
@@ -1401,8 +1654,10 @@ html.fl-dark .rcp-pill.is-live i { box-shadow: 0 0 7px var(--danger); }
   line-height: 1.55;
 }
 
-.rcp-dest-list { margin: 6px 0 0; padding-left: 18px; font-size: 12.5px; }
-.rcp-dest-list li { margin-top: 3px; }
+.rcp-consent__bar { justify-content: space-between; margin-top: 0; }
+
+.rcp-dest-list { margin: 0; padding-left: 18px; font-size: 12.5px; }
+.rcp-dest-list li + li { margin-top: 3px; }
 .rcp-dest-list code { font-size: 11.5px; word-break: break-all; }
 
 /* ── Setup mode: one tab as a step of OAIY's setup wizard ───────────────── */
@@ -1455,23 +1710,31 @@ html[data-oaiy-setup] .rcp-dongle .rcp-dongle__bar,
   .rcp-stepper li:not(.is-current) .rcp-stepper__name { display: none; }
 }
 
-/* ── Narrow windows ─────────────────────────────────────────────────────── */
+/* ── Narrow windows, touch screens ──────────────────────────────────────── */
 
 @media (max-width: 760px) {
-  .rcp-button,
-  .rcp-call-action,
-  .rcp-tab-btn { min-height: 44px; }
   .rcp-set-in-oaiy .rcp-setting { flex-wrap: wrap; }
   .rcp-set-in-oaiy .rcp-setting small { flex-basis: 100%; }
 }
 
 @media (max-width: 600px) {
+  .rcp-status__meta { align-items: flex-start; }
+}
+
+@media (max-width: 380px) {
+  .rcp-metrics { grid-template-columns: minmax(0, 1fr); }
+}
+
+/* A finger needs a bigger target than a pointer; a narrow window alone does not. */
+@media (pointer: coarse) {
+  .rcp-button,
+  .rcp-call-action,
+  .rcp-tab-btn { min-height: 44px; }
+
   /* 16px keeps mobile browsers from zooming into a focused field. */
   .rcp input,
   .rcp select,
   .rcp textarea { font-size: 16px; }
-  .rcp-metrics { grid-template-columns: 1fr; }
-  .rcp-status__meta { align-items: flex-start; }
 }
 
 @media (prefers-reduced-motion: reduce) {

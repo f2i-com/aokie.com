@@ -396,13 +396,10 @@
             if (paused) {
               HOST.toast(
                 'error',
-                'Consent recorded, but the phone line is paused: ' + paused + '. The receptionist answers no calls until this is resolved.'
+                'Consent recorded, but the phone line is paused: ' + U.plainTimes(paused) + '. The receptionist answers no calls until this is put right.'
               );
             } else {
-              HOST.toast(
-                'success',
-                'Consent recorded — enforcement is on; denied scopes are refused at the point of capture.'
-              );
+              HOST.toast('success', 'Consent recorded and enforced: anything not allowed is refused.');
             }
           });
         },
@@ -443,6 +440,13 @@
         }
       }
     }
+    // The plugin's gate for the phone line itself (consent.get `bluetooth`):
+    // an expired grant, or one for an older version, is refused there before
+    // the radio is stopped for it, so the badge read green over a grant the
+    // plugin no longer honours. A grant that leaves Bluetooth out on purpose
+    // is the person's choice, not a fault of the grant.
+    var gate = s.bluetooth && typeof s.bluetooth === 'object' ? s.bluetooth : null;
+    var lineRefused = !!(gate && gate.allowed === false && !(grant && grant.scopes && grant.scopes.bluetooth === false));
     // A radio paused for consent (`blocked`) needs action too: the badge
     // read green, "Consent v3 · enforced", while the phone line was off.
     var needsAction =
@@ -451,11 +455,13 @@
       !enforced ||
       !destinationCurrent ||
       !!s.note ||
-      !!s.blocked;
+      !!s.blocked ||
+      lineRefused;
     return {
       grant: grant,
       enforced: enforced,
       destinationCurrent: destinationCurrent,
+      lineRefused: lineRefused,
       needsAction: needsAction,
       ok: !!grant && enforced && !needsAction,
     };
@@ -482,57 +488,96 @@
     }
   }
 
+  /** A grant's date, as the person writes dates ('' when there is none). */
+  function day(iso) {
+    var t = iso ? new Date(iso) : null;
+    return t && !isNaN(t.getTime()) ? t.toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' }) : '';
+  }
+
+  /** Why the consent needs looking at, in a sentence. */
+  function reviewReason(s, r) {
+    var gate = s.bluetooth && typeof s.bluetooth === 'object' ? s.bluetooth : null;
+    var said = s.note || s.blocked || (r.lineRefused && gate && gate.reason) || '';
+    if (said) return U.sentence(said);
+    if (!r.grant) return 'No consent is recorded on this computer yet. The receptionist answers no calls until it is.';
+    if (r.grant.version !== s.requiredVersion) {
+      return 'Consent version ' + r.grant.version + ' was accepted, but version ' + s.requiredVersion + ' is now needed.';
+    }
+    if (!r.destinationCurrent) return 'Call data now goes somewhere this consent does not name. Review it to accept the new destination.';
+    if (!r.enforced) return 'Consent is recorded, but not enforced yet.';
+    return '';
+  }
+
   function statusCardHtml() {
-    if (status === undefined) return '<p class="rcp-loading">Loading…</p>';
+    if (status === undefined) return U.loadingHtml;
     if (status === null) {
-      return (
-        '<p class="rcp-error">' +
-        esc(error || 'consent.get failed — is the plugin running?') +
-        '</p>'
-      );
+      return U.problemHtml(error || 'The consent could not be read.');
     }
     var r = review(status);
     var grant = r.grant;
-    var enforced = r.enforced;
-    var destinationCurrent = r.destinationCurrent;
     var needsAction = r.needsAction;
 
     var badge;
-    if (grant && enforced && !needsAction) {
+    if (grant && r.enforced && !needsAction) {
       badge =
         '<span class="rcp-badge is-ok" title="' +
         esc('Accepted ' + (grant.acceptedAt || '') + ' by ' + (grant.acceptedBy || 'operator') + ' · expires ' + (grant.expiresAt || '—')) +
         '">Consent v' + esc(grant.version) + ' · enforced</span>';
     } else {
       badge =
-        '<span class="rcp-badge is-pending" title="' +
-        esc(
-          status.note ||
-            status.blocked ||
-            (!destinationCurrent && grant
-              ? 'A configured data destination has not been accepted yet.'
-              : 'Consent has not been recorded on this device.')
-        ) +
-        '">' +
-        (status.blocked
+        '<span class="rcp-badge is-pending">' +
+        (status.blocked || r.lineRefused
           ? 'Consent required — phone offline'
           : grant
             ? 'Consent needs review'
             : 'Consent not recorded') +
         '</span>';
     }
+    var reason = needsAction ? reviewReason(status, r) : '';
+
+    // What was granted, when, and until when.
+    var facts = '';
+    if (grant) {
+      var scopes = grant.scopes || {};
+      var allowed = [];
+      for (var i = 0; i < SCOPE_ROWS.length; i++) {
+        if (scopes[SCOPE_ROWS[i].key] === true) allowed.push(SCOPE_ROWS[i].label);
+      }
+      var expires = day(grant.expiresAt);
+      var expired = !!grant.expiresAt && !isNaN(Date.parse(grant.expiresAt)) && Date.parse(grant.expiresAt) <= Date.now();
+      var dests = Array.isArray(scopes.destinations) ? scopes.destinations.filter(function (d) { return typeof d === 'string' && d; }) : [];
+      var ownOrigin = TABS.oaiy && TABS.oaiy.destination;
+      var destNames = dests.map(function (d) {
+        return d === ownOrigin ? 'OAIY on this computer (' + d + ')' : d;
+      });
+      // (two lists: the four short facts fill their row however wide it is)
+      facts =
+        '<dl class="rcp-facts">' +
+        '<div><dt>Accepted</dt><dd>' + esc(day(grant.acceptedAt) || '—') + '</dd></div>' +
+        '<div><dt>' + (expired ? 'Expired' : 'Expires') + '</dt><dd' + (expired ? ' class="is-warn"' : '') + '>' + esc(expires || 'Never') + '</dd></div>' +
+        '<div><dt>Version</dt><dd>' + esc(grant.version) +
+        (grant.version !== status.requiredVersion ? ' <small>(' + esc(status.requiredVersion) + ' needed)</small>' : '') + '</dd></div>' +
+        '<div><dt>Records kept</dt><dd>' + esc(typeof scopes.retentionDays === 'number' ? scopes.retentionDays + ' days' : '—') + '</dd></div>' +
+        '</dl>' +
+        '<dl class="rcp-facts">' +
+        '<div class="is-wide"><dt>Allows</dt><dd>' + esc(allowed.length ? allowed.join(', ') : 'Nothing') + '</dd></div>' +
+        '<div class="is-wide"><dt>Call data goes to</dt><dd>' + esc(destNames.length ? destNames.join(', ') : 'This computer only') + '</dd></div>' +
+        '</dl>';
+    }
     var warnHint =
       status.mode === 'warn'
-        ? '<p class="rcp-hint">warn mode (developer override) — sensitive processing runs with consent unrecorded</p>'
+        ? '<p class="rcp-hint is-warn">Enforcement is off (a developer setting): calls are handled even without consent recorded.</p>'
         : '';
     return (
       '<div class="rcp-card__body">' +
-      '<div class="rcp-actions" style="margin-top: 0; justify-content: space-between;">' +
-      '<span>' + badge + '</span>' +
-      '<button type="button" class="rcp-button' + (grant ? '' : ' is-primary') + '" data-act="cns-toggle">' +
-      (wizardOpen ? 'Hide' : grant ? 'Review consent' : 'Set up consent') +
+      '<div class="rcp-actions rcp-consent__bar">' +
+      badge +
+      '<button type="button" class="rcp-button' + (needsAction && !wizardOpen ? ' is-primary' : '') + '" data-act="cns-toggle">' +
+      (wizardOpen ? 'Close the form' : grant ? 'Review consent' : 'Set up consent') +
       '</button>' +
       '</div>' +
+      (reason ? '<div class="rcp-callout is-warn" role="status">' + ICONS.alert + '<span>' + esc(reason) + '</span></div>' : '') +
+      facts +
       warnHint +
       '</div>'
     );
@@ -549,7 +594,7 @@
     var codexChoice = '';
     if (codexProviderAvailable) {
       codexChoice =
-        '<label class="rcp-scope-row" style="margin-top: 8px;">' +
+        '<label class="rcp-scope-row">' +
         '<input type="checkbox" data-codex-destination="1"' +
         (codexDestinationOptIn ? ' checked' : '') +
         (codexConfigured ? ' disabled' : '') +
@@ -593,18 +638,17 @@
     var destBlock;
     if (dests.length === 0) {
       destBlock =
-        '<p class="rcp-hint">All speech-processing endpoints are local to this machine. If a Companion scope is ' +
-        'enabled, authorised state, captions or endpoint-encrypted WebRTC media can still travel through the ' +
-        'selected FormLogic or custom deployment. The signalling server never receives unencrypted call audio; ' +
-        "TURN can only relay encrypted packets. Linked FormLogic records follow each form's own retention settings.</p>";
+        '<p class="rcp-hint">All call processing stays on this computer. With a Companion permission on, captions, ' +
+        'status or encrypted call audio can also pass through the server your Companion apps connect through; it never ' +
+        'receives the call unencrypted.</p>';
     } else {
       var items = [];
       for (var d = 0; d < dests.length; d++) {
         items.push('<li><code>' + esc(dests[d]) + '</code></li>');
       }
       destBlock =
-        '<p class="rcp-hint">These configured endpoints will receive call data (transcripts/audio for processing). ' +
-        'Changing them later to somewhere new requires re-consent:</p>' +
+        '<p class="rcp-hint">Call data (audio and transcripts) goes here to be processed. Sending it anywhere new later ' +
+        'asks for consent again:</p>' +
         '<ul class="rcp-dest-list">' + items.join('') + '</ul>';
     }
     return (
@@ -612,36 +656,34 @@
       '<div class="rcp-card__heading">' +
       '<div class="rcp-card__heading-copy">' +
       '<small>Access &amp; consent</small>' +
-      '<h3>Phone receptionist — access &amp; consent</h3>' +
+      '<h3>What the receptionist may do</h3>' +
       '</div>' +
       '</div>' +
       '<div class="rcp-card__body">' +
-      '<p class="rcp-hint" style="margin-top: 0;">Version ' + esc((status && status.requiredVersion) || 1) +
-      ' · grants expire after 12 months · ' +
+      '<p class="rcp-hint">Version ' + esc((status && status.requiredVersion) || 1) +
+      ' · consent lasts 12 months · ' +
       // Signed only where the host signs grants (consent.get signatureRequired); OAIY does not, and there the
       // grant is Aokie's own record on this computer, which a settings write cannot set aside once it is made.
       (status && status.signatureRequired === true
         ? "signed by this computer, so it can't be copied to another install. "
         : 'kept by Aokie on this computer; once recorded, no settings change can turn its enforcement off. ') +
-      'Privacy &amp; data-handling disclosure: <code>formlogic.com/privacy</code></p>' +
-      '<div style="margin-top: 8px;">' + scopeRows.join('') + '</div>' +
-      '<div style="margin-top: 12px;">' +
-      '<strong style="font-size: 11px;">Where call data goes</strong>' +
+      'Privacy and data handling: <code>formlogic.com/privacy</code></p>' +
+      '<div class="rcp-scope-list">' + scopeRows.join('') + '</div>' +
+      '<h4 class="rcp-subhead">Where call data goes</h4>' +
       codexChoice +
       destBlock +
-      '</div>' +
-      '<label class="rcp-field" style="max-width: 260px;"><span>Record retention (days)</span>' +
+      '<label class="rcp-field rcp-field--short"><span>Keep call records for (days)</span>' +
       '<input type="number" id="cns-retention" min="1" max="3650" value="' + esc(retentionDays) + '" /></label>' +
-      '<div class="rcp-callout is-warn" style="margin-top: 12px;">' + ICONS.alert +
+      '<div class="rcp-callout is-warn">' + ICONS.alert +
       '<span><strong>Your callers, your responsibility:</strong> laws on call recording, transcription and AI ' +
-      "disclosure differ by jurisdiction. Many require you to TELL callers they're speaking with an AI and/or " +
-      'being transcribed — put it in your greeting. Confirm your local requirements before going live.</span></div>' +
-      (error ? '<p class="rcp-error" style="padding: 10px 0 0;">' + esc(error) + '</p>' : '') +
+      "disclosure differ from place to place. Many require you to tell callers they're speaking with an AI or " +
+      'being transcribed — say so in your greeting. Check what applies to you before going live.</span></div>' +
+      (error ? '<p class="rcp-error" role="alert">' + esc(error) + '</p>' : '') +
       '<div class="rcp-actions">' +
-      '<button type="button" class="rcp-button" data-act="cns-close"' + (submitting ? ' disabled' : '') + '>Not now</button>' +
       '<button type="button" class="rcp-button is-primary" data-act="cns-accept"' + (submitting ? ' disabled' : '') + '>' +
       (submitting ? 'Recording…' : 'Accept & enforce') +
       '</button>' +
+      '<button type="button" class="rcp-button" data-act="cns-close"' + (submitting ? ' disabled' : '') + '>Not now</button>' +
       '</div>' +
       '</div>' +
       '</section>'
@@ -655,7 +697,7 @@
       '<div class="rcp-card__heading">' +
       '<div class="rcp-card__heading-copy">' +
       '<small>Consent</small>' +
-      '<h3>Operator consent &amp; enforcement</h3>' +
+      '<h3>Consent for the phone receptionist</h3>' +
       '</div>' +
       '</div>' +
       statusCardHtml() +

@@ -28,7 +28,7 @@
   <!-- ══ OVERVIEW ══════════════════════════════════════════════════════════ -->
   <div class="rcp-tab-panel rcp-overview" id="tab-overview" role="tabpanel" aria-labelledby="nav-overview" tabindex="0">
     <!-- Status: plugin health, then the readiness tiles -->
-    <section class="rcp-card rcp-wide" aria-labelledby="hero-headline">
+    <section class="rcp-card rcp-wide rcp-status-card" aria-labelledby="hero-headline">
       <div class="rcp-card__heading">
         <div class="rcp-card__heading-copy">
           <small>Status</small>
@@ -42,7 +42,7 @@
       <p class="rcp-status__detail" id="hero-sub">Contacting the Aokie plugin.</p>
       <!-- Readiness tiles (phone bridge / who answers / radio / delivery) -->
       <div class="rcp-grid" id="readiness" aria-label="Readiness checks">
-        <p class="rcp-loading">Loading&hellip;</p>
+        <div class="rcp-skeleton" role="status"><span class="rcp-sr">Loading</span><i></i><i></i><i></i></div>
       </div>
     </section>
 
@@ -56,7 +56,7 @@
         <span class="rcp-pill is-neutral" id="live-pill" hidden><i></i><span id="live-pill-text"></span></span>
       </div>
       <div id="live-body">
-        <p class="rcp-loading">Loading&hellip;</p>
+        <div class="rcp-skeleton" role="status"><span class="rcp-sr">Loading</span><i></i><i></i><i></i></div>
       </div>
       <div id="switchboard-body" class="rcp-switchboard" aria-live="polite" hidden></div>
       <!-- The composer is STATIC so re-renders never eat the operator's typing. -->
@@ -77,11 +77,11 @@
       <div class="rcp-card__heading">
         <div class="rcp-card__heading-copy">
           <small>Receptionist</small>
-          <h3 id="settings-title">Loading&hellip;</h3>
+          <h3 id="settings-title">Checking the settings&hellip;</h3>
         </div>
       </div>
-      <div id="settings-body">
-        <p class="rcp-loading">Loading&hellip;</p>
+      <div id="settings-body" class="rcp-card__content">
+        <div class="rcp-skeleton" role="status"><span class="rcp-sr">Loading</span><i></i><i></i><i></i></div>
       </div>
       <p class="rcp-footnote">
         Edit the greeting and brief in
@@ -95,30 +95,33 @@
       <div class="rcp-card__heading">
         <div class="rcp-card__heading-copy">
           <small>Paired phones</small>
-          <h3 id="phones-title">Loading&hellip;</h3>
+          <h3 id="phones-title">Checking paired phones&hellip;</h3>
         </div>
       </div>
-      <div id="phones-body">
-        <p class="rcp-loading">Loading&hellip;</p>
+      <div id="phones-body" class="rcp-card__content">
+        <div class="rcp-skeleton" role="status"><span class="rcp-sr">Loading</span><i></i><i></i><i></i></div>
       </div>
       <p class="rcp-footnote">
-        Pairing, the numeric-comparison confirm and Forget are in
+        Pair a new phone, or forget one, in
         <button type="button" class="rcp-link-btn" data-tabgo="phone">Phone setup</button>.
       </p>
     </section>
 
-    <!-- Delivery: outbox counts + dead-letter redrive -->
+    <!-- Delivery: the outbox's counts (records waiting for OAIY) + resend of the ones it gave up on -->
     <section class="rcp-card">
       <div class="rcp-card__heading">
         <div class="rcp-card__heading-copy">
-          <small>Data delivery</small>
-          <h3 id="delivery-title">Loading&hellip;</h3>
+          <small>Call &amp; text records</small>
+          <h3 id="delivery-title">Checking delivery&hellip;</h3>
         </div>
         <span class="rcp-pill is-neutral" id="delivery-pill"><i></i><span id="delivery-pill-text">Checking</span></span>
       </div>
-      <div id="delivery-body">
-        <p class="rcp-loading">Loading&hellip;</p>
+      <div id="delivery-body" class="rcp-card__content">
+        <div class="rcp-skeleton" role="status"><span class="rcp-sr">Loading</span><i></i><i></i><i></i></div>
       </div>
+      <p class="rcp-footnote">
+        Each call and text is kept here until OAIY has it, so none is lost while OAIY is closed or busy.
+      </p>
     </section>
 
     <p class="rcp-pointer rcp-wide">

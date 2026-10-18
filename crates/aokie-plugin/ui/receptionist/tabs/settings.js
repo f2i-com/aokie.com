@@ -308,7 +308,7 @@
     if (saving) return Promise.resolve(false);
     var patch = settingsPatch(baseline, settings);
     if (Object.keys(patch).length === 0) {
-      HOST.toast('success', 'No changes to save');
+      HOST.toast('info', 'Nothing to save: no setting was changed.');
       return Promise.resolve(false);
     }
     saving = true;
@@ -336,15 +336,15 @@
           if (blocked) {
             HOST.toast(
               'error',
-              'Settings saved, but the receptionist is paused. Open Consent and accept the new data destination before calls can resume.'
+              'Settings saved, but the receptionist is paused: accept the new data destination in Consent before calls can resume.'
             );
           } else if (pendingRestart) {
             HOST.toast(
               'success',
-              'Saved — one more step: press "Restart receptionist now" below to apply it to the line.'
+              'Saved. One more step: press Restart receptionist now, at the top, to apply it.'
             );
           } else {
-            HOST.toast('success', 'Receptionist settings saved — takes effect on the next call.');
+            HOST.toast('success', 'Saved. It applies from the next call.');
           }
         },
         function (e) {
@@ -462,12 +462,12 @@
             'Aokie has no voice of its own there, so its own lines (a screened caller’s message, the hold announcements) are not said and manager numbers ring through.'
           : esc(OAIY.noOwnSpeech) + ', so nobody answers them: they ring through to you.';
       html.push(
-        '<p class="rcp-notice rcp-notice--warn" role="status"><strong>Calls do not go to OAIY.</strong> ' +
+        '<div class="rcp-notice rcp-notice--warn" role="status"><strong>Calls do not go to OAIY.</strong> ' +
           where + ' Sending them to OAIY lets the Front desk agent answer in the OAIY voice; ' +
-          'it applies after the receptionist restarts.</p>' +
+          'it applies after the receptionist restarts.' +
           '<div class="rcp-actions">' +
           '<button type="button" class="rcp-button is-primary" data-act="set-route-oaiy"' +
-          (saving || loading ? ' disabled' : '') + '>Send calls to OAIY</button></div>'
+          (saving || loading ? ' disabled' : '') + '>Send calls to OAIY</button></div></div>'
       );
     }
     html.push(
@@ -638,9 +638,9 @@
   function greetingSaidHtml(route) {
     var said = String(settings.greeting || '').trim() || DEFAULT_GREETING;
     return (
-      '<span class="rcp-said-label">New callers hear</span> &ldquo;' + esc(said) + '&rdquo;' +
+      '<span class="rcp-said-label">New callers hear</span><span>&ldquo;' + esc(said) + '&rdquo;</span>' +
       (route === 'oaiy'
-        ? '<br><span class="rcp-said-label">Callers OAIY knows hear</span> &ldquo;' + esc(personalGreeting(said, 'Sam')) + '&rdquo;' +
+        ? '<span class="rcp-said-label">Callers OAIY knows hear</span><span>&ldquo;' + esc(personalGreeting(said, 'Sam')) + '&rdquo;</span>' +
           '<span class="rcp-said-note">By first name: the one in OAIY&rsquo;s Contacts, or the one their phone shows.</span>'
         : '')
     );
@@ -664,7 +664,7 @@
             ? 'Spoken first, as soon as the call connects, in the voice chosen in OAIY. Blank = the built-in greeting shown in the box.'
             : 'Spoken first, as soon as the call connects. Blank = the built-in greeting shown in the box.'
         ) +
-        '<p class="rcp-hint rcp-greeting-said" id="set-greeting-said" aria-live="polite">' + greetingSaidHtml(route) + '</p>' +
+        '<p class="rcp-greeting-said" id="set-greeting-said" aria-live="polite">' + greetingSaidHtml(route) + '</p>' +
         field(
           'Receptionist brief',
           '<textarea rows="6" data-key="persona" placeholder="e.g. We are a small hair salon. Cuts take 45 minutes.">' +
@@ -706,7 +706,7 @@
         hint('Dongle mode only. Some dongles only work reliably with CVSD; mSBC gives better speech-recognition accuracy where supported.') +
         field(
           'Re-enumerate at start (hardware id)',
-          '<input type="text" data-key="reenumerateHwid" maxlength="200" placeholder="USB\\VID_0A5C&amp;PID_21EC" value="' +
+          '<input type="text" class="is-mono" data-key="reenumerateHwid" maxlength="200" placeholder="USB\\VID_0A5C&amp;PID_21EC" value="' +
             esc(settings.reenumerateHwid) + '" />'
         ) +
         hint('Dongle mode only. For a dongle whose call audio stays silent after Windows starts: Aokie re-enumerates this device before opening it, as if it were unplugged and plugged back in. Leave blank for none; takes effect the next time the phone line starts.') +
@@ -720,7 +720,7 @@
         '<div class="set-dongle-only"' + (settings.transportMode !== 'native' ? '' : ' hidden') + '>' +
         check('legacyPairingPin', 'Allow legacy PIN pairing (compatibility)') +
         hint(
-          "⚠️ Uses the fixed PIN 0000 for very old devices that can't do modern code-confirmation pairing — it provides no protection against a nearby impostor. Enable only while pairing such a device, then turn it back off.",
+          U.icons.alert + " Uses the fixed PIN 0000 for very old devices that can't do modern code-confirmation pairing — it provides no protection against a nearby impostor. Turn it on only while pairing such a device, then turn it back off.",
           true
         ) +
         '</div>'
@@ -745,18 +745,15 @@
       // event fires — a submit button would be dead. Save rides the click
       // delegate; Enter-to-save rides the keydown handler in wire().
       '<div class="rcp-form__actions rcp-wide">' +
-      (pendingRestart
-        ? '<p class="rcp-notice rcp-notice--warn">Saved — the change applies when the receptionist restarts. The phone reconnects automatically (about 15 seconds of downtime).</p>' +
-          '<div class="rcp-actions">' +
-          '<button type="button" class="rcp-button is-primary" data-act="set-apply-restart"' + (saving || loading || restarting ? ' disabled' : '') + '>Restart receptionist now</button>' +
-          '</div>'
-        : '') +
       '<div class="rcp-actions">' +
       '<button type="button" class="rcp-button is-primary" id="set-save" data-act="set-save"' + (saving || loading ? ' disabled' : '') + '>' +
       (saving ? 'Saving…' : 'Save') +
       '</button>' +
       '<button type="button" class="rcp-button" data-act="set-reload"' + (loading || saving ? ' disabled' : '') + '>Reload</button>' +
       '</div>' +
+      dirtyHtml() +
+      // A failed save or reload, by the buttons that were pressed.
+      (error ? '<p class="rcp-error" role="alert">' + esc(error) + '</p>' : '') +
       '</div>' +
       '</form>'
     );
@@ -766,22 +763,58 @@
     if (!root) return;
     var body;
     if (loading && !loaded) {
-      body = section('Receptionist settings', '<p class="rcp-loading">Loading…</p>', 'rcp-wide');
+      body = section('Receptionist settings', U.loadingHtml, 'rcp-wide');
     } else if (!loaded) {
       body = section(
         'Receptionist settings',
-        '<p class="rcp-inline-note">Couldn\'t load receptionist settings.' +
-          (error ? ' ' + esc(error) : '') +
-          '</p><div class="rcp-actions"><button type="button" class="rcp-button" data-act="set-retry">Retry</button></div>',
+        (error === U.notRunning
+          ? '<p class="rcp-empty">The settings show here once Aokie is running.</p>'
+          : '<p class="rcp-error">The receptionist settings could not be read' + (error ? ': ' + esc(error) : '.') + '</p>') +
+          '<div class="rcp-actions"><button type="button" class="rcp-button" data-act="set-retry">Try again</button></div>',
         'rcp-wide'
       );
     } else {
       body = formHtml();
     }
     root.innerHTML =
+      restartNoticeHtml() +
       appManagedNoticeHtml() +
-      body +
-      (loaded && error ? '<p class="rcp-error rcp-wide">' + esc(error) + '</p>' : '');
+      body;
+  }
+
+  /** Saved, but where calls go applies only once the receptionist restarts:
+   *  the step, and its button, at the top where the change was made. */
+  function restartNoticeHtml() {
+    if (!loaded || !pendingRestart) return '';
+    return (
+      '<div class="rcp-notice rcp-notice--warn rcp-wide" role="status">' +
+      '<strong>Saved. One more step:</strong> the change applies when the receptionist restarts. ' +
+      'The phone reconnects by itself, in about 15 seconds.' +
+      '<div class="rcp-actions">' +
+      '<button type="button" class="rcp-button is-primary" data-act="set-apply-restart"' + (saving || loading || restarting ? ' disabled' : '') + '>' +
+      (restarting ? 'Restarting…' : 'Restart receptionist now') +
+      '</button>' +
+      '</div>' +
+      '</div>'
+    );
+  }
+
+  /** Beside Save: whether the form holds edits not saved yet. */
+  function dirtyHtml() {
+    var dirty = hasUnsavedEdits();
+    return (
+      '<span class="rcp-dirty' + (dirty ? ' is-dirty' : '') + '" id="set-dirty" aria-live="polite">' +
+      (dirty ? 'Unsaved changes' : 'No unsaved changes') +
+      '</span>'
+    );
+  }
+
+  function updateDirty() {
+    var el = root && root.querySelector ? root.querySelector('#set-dirty') : null;
+    if (!el) return;
+    var dirty = hasUnsavedEdits();
+    el.className = 'rcp-dirty' + (dirty ? ' is-dirty' : '');
+    el.textContent = dirty ? 'Unsaved changes' : 'No unsaved changes';
   }
 
   /**
@@ -810,6 +843,11 @@
   // ---- event wiring (delegated once per container) ------------------------
 
   function onInputOrChange(e) {
+    handleField(e);
+    updateDirty();
+  }
+
+  function handleField(e) {
     var t = e.target;
     if (!t || !t.getAttribute) return;
 
@@ -897,7 +935,7 @@
     if (typeof HOST.restartPlugin !== 'function') {
       HOST.toast(
         'info',
-        'This OAIY Desktop cannot restart plugins from here yet — restart the Aokie plugin from the Plugins panel to apply.'
+        'This version of OAIY cannot restart Aokie from here: restart the Aokie plugin on the Plugins page to apply.'
       );
       return;
     }
@@ -915,7 +953,7 @@
           render();
           HOST.toast(
             'info',
-            'A call is on the line — press "Restart receptionist now" again once it has ended.'
+            'A call is on the line, so the receptionist was not restarted. Press Restart receptionist now again once the call has ended.'
           );
           return;
         }
@@ -936,11 +974,11 @@
     pendingRestart = null;
     restarting = true;
     render();
-    HOST.toast('info', 'Restarting the receptionist — the phone reconnects automatically.');
+    HOST.toast('info', 'Restarting the receptionist: the phone reconnects by itself.');
     HOST.restartPlugin().then(
       function () {
         restarting = false;
-        HOST.toast('success', 'Receptionist restarted — the saved settings are live.');
+        HOST.toast('success', 'Receptionist restarted: the saved settings are live.');
         // Give the plugin a beat to finish booting before re-reading
         // settings (an immediate settings.get can race the connector start).
         setTimeout(function () {
@@ -949,7 +987,7 @@
       },
       function (e) {
         restarting = false;
-        HOST.toast('error', 'Restart failed: ' + errMsg(e));
+        HOST.toast('error', 'The receptionist could not be restarted: ' + errMsg(e));
         pendingRestart = ['restart'];
         render();
       }
