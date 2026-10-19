@@ -29,24 +29,29 @@
   --faint: #65615b;
 
   --border: #cec8be;
-  --strong-border: #9f998f;
+  /* (the dashboard's: lighter than the prototype's #9f998f, which framed
+     every secondary button in near-black) */
+  --strong-border: #b3ab9f;
 
   --primary: #2457e6;
   --primary-2: #2457e6;
   --primary-soft: rgba(36, 87, 230, 0.1);
   /* The primary as WORDS (links, the open tab): the primary itself on paper. */
   --primary-text: var(--primary);
-  /* Green and amber as words in 10.5px pills and on their own tints: the
-     host's #218450 and #9c6a08 read under 4.5:1 there, so a deeper shade. */
+  /* A primary button's fill (the dashboard's --primary-btn). */
+  --primary-btn: #2457e6;
+  --primary-btn-2: #2457e6;
+  /* Green and amber as words in pills on their own tints, and those pills
+     on a tinted row (a chosen dongle): a shade deeper than the dashboard's
+     #1c7646 and #8f6100, which read 4.2-4.3:1 there. */
   --green: #196c40;
   --green-soft: rgba(25, 108, 64, 0.1);
   --amber: #865a04;
   --amber-soft: rgba(245, 181, 44, 0.14);
-  --danger: #e94b3c;
-  --danger-soft: rgba(233, 75, 60, 0.08);
-  /* Danger as WORDS: #e94b3c is ~3.8:1 on paper, under the 4.5:1 body-text
-     floor, so error text and danger buttons use a deeper shade of it (deep
-     enough for a danger button inside a danger confirm, tint on tint). */
+  --danger: #bd3020;
+  --danger-soft: rgba(189, 48, 32, 0.08);
+  /* Danger as WORDS: a shade deeper than the dashboard's #bd3020, deep
+     enough for a danger button inside a danger confirm (tint on tint). */
   --danger-text: #b02f20;
 
   --focus: #2457e6;
@@ -84,7 +89,12 @@ html.fl-dark {
   --primary-2: #4d8bff;
   --primary-soft: rgba(113, 103, 255, 0.14);
   /* #7167ff as words is about 4.1:1 on the night surfaces: a lighter tint of it. */
-  --primary-text: #8f88ff;
+  --primary-text: #948cff;
+  /* A primary button's fill: white on the accent itself is 3.3-4.1:1, so the
+     button is a shade deeper (4.5:1 or more across its gradient), as on the
+     dashboard. The accent stays bright for bars, marks and icons. */
+  --primary-btn: #5d52f0;
+  --primary-btn-2: #3a6cdb;
   --green: #45d6a2;
   --green-soft: rgba(69, 214, 162, 0.12);
   --amber: #f2b84b;
@@ -93,12 +103,13 @@ html.fl-dark {
   --danger-soft: rgba(255, 110, 120, 0.1);
   --danger-text: #ff6e78;
 
-  --focus: #35d4e8;
+  /* The focus ring in the accent, as the sidebar's. */
+  --focus: #948cff;
   --shadow-card: 0 10px 26px rgba(0, 0, 0, 0.1);
-  --shadow-primary: 0 4px 14px color-mix(in srgb, var(--primary) 22%, transparent), inset 0 1px rgba(255, 255, 255, 0.18);
+  --shadow-primary: 0 2px 8px color-mix(in srgb, var(--primary-btn) 22%, transparent), inset 0 1px rgba(255, 255, 255, 0.14);
 
   /* Prism Lab is softer, Paper Circuit squarer. */
-  --r-card: 11px;
+  --r-card: 10px;
   --r-ctl: 8px;
   --r-sm: 6px;
 
@@ -133,11 +144,15 @@ button { color: inherit; }
 button,
 select { cursor: pointer; }
 
+/* The ring follows each control's own corners (a 4px radius here once
+   squared off an 8px button under the keyboard); inline words get a soft one. */
 :focus-visible {
   outline: 2px solid var(--focus);
   outline-offset: 2px;
-  border-radius: 4px;
 }
+
+.rcp-link-btn:focus-visible,
+summary:focus-visible { border-radius: var(--r-sm); }
 
 * {
   scrollbar-width: thin;
@@ -157,7 +172,7 @@ code { font-family: var(--font-mono); font-size: 0.92em; }
 .rcp {
   display: flex;
   flex-direction: column;
-  gap: 18px;
+  gap: 16px;
   min-width: 0;
   /* Card edges line up with the host's page heading above the screen. */
   padding: 2px 0 24px;
@@ -180,7 +195,7 @@ code { font-family: var(--font-mono); font-size: 0.92em; }
 .rcp-tab-btn {
   appearance: none;
   display: inline-flex;
-  height: 30px;
+  height: 28px;
   align-items: center;
   border: 0;
   border-radius: var(--r-sm);
@@ -194,8 +209,9 @@ code { font-family: var(--font-mono); font-size: 0.92em; }
 }
 
 .rcp-tab-btn:hover { background: var(--surface-soft); color: var(--text); }
-.rcp-tab-btn.is-active { background: var(--primary-soft); color: var(--primary-text); }
-html.fl-dark .rcp-tab-btn.is-active { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--primary) 30%, transparent); }
+/* The open one as the sidebar marks the open page: a tint, its words at full strength. */
+.rcp-tab-btn.is-active { background: var(--primary-soft); color: var(--text); }
+html.fl-dark .rcp-tab-btn.is-active { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--primary) 26%, transparent); }
 .rcp-tab-btn:focus-visible { outline-offset: -2px; }
 
 /* Hidden by the transport mode (the Dongle tab on the native transport). */
@@ -206,7 +222,8 @@ html.fl-dark .rcp-tab-btn.is-active { box-shadow: inset 0 0 0 1px color-mix(in s
 .rcp-tab-panel {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(min(100%, 440px), 1fr));
-  gap: 18px;
+  /* The dashboard's own rhythm between its sections. */
+  gap: 14px;
   align-items: start;
   min-width: 0;
 }
@@ -232,7 +249,7 @@ html.fl-dark .rcp-tab-btn.is-active { box-shadow: inset 0 0 0 1px color-mix(in s
   flex-direction: column;
   gap: 12px;
   min-width: 0;
-  padding: 15px 16px 17px;
+  padding: 16px 18px 18px;
   border: 1px solid var(--border);
   border-radius: var(--r-card);
   background: var(--surface);
@@ -251,12 +268,13 @@ html.fl-dark .rcp-tab-btn.is-active { box-shadow: inset 0 0 0 1px color-mix(in s
 .rcp-card__heading-copy {
   display: flex;
   flex-direction: column;
-  gap: 7px;
+  gap: 5px;
   min-width: 0;
   flex: 1 1 220px;
 }
 
-/* The section title with the dashboard's accent dash. */
+/* A card's title on its own (the Settings form's sections): the dashboard's
+   section title, its short accent rule and no glow. */
 .rcp-card__heading-copy > small,
 .rcp-group-title {
   display: flex;
@@ -264,30 +282,43 @@ html.fl-dark .rcp-tab-btn.is-active { box-shadow: inset 0 0 0 1px color-mix(in s
   gap: 9px;
   margin: 0;
   color: var(--text);
-  font-size: 12.5px;
+  font-size: 13px;
   font-weight: 650;
-  letter-spacing: 0.02em;
+  line-height: 1.35;
 }
 
 .rcp-card__heading-copy > small::before,
 .rcp-group-title::before {
   flex: none;
-  width: 14px;
+  width: 12px;
   height: 2px;
   border-radius: 2px;
   background: var(--primary);
   content: '';
 }
 
-html.fl-dark .rcp-card__heading-copy > small::before,
-html.fl-dark .rcp-group-title::before { box-shadow: 0 0 8px var(--primary); }
+/* Over a title that says how things stand, it is what the card is about: a
+   quiet label in the voice of the sidebar's group labels (mono capitals),
+   so the title under it leads. */
+.rcp-card__heading-copy > small:has(+ h3) {
+  color: var(--faint);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  line-height: 1.4;
+  text-transform: uppercase;
+}
 
 .rcp-card__heading h3 {
-  font-size: 16px;
+  font-size: 15px;
   font-weight: 650;
-  letter-spacing: -0.01em;
+  letter-spacing: -0.012em;
   line-height: 1.3;
 }
+
+/* The page's headline: how the receptionist stands. */
+.rcp-status-card .rcp-card__heading h3 { font-size: 17px; letter-spacing: -0.015em; }
 
 /* A card's parts one gap apart (the card's own gap is for its heading). */
 .rcp-card__body,
@@ -341,15 +372,46 @@ html.fl-dark .rcp-group-title::before { box-shadow: 0 0 8px var(--primary); }
   line-height: 1.55;
 }
 
-.rcp-loading,
-.rcp-empty { color: var(--faint); }
+.rcp-loading { color: var(--faint); }
 
+/* Nothing here (yet): the dashboard's empty state, compact, so a card that
+   has nothing to list reads as such rather than as a stray line. */
+.rcp-empty {
+  padding: 12px 14px;
+  border: 1px dashed var(--border);
+  border-radius: var(--r-ctl);
+  background: color-mix(in srgb, var(--surface-soft) 45%, transparent);
+}
+
+/* (a note under a list is about the list, not an empty one) */
+.rcp-phone-list + .rcp-empty {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--faint);
+}
+
+/* What failed: the dashboard's error banner, the words in the danger colour
+   on its tint. */
 .rcp-error {
   margin: 0;
+  padding: 10px 14px;
+  border: 1px solid color-mix(in srgb, var(--danger) 30%, var(--border));
+  border-radius: var(--r-ctl);
+  background: var(--danger-soft);
   color: var(--danger-text);
   font-size: 12.5px;
-  line-height: 1.55;
+  line-height: 1.5;
   overflow-wrap: anywhere;
+}
+
+/* A field's own note (the days typed for keeping records): its words under
+   the field, as its hint was, not a box. */
+.rcp-field + .rcp-error {
+  padding: 0;
+  border: 0;
+  background: none;
+  font-size: 12px;
 }
 
 .rcp-error > .rcp-actions { margin-top: 8px; }
@@ -359,7 +421,7 @@ html.fl-dark .rcp-group-title::before { box-shadow: 0 0 8px var(--primary); }
   padding-top: 11px;
   border-top: 1px solid var(--border);
   color: var(--muted);
-  font-size: 12.5px;
+  font-size: 12px;
   line-height: 1.55;
 }
 
@@ -441,27 +503,27 @@ html.fl-dark .rcp-group-title::before { box-shadow: 0 0 8px var(--primary); }
   display: flex;
   flex-direction: column;
   align-items: flex-start;
-  gap: 4px;
+  gap: 3px;
   min-width: 0;
-  padding: 13px 14px 14px;
+  padding: 12px 13px 13px;
   border: 1px solid var(--border);
   border-radius: var(--r-card);
-  background: var(--surface-solid);
-  box-shadow: var(--shadow-card);
+  /* (the dashboard's status tile) */
+  background: var(--surface-raised);
 }
 
 .rcp-ready__icon {
   display: inline-flex;
-  margin-bottom: 4px;
-  color: var(--muted);
+  margin-bottom: 5px;
+  color: var(--faint);
 }
 
 .rcp-ready strong {
   max-width: 100%;
   padding-right: 18px;
-  font-size: 18px;
+  font-size: 17px;
   font-weight: 650;
-  letter-spacing: -0.01em;
+  letter-spacing: -0.012em;
   line-height: 1.25;
 }
 
@@ -471,6 +533,7 @@ html.fl-dark .rcp-group-title::before { box-shadow: 0 0 8px var(--primary); }
 .rcp-ready small {
   color: var(--muted);
   font-size: 12px;
+  font-weight: 560;
 }
 
 .rcp-ready p {
@@ -494,8 +557,8 @@ html.fl-dark .rcp-group-title::before { box-shadow: 0 0 8px var(--primary); }
 
 .rcp-ready__state {
   position: absolute;
-  top: 13px;
-  right: 13px;
+  top: 12px;
+  right: 12px;
   display: inline-flex;
 }
 
@@ -503,24 +566,28 @@ html.fl-dark .rcp-group-title::before { box-shadow: 0 0 8px var(--primary); }
 .rcp-ready__state.is-bad { color: var(--amber); }
 .rcp-ready__state.is-unknown { color: var(--faint); }
 
-/* ── Badges (the dashboard's LED pills) ─────────────────────────────────── */
+/* ── Badges (the dashboard's status pills) ──────────────────────────────── */
+/* One family with the dashboard's own: 20px tall, the body's type at 11px,
+   a hairline in its colour on its own tint. The dot glows only in Prism Lab. */
 
 .rcp-pill,
 .rcp-badge {
   display: inline-flex;
   flex: none;
+  height: 20px;
   align-items: center;
-  gap: 6px;
-  border: 1px solid var(--strong-border);
+  gap: 5px;
+  border: 1px solid var(--border);
   border-radius: 999px;
   background: var(--surface-soft);
   color: var(--muted);
-  padding: 3px 9px;
-  font-family: var(--font-mono);
-  font-size: 10.5px;
+  padding: 0 8px;
+  font-family: var(--font-body);
+  font-size: 11px;
   font-weight: 600;
-  letter-spacing: 0.02em;
-  line-height: 1.4;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.005em;
+  line-height: 1;
   white-space: nowrap;
 }
 
@@ -539,29 +606,31 @@ html.fl-dark .rcp-group-title::before { box-shadow: 0 0 8px var(--primary); }
 
 .rcp-pill.is-ok,
 .rcp-badge.is-ok {
-  border-color: color-mix(in srgb, var(--green) 35%, var(--border));
+  border-color: color-mix(in srgb, var(--green) 32%, var(--border));
   background: var(--green-soft);
   color: var(--green);
 }
 
 .rcp-pill.is-warn,
 .rcp-badge.is-pending {
-  border-color: color-mix(in srgb, var(--amber) 40%, var(--border));
+  border-color: color-mix(in srgb, var(--amber) 36%, var(--border));
   background: var(--amber-soft);
   color: var(--amber);
 }
 
 .rcp-pill.is-err,
 .rcp-pill.is-live {
-  border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
+  border-color: color-mix(in srgb, var(--danger) 32%, var(--border));
   background: var(--danger-soft);
   color: var(--danger-text);
 }
 
 html.fl-dark .rcp-pill.is-ok i,
-html.fl-dark .rcp-badge.is-ok::before { box-shadow: 0 0 7px var(--green); }
+html.fl-dark .rcp-badge.is-ok::before { box-shadow: 0 0 6px var(--green); }
+html.fl-dark .rcp-pill.is-warn i,
+html.fl-dark .rcp-badge.is-pending::before { box-shadow: 0 0 6px var(--amber); }
 html.fl-dark .rcp-pill.is-err i,
-html.fl-dark .rcp-pill.is-live i { box-shadow: 0 0 7px var(--danger); }
+html.fl-dark .rcp-pill.is-live i { box-shadow: 0 0 6px var(--danger); }
 
 .rcp-pill.is-live i { animation: rcp-led-pulse 1.3s ease-in-out infinite; }
 
@@ -592,12 +661,15 @@ html.fl-dark .rcp-pill.is-live i { box-shadow: 0 0 7px var(--danger); }
   font-weight: 600;
   line-height: 1.25;
   text-align: center;
-  transition: background 0.14s, border-color 0.14s, transform 0.06s, box-shadow 0.14s, filter 0.14s;
+  transition: background 0.14s, border-color 0.14s, color 0.14s, transform 0.06s, box-shadow 0.14s, filter 0.14s;
 }
+
+.rcp-button > svg,
+.rcp-call-action > svg { flex: none; }
 
 .rcp-button:hover:not(:disabled),
 .rcp-call-action:hover:not(:disabled) {
-  border-color: var(--primary);
+  border-color: color-mix(in srgb, var(--primary) 60%, var(--strong-border));
   background: var(--primary-soft);
 }
 
@@ -610,33 +682,52 @@ html.fl-dark .rcp-pill.is-live i { box-shadow: 0 0 7px var(--danger); }
   opacity: 0.45;
 }
 
-/* A row's own small actions (the dashboard's .btn-tiny). */
+/* A row's own small actions (the dashboard's .btn-tiny): quieter than the
+   card's buttons until the pointer is on one. */
 .rcp-button.is-small {
   min-height: 28px;
   border-color: var(--border);
   border-radius: var(--r-sm);
+  color: var(--muted);
   padding: 0 10px;
   font-size: 12px;
+  font-weight: 580;
 }
 
+.rcp-button.is-small:hover:not(:disabled) { color: var(--text); }
+
+/* The one thing to do: white on a deeper shade of the accent, a soft lift. */
 .rcp-button.is-primary {
-  border-color: color-mix(in srgb, var(--primary) 80%, white);
-  background: linear-gradient(115deg, var(--primary), var(--primary-2));
+  border-color: color-mix(in srgb, var(--primary-btn) 70%, white);
+  background: linear-gradient(115deg, var(--primary-btn), var(--primary-btn-2));
   box-shadow: var(--shadow-primary);
   color: #fff;
 }
 
 .rcp-button.is-primary:hover:not(:disabled) {
-  border-color: color-mix(in srgb, var(--primary) 80%, white);
-  background: linear-gradient(115deg, var(--primary), var(--primary-2));
-  filter: brightness(1.08);
+  border-color: color-mix(in srgb, var(--primary-btn) 70%, white);
+  background: linear-gradient(115deg, var(--primary-btn), var(--primary-btn-2));
+  color: #fff;
+  filter: brightness(1.1);
 }
 
 /* Paper Circuit has no glow: a flat primary with its hard offset shadow. */
 html:not(.fl-dark) .rcp-button.is-primary,
 html:not(.fl-dark) .rcp-button.is-primary:hover:not(:disabled) {
-  border-color: var(--primary);
-  background: var(--primary);
+  border-color: var(--primary-btn);
+  background: var(--primary-btn);
+}
+
+/* Not yet possible: the accent's tint and its words, not a faded slab of
+   colour (that read as a fault), as on the dashboard. */
+.rcp-button.is-primary:disabled,
+html:not(.fl-dark) .rcp-button.is-primary:disabled {
+  border-color: color-mix(in srgb, var(--primary) 30%, var(--border));
+  background: var(--primary-soft);
+  box-shadow: none;
+  color: var(--primary-text);
+  filter: none;
+  opacity: 0.6;
 }
 
 .rcp-button.is-danger,
@@ -649,7 +740,8 @@ html:not(.fl-dark) .rcp-button.is-primary:hover:not(:disabled) {
 .rcp-button.is-danger:hover:not(:disabled),
 .rcp-call-action.is-reject:hover:not(:disabled) {
   border-color: var(--danger);
-  background: var(--danger-soft);
+  background: color-mix(in srgb, var(--danger) 16%, transparent);
+  color: var(--danger-text);
 }
 
 .rcp-button.is-warn {
@@ -660,7 +752,7 @@ html:not(.fl-dark) .rcp-button.is-primary:hover:not(:disabled) {
 
 .rcp-button.is-warn:hover:not(:disabled) {
   border-color: var(--amber);
-  background: var(--amber-soft);
+  background: color-mix(in srgb, var(--amber) 18%, transparent);
 }
 
 .rcp-call-action.is-answer {
@@ -669,7 +761,8 @@ html:not(.fl-dark) .rcp-button.is-primary:hover:not(:disabled) {
   color: #fff;
 }
 
-html.fl-dark .rcp-call-action.is-answer { color: #06281c; }
+/* (the night's green is light: the words in the page's own dark) */
+html.fl-dark .rcp-call-action.is-answer { color: var(--surface-solid); }
 
 .rcp-call-action.is-answer:hover:not(:disabled) {
   border-color: var(--green);
@@ -718,6 +811,17 @@ html.fl-dark .rcp-call-action.is-answer { color: #06281c; }
   flex-direction: column;
 }
 
+/* Not known yet (Aokie not running): the box fills the card, its words
+   centred, as the waiting state's do. */
+.rcp-live-card > #live-body > .rcp-empty {
+  display: flex;
+  flex: 1 1 auto;
+  align-items: center;
+  justify-content: center;
+  min-height: 120px;
+  text-align: center;
+}
+
 /* The call (or the wait for one) in a framed box that fills the card. */
 .rcp-empty-call,
 .rcp-ringing {
@@ -726,49 +830,55 @@ html.fl-dark .rcp-call-action.is-answer { color: #06281c; }
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  min-height: 170px;
-  padding: 18px 16px;
+  min-height: 160px;
+  padding: 22px 20px;
   border: 1px dashed var(--border);
   border-radius: var(--r-ctl);
+  /* (the dashboard's empty state: a faint wash inside the dashed line) */
+  background: color-mix(in srgb, var(--surface-soft) 45%, transparent);
   text-align: center;
 }
 
 .rcp-ringing {
   border-style: solid;
-  border-color: color-mix(in srgb, var(--amber) 40%, var(--border));
-  background: color-mix(in srgb, var(--amber-soft) 55%, transparent);
+  border-color: color-mix(in srgb, var(--amber) 34%, var(--border));
+  background: color-mix(in srgb, var(--amber) 6%, transparent);
 }
 
 .rcp-ringing.is-active {
-  border-color: color-mix(in srgb, var(--green) 35%, var(--border));
-  background: color-mix(in srgb, var(--green-soft) 55%, transparent);
+  border-color: color-mix(in srgb, var(--green) 30%, var(--border));
+  background: color-mix(in srgb, var(--green) 5%, transparent);
 }
 
+/* Nothing is happening: the icon in a quiet tile, as the sidebar's icons are
+   faint until they matter. */
 .rcp-empty-call__icon {
   display: inline-flex;
-  width: 44px;
-  height: 44px;
+  width: 40px;
+  height: 40px;
   align-items: center;
   justify-content: center;
+  border: 1px solid var(--border);
   border-radius: var(--r-card);
-  background: var(--primary-soft);
-  color: var(--primary);
+  background: var(--surface-raised);
+  color: var(--faint);
 }
 
 .rcp-empty-call__icon.is-warn {
+  border-color: color-mix(in srgb, var(--amber) 30%, var(--border));
   background: var(--amber-soft);
   color: var(--amber);
 }
 
 .rcp-empty-call h4 {
   margin-top: 12px;
-  font-size: 14px;
-  font-weight: 650;
+  font-size: 13.5px;
+  font-weight: 620;
 }
 
 .rcp-empty-call p {
   max-width: 360px;
-  margin: 5px 0 0;
+  margin: 4px 0 0;
   color: var(--muted);
   font-size: 12.5px;
   line-height: 1.55;
@@ -776,19 +886,21 @@ html.fl-dark .rcp-call-action.is-answer { color: #06281c; }
 
 .rcp-empty-call .rcp-actions { justify-content: center; margin-top: 14px; }
 
+/* "Incoming call": a label in the sidebar's voice, over the caller. */
 .rcp-ringing small {
   color: var(--muted);
   font-family: var(--font-mono);
   font-size: 10.5px;
-  font-weight: 650;
-  letter-spacing: 0.06em;
+  font-weight: 600;
+  letter-spacing: 0.12em;
 }
 
 .rcp-ringing h4 {
-  margin-top: 4px;
-  font-size: 20px;
+  margin-top: 5px;
+  font-size: 21px;
   font-weight: 650;
-  letter-spacing: -0.01em;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.012em;
   line-height: 1.25;
 }
 
@@ -881,31 +993,65 @@ html.fl-dark .rcp-call-action.is-answer { color: #06281c; }
   gap: 8px;
 }
 
-.rcp-phone-row {
+/* A row of a list (a phone, a Companion app): the dashboard's list row, its
+   frame firming under the pointer and its icon brightening, as the sidebar's. */
+.rcp-phone-row,
+.rcp-person-row {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 8px 10px;
+  gap: 8px 12px;
   min-width: 0;
   padding: 10px 12px;
   border: 1px solid var(--border);
   border-radius: var(--r-card);
   background: var(--surface-raised);
+  transition: border-color 0.14s;
+}
+
+.rcp-phone-row:hover,
+.rcp-person-row:hover { border-color: color-mix(in srgb, var(--strong-border) 70%, var(--border)); }
+
+.rcp-phone-row__icon,
+.rcp-person-row__icon {
+  display: inline-flex;
+  flex: none;
+  width: 32px;
+  height: 32px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border);
+  border-radius: var(--r-ctl);
+  background: var(--surface-soft);
+  color: var(--faint);
+  transition: color 0.14s;
+}
+
+.rcp-phone-row:hover .rcp-phone-row__icon { color: var(--text); }
+
+.rcp-phone-row__icon.is-ok {
+  border-color: color-mix(in srgb, var(--green) 28%, var(--border));
+  background: var(--green-soft);
+  color: var(--green);
 }
 
 .rcp-phone-row__id {
-  flex: 1 1 140px;
+  /* (room for a name and its address beside the icon, the state and two
+     buttons on one line in a half-width card) */
+  flex: 1 1 116px;
   min-width: 0;
 }
 
 .rcp-phone-row__id strong {
   display: block;
   font-size: 13.5px;
-  font-weight: 600;
+  font-weight: 620;
+  line-height: 1.35;
 }
 
 .rcp-phone-row__id small {
   display: block;
+  margin-top: 1px;
   color: var(--faint);
   font-family: var(--font-mono);
   font-size: 11px;
@@ -1020,7 +1166,7 @@ html.fl-dark .rcp-call-action.is-answer { color: #06281c; }
 .rcp-form {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(min(100%, 440px), 1fr));
-  gap: 18px;
+  gap: 14px;
   /* Cards side by side share a height. */
   align-items: stretch;
   min-width: 0;
@@ -1124,25 +1270,47 @@ html { scroll-padding-bottom: calc(var(--rcp-bar-h, 0px) + 18px); }
   outline: 0;
   background: var(--surface-soft);
   color: var(--text);
-  padding: 0 9px;
-  font-size: 12.5px;
-  transition: border-color 0.14s, box-shadow 0.14s;
+  padding: 0 10px;
+  font-size: 13px;
+  transition: border-color 0.14s, box-shadow 0.14s, background 0.14s;
 }
 
-/* Identifiers and numbers keep the mono data voice; words are in the body type. */
+/* Identifiers and numbers keep the mono data voice, a size down as mono runs
+   wide; words are in the body type. */
 .rcp input.is-mono,
 .rcp input[type='number'],
-.rcp textarea.is-mono { font-family: var(--font-mono); }
+.rcp textarea.is-mono { font-family: var(--font-mono); font-size: 12px; }
 
 .rcp textarea {
   height: auto;
-  padding: 9px;
+  padding: 8px 10px;
   line-height: 1.55;
   resize: vertical;
 }
 
+/* A menu: one chevron of the theme's own, in its muted colour (the system's
+   differs between WebKit and Chrome, and ignores the field's colours). */
+.rcp select {
+  -webkit-appearance: none;
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%2365615b' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-position: right 11px center;
+  background-repeat: no-repeat;
+  background-size: 10px 6px;
+  padding-right: 30px;
+  text-overflow: ellipsis;
+}
+
+html.fl-dark .rcp select {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%2398a6bd' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+}
+
 .rcp input::placeholder,
 .rcp textarea::placeholder { color: var(--faint); }
+
+.rcp input:hover:not(:disabled):not(:focus),
+.rcp select:hover:not(:disabled):not(:focus),
+.rcp textarea:hover:not(:disabled):not(:focus) { border-color: color-mix(in srgb, var(--strong-border) 70%, var(--border)); }
 
 .rcp input:focus,
 .rcp select:focus,
@@ -1219,20 +1387,20 @@ html { scroll-padding-bottom: calc(var(--rcp-bar-h, 0px) + 18px); }
 
 .rcp-notice {
   margin: 0;
-  padding: 11px 14px;
+  padding: 10px 14px;
   border: 1px solid var(--border);
   border-radius: var(--r-ctl);
   background: var(--surface-soft);
   color: var(--muted);
   font-size: 12.5px;
-  line-height: 1.55;
+  line-height: 1.5;
   overflow-wrap: anywhere;
 }
 
 .rcp-notice strong { color: var(--text); }
 
 .rcp-notice--ok {
-  border-color: color-mix(in srgb, var(--green) 35%, var(--border));
+  border-color: color-mix(in srgb, var(--green) 30%, var(--border));
   background: var(--green-soft);
   color: var(--text);
 }
@@ -1240,7 +1408,7 @@ html { scroll-padding-bottom: calc(var(--rcp-bar-h, 0px) + 18px); }
 .rcp-notice--ok strong { color: var(--green); }
 
 .rcp-notice--warn {
-  border-color: color-mix(in srgb, var(--amber) 40%, var(--border));
+  border-color: color-mix(in srgb, var(--amber) 34%, var(--border));
   background: var(--amber-soft);
   color: var(--text);
 }
@@ -1253,39 +1421,40 @@ html { scroll-padding-bottom: calc(var(--rcp-bar-h, 0px) + 18px); }
 .rcp-callout {
   display: flex;
   align-items: flex-start;
-  gap: 9px;
-  padding: 11px 14px;
-  border: 1px solid color-mix(in srgb, var(--primary) 35%, var(--border));
+  gap: 10px;
+  padding: 10px 14px;
+  border: 1px solid color-mix(in srgb, var(--primary) 30%, var(--border));
   border-radius: var(--r-ctl);
   background: var(--primary-soft);
   color: var(--text);
   font-size: 12.5px;
-  line-height: 1.55;
+  line-height: 1.5;
 }
 
 .rcp-callout > span { min-width: 0; }
 
 .rcp-callout.is-warn {
-  border-color: color-mix(in srgb, var(--amber) 40%, var(--border));
+  border-color: color-mix(in srgb, var(--amber) 34%, var(--border));
   background: var(--amber-soft);
 }
 
 .rcp-callout svg { flex: none; margin-top: 2px; }
+.rcp-callout > svg { color: var(--primary-text); }
 .rcp-callout.is-warn > svg { color: var(--amber); }
 .rcp-callout .rcp-check { margin-top: 8px; }
 
 /* Inline confirm (destructive actions — no host dialog in the sandbox). */
 .rcp-confirm {
-  padding: 11px 14px;
-  border: 1px solid color-mix(in srgb, var(--amber) 40%, var(--border));
+  padding: 12px 14px;
+  border: 1px solid color-mix(in srgb, var(--amber) 34%, var(--border));
   border-radius: var(--r-ctl);
   background: var(--amber-soft);
   font-size: 12.5px;
-  line-height: 1.55;
+  line-height: 1.5;
 }
 
 .rcp-confirm.is-danger {
-  border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
+  border-color: color-mix(in srgb, var(--danger) 30%, var(--border));
   background: var(--danger-soft);
 }
 
@@ -1319,13 +1488,24 @@ html { scroll-padding-bottom: calc(var(--rcp-bar-h, 0px) + 18px); }
   word-break: break-all;
 }
 
+/* The code to compare with the phone's: the one thing on the card, framed in
+   the accent's tint, its digits evenly spaced and centred (the indent offsets
+   the spacing after the last digit). */
 .rcp-paircode {
-  margin: 4px 0;
+  margin: 2px 0;
+  padding: 14px 16px 15px;
+  border: 1px solid color-mix(in srgb, var(--primary) 30%, var(--border));
+  border-radius: var(--r-card);
+  background: var(--primary-soft);
+  color: var(--text);
   font-family: var(--font-mono);
-  font-size: 30px;
-  font-weight: 700;
-  letter-spacing: 6px;
+  font-size: 32px;
+  font-weight: 650;
   font-variant-numeric: tabular-nums;
+  letter-spacing: 0.22em;
+  line-height: 1.15;
+  text-align: center;
+  text-indent: 0.22em;
 }
 
 /* ── Dongle wizard ──────────────────────────────────────────────────────── */
@@ -1358,7 +1538,7 @@ html { scroll-padding-bottom: calc(var(--rcp-bar-h, 0px) + 18px); }
   transition: border-color 0.14s, background 0.14s;
 }
 
-.rcp-wizard-row:hover { border-color: var(--strong-border); }
+.rcp-wizard-row:hover { border-color: color-mix(in srgb, var(--strong-border) 70%, var(--border)); }
 
 .rcp-wizard-row.is-selected {
   border-color: var(--primary);
@@ -1600,37 +1780,37 @@ html { scroll-padding-bottom: calc(var(--rcp-bar-h, 0px) + 18px); }
   word-break: break-all;
 }
 
-.rcp-list { display: flex; flex-direction: column; }
-.rcp-list h4 { margin: 0 0 2px; font-size: 13px; font-weight: 650; }
-.rcp-list + .rcp-list { margin-top: 6px; }
+/* The Companion apps, in groups (waiting, approved): each group's name a
+   label in the sidebar's voice, its rows as the phones' are. */
+.rcp-list { display: flex; flex-direction: column; gap: 8px; }
 
-.rcp-person-row {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px 10px;
-  min-width: 0;
-  padding: 10px 0;
-  border-top: 1px solid var(--border);
+.rcp-list h4 {
+  margin: 0;
+  color: var(--faint);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
 }
 
-.rcp-list h4 + .rcp-person-row { border-top: 0; }
+.rcp-list + .rcp-list { margin-top: 8px; }
 
+/* Waiting for approval: the accent's tint, as something to act on. */
 .rcp-person-row__icon {
-  display: inline-flex;
-  flex: none;
-  width: 30px;
-  height: 30px;
-  align-items: center;
-  justify-content: center;
-  border-radius: var(--r-ctl);
+  border-color: color-mix(in srgb, var(--primary) 26%, var(--border));
   background: var(--primary-soft);
-  color: var(--primary);
+  color: var(--primary-text);
 }
 
-.rcp-person-row__icon.is-ok { background: var(--green-soft); color: var(--green); }
+.rcp-person-row__icon.is-ok {
+  border-color: color-mix(in srgb, var(--green) 28%, var(--border));
+  background: var(--green-soft);
+  color: var(--green);
+}
+
 .rcp-person-row__id { flex: 1 1 180px; min-width: 0; }
-.rcp-person-row__id strong { display: block; font-size: 13px; }
+.rcp-person-row__id strong { display: block; font-size: 13.5px; font-weight: 620; line-height: 1.35; }
 
 .rcp-person-row__id small {
   display: block;
@@ -1656,6 +1836,8 @@ html { scroll-padding-bottom: calc(var(--rcp-bar-h, 0px) + 18px); }
   flex-wrap: wrap;
   align-items: center;
   gap: 8px 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
 }
 
 .rcp-danger-row > span { flex: 1 1 240px; min-width: 0; }
@@ -1674,6 +1856,35 @@ html { scroll-padding-bottom: calc(var(--rcp-bar-h, 0px) + 18px); }
   font-weight: 600;
   cursor: pointer;
 }
+
+/* A fold's own chevron (the system's triangle differs between WebKit and
+   Chrome): pointing on while shut, down while open. */
+.rcp-details summary,
+.rcp-other-usb summary {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  list-style: none;
+}
+
+.rcp-details summary::-webkit-details-marker,
+.rcp-other-usb summary::-webkit-details-marker { display: none; }
+
+.rcp-details summary::before,
+.rcp-other-usb summary::before {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  margin: 0 1px 0 2px;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  content: '';
+  transform: rotate(-45deg);
+  transition: transform 0.14s;
+}
+
+.rcp-details[open] > summary::before,
+.rcp-other-usb[open] > summary::before { transform: translateY(-2px) rotate(45deg); }
 
 .rcp-details summary:hover { color: var(--text); }
 .rcp-details[open] > summary { margin-bottom: 10px; }

@@ -1719,6 +1719,7 @@
           var armed = state.disconnectArm === addr && connected && !down;
           return (
             '<div class="rcp-phone-row">' +
+            '<span class="rcp-phone-row__icon' + (connected ? ' is-ok' : '') + '">' + ICONS.smartphone + '</span>' +
             '<span class="rcp-phone-row__id">' +
             '<strong>' + esc(d.name || 'Unnamed phone') + '</strong>' +
             '<small>' + esc(addr) + '</small>' +

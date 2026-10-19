@@ -624,6 +624,7 @@
       var armed = !!(disconnectArm && disconnectArm.address === addr && isConn);
       rows.push(
         '<div class="rcp-phone-row">' +
+          '<span class="rcp-phone-row__icon' + (isConn ? ' is-ok' : '') + '">' + ICONS.smartphone + '</span>' +
           '<span class="rcp-phone-row__id">' +
           '<strong>' + esc(d.name || 'Unnamed phone') + '</strong>' +
           '<small>' + esc(addr) + '</small>' +
