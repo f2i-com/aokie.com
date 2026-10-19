@@ -3460,6 +3460,28 @@ fn run_runtime(
                         // to honor looks identical to "phone never asked for
                         // SCO" in the log. Now we can tell them apart.
                         eprintln!("[AokieRadio] HCI {}", action);
+                        // A bond just made: the phone's name, asked for as its link came up and answered before there was a
+                        // bond to keep it with (so the paired phones said "Unnamed phone" until a later reconnect), is kept
+                        // with the bond now.
+                        if let hci::HciEvent::LinkKeyNotification { address, .. } = &event {
+                            let live = status
+                                .addresses
+                                .read()
+                                .ok()
+                                .filter(|a| a.remote.eq_ignore_ascii_case(address))
+                                .and_then(|a| a.remote_name.clone());
+                            if let Some(name) = live {
+                                match pairing_store.set_name(address, &name) {
+                                    Ok(true) => {
+                                        if let Ok(mut snap) = status.bonded_devices.write() {
+                                            *snap = pairing_store.list_devices();
+                                        }
+                                    }
+                                    Ok(false) => {}
+                                    Err(e) => eprintln!("[AokieRadio] failed to persist device name for {}: {e}", super::LogAddr(&address)),
+                                }
+                            }
+                        }
                     }
                     Ok(Some(manager::PairingOutcome::ConfirmationPending {
                         address,
