@@ -486,12 +486,61 @@ pub fn remote_name_request_command(address: &str) -> Result<[u8; 13], String> {
 }
 
 pub fn create_connection_command_default(address: &str) -> Result<[u8; 16], String> {
+    create_connection_command_for(address, true)
+}
+
+/// The default link policy's role-switch bit (Core Spec v5.4 Vol 4 Part E §7.2.12).
+pub const LINK_POLICY_ROLE_SWITCH: u16 = 0x0001;
+
+/// [`create_connection_command_default`], the role switch allowed or not as the controller's link policy says (a
+/// Realtek controller refuses it: manager::link_policy_for).
+pub fn create_connection_command_for(address: &str, allow_role_switch: bool) -> Result<[u8; 16], String> {
     create_connection_command(
         address, 0xCC18, // BR packet types: DM1 + DH1 + DM3 + DH3 + DM5 + DH5
         0x01,   // Page Scan Repetition Mode R1
         0x0000, // Clock offset unknown
-        0x01,   // Allow role switch
+        u8::from(allow_role_switch),
     )
+}
+
+/// The name of an HCI error code (Core Spec v5.4 Vol 1 Part F), for the log: the ones a connection or a pairing ends
+/// with; another is "an error".
+pub fn status_name(status: u8) -> &'static str {
+    match status {
+        0x00 => "success",
+        0x02 => "unknown connection",
+        0x04 => "page timeout",
+        0x05 => "authentication failure",
+        0x06 => "PIN or key missing",
+        0x08 => "connection timeout",
+        0x0a => "too many synchronous connections",
+        0x0b => "connection already exists",
+        0x0c => "command disallowed",
+        0x0d => "rejected: limited resources",
+        0x0e => "rejected: security reasons",
+        0x0f => "rejected: unacceptable address",
+        0x10 => "connection accept timeout exceeded",
+        0x11 => "unsupported feature or parameter",
+        0x12 => "invalid HCI command parameters",
+        0x13 => "remote user ended the connection",
+        0x16 => "ended by the local host",
+        0x18 => "pairing not allowed",
+        0x1a => "unsupported remote feature",
+        0x1f => "unspecified error",
+        0x22 => "LMP response timeout",
+        0x23 => "LMP error transaction collision",
+        0x24 => "LMP PDU not allowed",
+        0x25 => "encryption mode not acceptable",
+        0x28 => "instant passed",
+        0x29 => "pairing with unit key not supported",
+        0x2a => "different transaction collision",
+        0x2f => "insufficient security",
+        0x30 => "parameter out of mandatory range",
+        0x35 => "role switch failed",
+        0x3d => "connection terminated: MIC failure",
+        0x3e => "connection failed to be established",
+        _ => "an error",
+    }
 }
 
 pub fn accept_connection_request_command(address: &str, role: u8) -> Result<[u8; 10], String> {

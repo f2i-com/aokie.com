@@ -2536,7 +2536,7 @@ fn run_runtime(
                         let idx = auto_reconnect_target_index % paired.len();
                         auto_reconnect_target_index = idx.wrapping_add(1);
                         let addr = paired[idx].clone();
-                        match hci::create_connection_command_default(&addr) {
+                        match hci::create_connection_command_for(&addr, init_report.link_policy & hci::LINK_POLICY_ROLE_SWITCH != 0) {
                             Ok(cmd) => match transport.write_command(&cmd) {
                                 Ok(()) => {
                                     eprintln!(
@@ -2898,7 +2898,7 @@ fn run_runtime(
                 } else {
                     *pages += 1;
                     *due = Instant::now() + Duration::from_secs(25);
-                    match hci::create_connection_command_default(addr)
+                    match hci::create_connection_command_for(addr, init_report.link_policy & hci::LINK_POLICY_ROLE_SWITCH != 0)
                         .and_then(|cmd| transport.write_command(&cmd))
                     {
                         Ok(()) => {
@@ -3265,7 +3265,7 @@ fn run_runtime(
                     } else if manual_connect_pending.is_some() {
                         Err("a reconnect attempt is already in progress".to_string())
                     } else {
-                        match hci::create_connection_command_default(&address) {
+                        match hci::create_connection_command_for(&address, init_report.link_policy & hci::LINK_POLICY_ROLE_SWITCH != 0) {
                             Ok(cmd) => match transport.write_command(&cmd) {
                                 Ok(()) => {
                                     eprintln!(
@@ -5038,6 +5038,19 @@ fn forward_hci_event(
         {
             // A second phone's link: the main loop ends it. The connected
             // phone's status stays as it is (review 1 #6).
+        }
+        hci::HciEvent::ConnectionComplete {
+            status: cstatus,
+            address,
+            link_type,
+            ..
+        } if *cstatus != 0 => {
+            // A link that did not come up (a phone that "can't communicate with" Aokie): said, with the controller's
+            // reason, where it was said of nothing before.
+            eprintln!(
+                "[AokieRadio] Connection Complete from {} FAILED: status {:#04x} ({}), link type {}",
+                super::LogAddr(&address), cstatus, hci::status_name(*cstatus), link_type
+            );
         }
         hci::HciEvent::ConnectionComplete {
             status: cstatus,

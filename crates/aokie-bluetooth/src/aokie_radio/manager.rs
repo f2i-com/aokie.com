@@ -40,6 +40,21 @@ pub const AOKIE_EIR_UUIDS: &[u16] = &[
 ];
 pub const AOKIE_PAGE_TIMEOUT: u16 = 0x6000;
 pub const AOKIE_LINK_POLICY: u16 = 0x0005;
+/// The default link policy for a Realtek controller: sniff mode, and role switches refused. The RTL8822BU's
+/// Bluetooth (a Wi-Fi and Bluetooth adapter) lost every link a phone switched roles on: a Role Change, then Connection
+/// Complete "connection timeout", the phone saying it could not communicate with Aokie. With the switch refused the
+/// phone stays the link's central, and pairs. (Broadcom's BCM20702 keeps [`AOKIE_LINK_POLICY`], as tested with calls.)
+pub const AOKIE_LINK_POLICY_NO_ROLE_SWITCH: u16 = 0x0004;
+
+/// The default link policy for this controller: [`AOKIE_LINK_POLICY_NO_ROLE_SWITCH`] for a Realtek one, else
+/// [`AOKIE_LINK_POLICY`]. The runtime pages a bonded phone with the same choice (`create_connection_command_for`).
+pub fn link_policy_for(version: &hci::LocalVersion) -> u16 {
+    if version.manufacturer_name == realtek::BLUETOOTH_COMPANY_ID_REALTEK {
+        AOKIE_LINK_POLICY_NO_ROLE_SWITCH
+    } else {
+        AOKIE_LINK_POLICY
+    }
+}
 pub const AOKIE_VOICE_SETTING: u16 = 0x0060;
 /// Voice setting for HFP wide-band speech (mSBC) over an eSCO link.
 ///
@@ -285,6 +300,23 @@ pub fn listen_controller(
     // listen_runtime_controller_with_options so the cadence is the
     // same across diagnostic helpers.
     transport.set_read_timeouts(100, None, None)?;
+    // (AOKIE_DIAG_DISCOVERABLE: seen by phones as well as connectable, as an open pairing window makes the radio, so a
+    // phone that has not paired can find it and its whole pairing be watched)
+    if std::env::var_os("AOKIE_DIAG_DISCOVERABLE").is_some() {
+        write_scan_enable(&transport, AOKIE_SCAN_ENABLE_CONNECTABLE_DISCOVERABLE)?;
+        eprintln!("[AokieRadio] diagnostic: discoverable (scan_enable=0x03)");
+    }
+    // (AOKIE_DIAG_LINK_POLICY=0x0004, say: another default link policy than Aokie's, to see how a controller does
+    // with role switches refused)
+    if let Some(policy) = std::env::var("AOKIE_DIAG_LINK_POLICY").ok().and_then(|v| u16::from_str_radix(v.trim_start_matches("0x"), 16).ok()) {
+        command_status(
+            &transport,
+            &hci::write_default_link_policy_settings_command(policy),
+            hci::OPCODE_WRITE_DEFAULT_LINK_POLICY_SETTINGS,
+            "Write Default Link Policy Settings",
+        )?;
+        eprintln!("[AokieRadio] diagnostic: default link policy {policy:#06x}");
+    }
 
     let deadline = Instant::now() + duration;
     let mut events = Vec::new();
@@ -293,10 +325,13 @@ pub fn listen_controller(
             Ok(packet) => {
                 let event = hci::parse_typed_event(&packet)
                     .map_err(|e| format!("HCI event parse error: {}", e))?;
+                // (each as it comes: a listening cut short still shows what came)
+                eprintln!("[AokieRadio] diagnostic event: {event:?}");
                 let action = handle_diagnostic_hci_event(&transport, pairing_store, &event)?;
                 events.push(event_record(event, action));
             }
-            Err(e) if is_timeout_error(&e) => break,
+            // (a quiet tick: the deadline is looked at again; it ended the listening at the first 100 ms with no event)
+            Err(e) if is_timeout_error(&e) => continue,
             Err(e) => return Err(e),
         }
     }
@@ -364,7 +399,8 @@ pub fn listen_acl_controller(
                         .map(hfp_event_record),
                 );
             }
-            Err(e) if is_timeout_error(&e) => break,
+            // (a quiet tick, as for the events above: listening goes on to the deadline)
+            Err(e) if is_timeout_error(&e) => continue,
             Err(e) => return Err(e),
         }
     }
@@ -694,7 +730,7 @@ pub(crate) fn initialize_transport(
     )?;
     command_status(
         transport,
-        &hci::write_default_link_policy_settings_command(AOKIE_LINK_POLICY),
+        &hci::write_default_link_policy_settings_command(link_policy_for(&version)),
         hci::OPCODE_WRITE_DEFAULT_LINK_POLICY_SETTINGS,
         "Write Default Link Policy Settings",
     )?;
@@ -756,7 +792,7 @@ pub(crate) fn initialize_transport(
         local_name: AOKIE_CLASSIC_NAME.to_string(),
         class_of_device: AOKIE_CLASS_OF_DEVICE,
         page_timeout: AOKIE_PAGE_TIMEOUT,
-        link_policy: AOKIE_LINK_POLICY,
+        link_policy: link_policy_for(&version),
         voice_setting: AOKIE_VOICE_SETTING,
         scan_enable: AOKIE_SCAN_ENABLE_CONNECTABLE,
         simple_pairing_enabled: true,
@@ -1511,6 +1547,18 @@ mod tests {
         assert_eq!(AOKIE_SCO_TX_TONE_AMPLITUDE, 4_000);
         assert_eq!(AOKIE_HFP_AUTO_ANSWER_ENV, "AOKIE_RADIO_AUTO_ANSWER");
     }
+    #[test]
+    fn a_realtek_controller_refuses_role_switches_and_a_broadcom_keeps_them() {
+        // (the RTL8822BU lost every link a phone switched roles on; the BCM20702 carried calls with them allowed)
+        let realtek = hci::LocalVersion { hci_version: 8, hci_revision: 0xab6b, lmp_pal_version: 8, manufacturer_name: 93, lmp_pal_subversion: 0x705c };
+        let broadcom = hci::LocalVersion { manufacturer_name: 0x000f, ..realtek };
+        assert_eq!(link_policy_for(&realtek), 0x0004);
+        assert_eq!(link_policy_for(&realtek) & hci::LINK_POLICY_ROLE_SWITCH, 0, "no role switch on a Realtek");
+        assert_eq!(link_policy_for(&broadcom), AOKIE_LINK_POLICY);
+        assert_eq!(hci::create_connection_command_for("02:5A:1C:44:55:66", false).unwrap()[15], 0, "a page offers no switch either");
+        assert_eq!(hci::create_connection_command_for("02:5A:1C:44:55:66", true).unwrap(), hci::create_connection_command_default("02:5A:1C:44:55:66").unwrap());
+    }
+
 
     #[test]
     fn pairing_admission_gate_bonds_only_in_window_but_reconnects_always() {

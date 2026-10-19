@@ -203,7 +203,8 @@ fn duration_arg(
             .map_err(|_| format!("invalid seconds value '{value}'"))?,
         None => default_seconds,
     };
-    Ok(std::time::Duration::from_secs(seconds.clamp(1, 60)))
+    // (five minutes at most: long enough for a person to take a phone through pairing while it listens)
+    Ok(std::time::Duration::from_secs(seconds.clamp(1, 300)))
 }
 
 #[cfg(aokie_radio)]
