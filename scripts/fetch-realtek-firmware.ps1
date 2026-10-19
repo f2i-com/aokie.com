@@ -1,6 +1,7 @@
 # fetch-realtek-firmware.ps1 -Destination DIR: Realtek's RTL8761B (USB) and RTL8822B (the Bluetooth of an RTL8822BU
-# Wi-Fi and Bluetooth adapter) Bluetooth firmware, their configs, and the licence they are redistributed under, from linux-firmware (its official GitLab mirror, at a pinned commit), each
-# checked against its pinned SHA-256. Aokie loads them into an RTL8761B dongle (0bda:8771) at each start
+# Wi-Fi and Bluetooth adapter) Bluetooth firmware, their configs, and the licence they are redistributed under, from
+# linux-firmware (its official GitLab mirror, at a pinned commit), each checked against its pinned SHA-256. Aokie loads
+# them into an RTL8761B dongle (0bda:8771) or an RTL8822BU adapter at each start
 # (crates/aokie-bluetooth/src/aokie_radio/realtek.rs): on its ROM alone such a dongle takes Aokie's settings and is
 # seen by no phone. The bundle carries them in firmware/rtl_bt/, beside the plugin's program, where the loader looks.
 # The licence (Realtek's: redistribution of the unmodified binary, its notice kept) goes with them.

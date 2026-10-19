@@ -421,7 +421,10 @@ key OAIY's Mac build uses), on GitHub, in the repository's Settings:
    and the notary's App Store Connect API key: `APPLE_API_KEY_P8` (the .p8's
    text), `APPLE_API_KEY_ID` and `APPLE_API_ISSUER`. Without the last three the
    programs are signed but not notarised, which the job warns of.
-3. Variables (Actions): `MAC_SIGNING` set to `on`. Until then `sign-macos` is
+3. Variables (Actions), on the Repository variables tab: `MAC_SIGNING` set to
+   `on`. A repository variable, not one of the environment's: whether
+   `sign-macos` runs is decided before its environment is opened, so a
+   `MAC_SIGNING` kept in `mac-signing` is never seen. Until then `sign-macos` is
    skipped and the bundle is signed ad hoc, as before.
 
 ### What only a Mac can answer

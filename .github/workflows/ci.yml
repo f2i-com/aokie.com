@@ -433,8 +433,8 @@ jobs:
           New-Item -ItemType Directory -Force bundle/driver-package | Out-Null
           Copy-Item drivers/winusb/aokie_winusb_bluetooth.inf bundle/driver-package/
           Copy-Item drivers/winusb/aokie_winusb_bluetooth.cat bundle/driver-package/
-          # Realtek's RTL8761B firmware, its config and their licence, pinned: Aokie loads them into such a dongle at each
-          # start (realtek.rs), which a phone does not see on its ROM alone
+          # Realtek's RTL8761B and RTL8822B firmware, their configs and their licence, pinned: Aokie loads them into such a
+          # dongle at each start (realtek.rs), which a phone does not see on its ROM alone
           ./scripts/fetch-realtek-firmware.ps1 -Destination bundle/firmware/rtl_bt
           ./scripts/verify-bundle-assets.ps1 -Bundle bundle -DriverPackage
 
@@ -627,8 +627,8 @@ jobs:
           Copy-Item crates/aokie-plugin/manifest.json bundle/
           Copy-Item crates/aokie-plugin/definitions bundle/definitions -Recurse
           Copy-Item crates/aokie-plugin/ui bundle/ui -Recurse
-          # Realtek's RTL8761B firmware, its config and their licence, pinned: Aokie loads them into such a dongle at each
-          # start (realtek.rs), which a phone does not see on its ROM alone
+          # Realtek's RTL8761B and RTL8822B firmware, their configs and their licence, pinned: Aokie loads them into such a
+          # dongle at each start (realtek.rs), which a phone does not see on its ROM alone
           ./scripts/fetch-realtek-firmware.ps1 -Destination bundle/firmware/rtl_bt
           # (no driver-package/: this flavour renders and signs the selected dongle's INF on the PC)
           ./scripts/verify-bundle-assets.ps1 -Bundle bundle
@@ -1078,6 +1078,10 @@ jobs:
     name: attach the macOS bundle to the release
     runs-on: ubuntu-latest
     needs: [package-macos, plugin-release, plugin-release-managed-beta]
+    # One at a time with publish-linux: each reads the release's notes and writes them back with its paragraph, and
+    # the two are ready at the same moment (both wait for the Windows job), so together one paragraph could be lost.
+    concurrency:
+      group: release-notes-${{ github.run_id }}
     if: >-
       always() && needs.package-macos.result == 'success' && (
         (github.ref_type == 'tag' && (needs.plugin-release.result == 'success' || needs.plugin-release-managed-beta.result == 'success'))
@@ -1260,6 +1264,9 @@ jobs:
     name: attach the Linux bundle to the release
     runs-on: ubuntu-latest
     needs: [plugin-release-linux, plugin-release, plugin-release-managed-beta]
+    # One at a time with publish-macos (above: both rewrite the release's notes).
+    concurrency:
+      group: release-notes-${{ github.run_id }}
     if: >-
       always() && needs.plugin-release-linux.result == 'success' && (
         (github.ref_type == 'tag' && (needs.plugin-release.result == 'success' || needs.plugin-release-managed-beta.result == 'success'))
