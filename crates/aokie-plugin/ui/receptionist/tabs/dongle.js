@@ -140,11 +140,14 @@
     return hex(d.vid) + ':' + hex(d.pid);
   }
 
-  /** The chip in each dongle of Aokie's catalog (aokie-core's dongle_catalog.rs). */
+  /** The chip in each dongle of Aokie's catalog (aokie-core's dongle_catalog.rs), and in the adapters Aokie loads
+   *  firmware for that the catalog does not list (aokie-bluetooth's realtek.rs): on a Mac or Linux every controller
+   *  is listed as "USB Bluetooth controller", so the chip is what tells them apart. */
   var CHIPS = {
     '0a5c:21e8': 'Broadcom BCM20702',
     '0a5c:21ec': 'Broadcom BCM20702',
     '0bda:8771': 'Realtek RTL8761B',
+    '0bda:b82c': 'Realtek RTL8822BU',
     '0a12:0001': 'CSR8510 A10',
   };
 
@@ -889,7 +892,7 @@
       (inUse(d) ? '<span class="rcp-badge is-ok">in use</span>' : '') +
       (d.matchesCatalog
         ? '<span class="rcp-badge ' + (tier === 'certified' ? 'is-ok' : 'is-neutral') + '">' + (tier ? esc(tier) : 'supported') + '</span>'
-        : '<span class="rcp-badge is-neutral">unknown chipset</span>') +
+        : '<span class="rcp-badge is-neutral">' + (CHIPS[hexKey(d)] ? 'not in the catalog' : 'unknown chipset') + '</span>') +
       (leftToSystem(d)
         ? '<span class="rcp-badge is-neutral">left to the system</span>'
         : accessNeeded(d)
@@ -1173,7 +1176,7 @@
     reportProgress();
     var setup = setupActive();
     if (setup && builtInTransport()) {
-      root.innerHTML = builtInHtml();
+      U.setHtml(root, builtInHtml());
       return;
     }
     var body;
@@ -1183,8 +1186,9 @@
     else body = doneStepHtml();
 
     // In OAIY's wizard the step's own heading says what this is: the card holds the radio's state, the
-    // steps and the step open, its buttons last.
-    root.innerHTML =
+    // steps and the step open, its buttons last. (Drawn by U.setHtml: nothing when it is unchanged, and the
+    // control in use keeps focus when it is not; each poll of a job or of the radio drew it anew.)
+    U.setHtml(root,
       '<section class="rcp-card rcp-dongle">' +
       (setup
         ? ''
@@ -1216,7 +1220,7 @@
             'to give the dongle back to Windows (BTHUSB).</p>') +
       '</section>' +
       // Recovery for a working receptionist, not part of setting one up.
-      (setup ? '' : resetCardHtml());
+      (setup ? '' : resetCardHtml()));
   }
 
   /** The "Reset the dongle" card: software recovery without unplugging. */

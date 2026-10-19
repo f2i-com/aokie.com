@@ -186,17 +186,28 @@ assert.equal(rootClasses.has('rcp-no-nav'), false);
 oaiyStatus = { voice: null, llm: { running: false, state: null, resident: null } };
 await app.refreshOaiyStatus();
 assert.match(element('settings-body').innerHTML, /Chosen in Hours &amp; Services/);
-assert.match(element('settings-body').innerHTML, /engines stopped/);
+assert.match(element('settings-body').innerHTML, /Engines stopped/);
 failed = true;
 await app.refreshOaiyStatus();
 failed = false;
 assert.match(element('settings-body').innerHTML, /Loaded in Engines/);
 sources = [{ ...sources[0], status: 'stopped', url: null }];
 await app.refreshSources();
-assert.match(element('readiness').innerHTML, /OAIY Voice is stopped/);
+assert.match(element('readiness').innerHTML, /OAIY Voice is stopped: OAIY starts it when a call rings/);
+// A stopped OAIY Voice is how it rests between calls (OAIY starts it when one
+// rings): no fault, and not "start it in Services". One that stopped with an
+// error, or is still being installed, is.
+assert.match(element('readiness').innerHTML, /<div class="rcp-ready is-ok">(?:(?!rcp-ready ).)*OAIY Voice is stopped/s);
+assert.doesNotMatch(element('readiness').innerHTML, /start it in OAIY Services/);
+assert.match(element('settings-body').innerHTML, /Stopped · starts for calls/);
+sources = [{ ...sources[0], status: 'errored', url: null }];
+await app.refreshSources();
+assert.match(element('readiness').innerHTML, /<div class="rcp-ready is-bad">(?:(?!rcp-ready ).)*OAIY Voice is stopped with an error/s);
+sources = [{ ...sources[0], status: 'stopped', url: null }];
+await app.refreshSources();
 snapshot.lastHealth.components.responder.realtimeError = 'gateway refused';
 await app.refreshSnapshot();
-assert.match(element('readiness').innerHTML, /last call: gateway refused/);
+assert.match(element('readiness').innerHTML, /Last call: gateway refused/);
 payloads['settings.get'] = { settings: { ...oaiyBag, realtimeVoiceEndpoint: 'ws://127.0.0.1:17872/api/ai/providers/openai/v1/realtime/stream' } };
 delete snapshot.lastHealth.components.responder.realtimeError;
 await app.refreshSettings();

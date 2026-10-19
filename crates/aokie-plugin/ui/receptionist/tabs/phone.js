@@ -51,6 +51,13 @@
     return m + ':' + (s < 10 ? '0' : '') + s;
   }
 
+  /** The pairing window's time left, in the markup render() compares: each
+   *  2 s poll changes only this, and it is written into the spans in place
+   *  rather than the tab drawn anew (which dropped keyboard focus from Stop
+   *  pairing and Codes match, and a click pressed as the poll landed). */
+  var COUNTDOWN = '\u2063countdown\u2063';
+  var COUNTDOWN_HTML = '<span data-countdown>' + COUNTDOWN + '</span>';
+
   // ---- state (module-level — survives tab switches) -----------------------
 
   var root = null;
@@ -525,9 +532,9 @@
       // the actual pairing dialog and the code confirmation.
       var windowCopy =
         transportMode === 'dongle'
-          ? 'Phones nearby can see “Aokie AI Assistant” for <strong>' + esc(formatSeconds(secondsLeft)) + '</strong> more. ' +
+          ? 'Phones nearby can see “Aokie AI Assistant” for <strong>' + COUNTDOWN_HTML + '</strong> more. ' +
             'On your phone: Bluetooth › Pair new device › Aokie AI Assistant, then confirm the matching code here.'
-          : 'This PC can be found by nearby phones for <strong>' + esc(formatSeconds(secondsLeft)) + '</strong> more. ' +
+          : 'This PC can be found by nearby phones for <strong>' + COUNTDOWN_HTML + '</strong> more. ' +
             'Finish the pairing in Windows Settings › Bluetooth &amp; devices › Add device; Windows shows the code to confirm.';
       return (
         '<div class="rcp-card__body">' +
@@ -650,11 +657,11 @@
               '</div>'
             : '') +
           (forgetArm === addr
-            ? '<div class="rcp-confirm is-danger">' +
+            ? '<div class="rcp-confirm is-danger" role="group" aria-label="Forget this phone">' +
               '<p><strong>Forget ' + esc(d.name || 'this phone') + '?</strong> It cannot reconnect until you pair it again.</p>' +
               '<div class="rcp-actions">' +
               '<button type="button" class="rcp-button is-danger" data-act="ph-forget-confirm" data-addr="' + esc(addr) + '"' + (busy ? ' disabled' : '') + '>Forget phone</button>' +
-              '<button type="button" class="rcp-button" data-act="ph-forget-cancel">Cancel</button>' +
+              '<button type="button" class="rcp-button" data-act="ph-forget-cancel" data-addr="' + esc(addr) + '">Cancel</button>' +
               '</div>' +
               '</div>'
             : '') +
@@ -702,7 +709,7 @@
       (statusError
         ? '<span class="rcp-pill is-warn"><i></i>Unknown</span>'
         : secondsLeft > 0
-        ? '<span class="rcp-pill is-warn"><i></i>' + esc(formatSeconds(secondsLeft)) + ' left</span>'
+        ? '<span class="rcp-pill is-warn"><i></i>' + COUNTDOWN_HTML + ' left</span>'
         : connected
           ? '<span class="rcp-pill is-ok"><i></i>Connected</span>'
           : '') +
@@ -717,7 +724,11 @@
       '<h3>' +
       (bondedError
         ? U.radioDownReason(bondedError) !== null ? 'Not known yet' : 'Paired phones unavailable'
-        : known ? bonded.length + ' phone' + (bonded.length === 1 ? '' : 's') + ' paired' : 'Checking paired phones…') +
+        : !known
+          ? 'Checking paired phones…'
+          : bonded.length === 0
+            ? 'No phones paired'
+            : bonded.length + ' phone' + (bonded.length === 1 ? '' : 's') + ' paired') +
       '</h3>' +
       '</div>' +
       '</div>' +
@@ -725,9 +736,17 @@
       '<p class="rcp-footnote">Forget unpairs a phone: it must be paired again before it can reconnect. ' +
       'Phones still paired reconnect by themselves.</p>' +
       '</section>';
-    if (html === lastHtml) return;
-    lastHtml = html;
-    root.innerHTML = html;
+    var left = esc(formatSeconds(secondsLeft));
+    if (html !== lastHtml) {
+      lastHtml = html;
+      // (drawn anew: the control in use keeps focus, U.setHtml)
+      U.setHtml(root, html.split(COUNTDOWN).join(left));
+      return;
+    }
+    var spans = root.querySelectorAll ? root.querySelectorAll('[data-countdown]') : [];
+    for (var i = 0; i < spans.length; i++) {
+      if (spans[i].textContent !== left) spans[i].textContent = left;
+    }
   }
 
   // ---- wiring -------------------------------------------------------------
@@ -756,10 +775,13 @@
       } else if (act === 'ph-forget') {
         forgetArm = btn.getAttribute('data-addr');
         render();
+        focusIn('[data-act="ph-forget-cancel"]');
       } else if (act === 'ph-forget-confirm') doForget(btn.getAttribute('data-addr'));
       else if (act === 'ph-forget-cancel') {
+        var unforgotten = btn.getAttribute('data-addr');
         forgetArm = null;
         render();
+        focusIn('[data-act="ph-forget"][data-addr="' + String(unforgotten || '').replace(/["\\]/g, '\\$&') + '"]');
       }
     });
   }

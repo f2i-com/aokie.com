@@ -147,7 +147,14 @@
   // the focused control (by its data-* name or id), its caret and its scroll,
   // and put them back on the new one.
 
-  var FOCUS_KEYS = ['data-key', 'data-bool', 'data-num', 'data-scope', 'data-act', 'id'];
+  var FOCUS_KEYS = ['data-key', 'data-bool', 'data-num', 'data-scope', 'data-pick', 'data-act', 'data-tabgo', 'data-nav', 'id'];
+  /** What tells one row's control from the same control in the next row
+   *  (every phone row has its own Reconnect): added to the name above. */
+  var FOCUS_ROW_KEYS = ['data-addr', 'data-id', 'data-thumb', 'data-card'];
+
+  function attrSel(name, value) {
+    return '[' + name + '="' + String(value).replace(/["\\]/g, '\\$&') + '"]';
+  }
 
   /** Where focus is inside `root`, or null when it is not there. */
   function focusOf(root) {
@@ -156,7 +163,12 @@
     for (var i = 0; i < FOCUS_KEYS.length; i++) {
       var v = a.getAttribute && a.getAttribute(FOCUS_KEYS[i]);
       if (!v) continue;
-      var at = { sel: '[' + FOCUS_KEYS[i] + '="' + String(v).replace(/["\\]/g, '\\$&') + '"]' };
+      var sel = attrSel(FOCUS_KEYS[i], v);
+      for (var r = 0; r < FOCUS_ROW_KEYS.length; r++) {
+        var row = a.getAttribute(FOCUS_ROW_KEYS[r]);
+        if (row) sel += attrSel(FOCUS_ROW_KEYS[r], row);
+      }
+      var at = { sel: sel };
       try {
         if (typeof a.selectionStart === 'number') {
           at.start = a.selectionStart;
@@ -201,12 +213,23 @@
     return !a || a === document.body || a === document.documentElement || (!!root && a === root);
   }
 
+  /** How long a control that could not take focus back at once (a button
+   *  disabled while its command runs) waits for it at the next drawings. */
+  var HOLD_FOCUS_MS = 8000;
+
   /** innerHTML with a change guard so a poll re-render never resets hover
-   *  states or rebuilds identical DOM every tick. */
+   *  states or rebuilds identical DOM every tick. When it does draw anew, the
+   *  control in use there keeps focus (a keyboard user's place was lost to
+   *  each poll that changed a word); one disabled for the moment gets it back
+   *  at a later drawing, if focus has gone nowhere else meanwhile. */
   function setHtml(el, html) {
     if (el.__rcpHtml === html) return;
+    var held = el.__rcpHeld && Date.now() - el.__rcpHeld.t < HOLD_FOCUS_MS ? el.__rcpHeld : null;
+    var at = focusOf(el) || (held && focusLost(el) ? held.at : null);
     el.__rcpHtml = html;
     el.innerHTML = html;
+    el.__rcpHeld = null;
+    if (at && !restoreFocus(el, at)) el.__rcpHeld = { at: at, t: held && held.at === at ? held.t : Date.now() };
   }
 
   function setPill(pillEl, textEl, cls, text) {
@@ -291,6 +314,22 @@
     return null;
   }
 
+  /** How OAIY Voice stands for calls: { down, words, note }. A stopped OAIY
+   *  Voice is no fault: OAIY starts it as a call rings (or uses another
+   *  computer's, on OAIY Network), so calls are still answered. One that
+   *  stopped with an error is tried again the same way, but may fail again;
+   *  one being installed cannot answer until it is. `down`: worth fixing
+   *  before the next call. */
+  function voiceState(voice) {
+    var status = voice ? String(voice.status || '') : '';
+    if (status === 'running') return { down: false, words: 'running', note: '' };
+    if (status === 'stopped') return { down: false, words: 'stopped', note: 'OAIY starts it when a call rings' };
+    if (status === 'starting') return { down: false, words: 'starting', note: '' };
+    if (status === 'installing') return { down: true, words: 'being installed', note: 'calls are answered once it is' };
+    if (status === 'errored') return { down: true, words: 'stopped with an error', note: 'OAIY tries it again when a call rings; its log is in Services' };
+    return { down: false, words: status || 'unknown', note: '' };
+  }
+
   /** The voice chosen for calls and the engines' language model, from the
    *  host (PluginHost.oaiyStatus, OAIY Desktop 52a5a6a and later). Resolves
    *  null on an older host or a failed read, so callers show a pointer. */
@@ -310,8 +349,8 @@
   function modelText(status) {
     var llm = status && status.llm;
     if (!llm) return '';
-    if (!llm.running) return 'engines stopped';
-    if (!llm.resident) return llm.state ? 'no model loaded · ' + llm.state : '';
+    if (!llm.running) return 'Engines stopped';
+    if (!llm.resident) return llm.state ? 'No model loaded · ' + llm.state : '';
     return llm.resident + (llm.state ? ' · ' + llm.state : '');
   }
 
@@ -333,6 +372,7 @@
     realtimeProviderId: realtimeProviderId,
     callRoute: callRoute,
     voiceService: oaiyVoiceService,
+    voiceState: voiceState,
     readStatus: readOaiyStatus,
     modelText: modelText,
     voiceText: voiceText,
@@ -1216,7 +1256,7 @@
         var radioHealth = health.components.radio;
         var realtime = radioHealth && radioHealth.voiceRuntime && radioHealth.voiceRuntime.realtime;
         var lastError = responder.realtimeError || (realtime && realtime.error) || '';
-        var failure = lastError ? 'last call: ' + lastError : '';
+        var failure = lastError ? 'Last call: ' + lastError : '';
         var bag = state.settings && state.settings.settings;
         var toOaiy = OAIY.realtimeProviderId(bag && bag.realtimeVoiceEndpoint) === OAIY.providerId;
         if (!toOaiy) {
@@ -1230,19 +1270,25 @@
           });
           return;
         }
-        // OAIY Voice hears and speaks for every call; without it the Front
-        // desk cannot answer. Unknown (no source list) is not a failure.
+        // OAIY Voice hears and speaks for every call. OAIY starts it for a
+        // call that rings, so only one that cannot start (being installed,
+        // or stopped with an error) is a fault; unknown (no source list) is
+        // not one either.
         var voice = state.sources ? OAIY.voiceService(state.sources) : null;
-        var voiceDown = !!voice && voice.status !== 'running';
+        var vs = voiceState(voice);
         items.push({
           icon: ICONS.server,
           label: label,
           value: 'OAIY Front desk',
           note:
             failure ||
-            (voiceDown ? 'OAIY Voice is ' + voice.status + ' — start it in OAIY Services' : '') ||
-            (voice ? 'OAIY Voice running · the Front desk agent replies' : 'The Front desk agent replies through OAIY'),
-          ok: failure || voiceDown ? false : voice ? true : null,
+            (voice && vs.words !== 'running'
+              ? 'OAIY Voice is ' + vs.words + (vs.note ? ': ' + vs.note : '')
+              : voice
+                ? 'OAIY Voice running · the Front desk agent replies'
+                : 'The Front desk agent replies through OAIY'),
+          // (one starting, or in a state this screen does not know, is neither)
+          ok: failure || vs.down ? false : voice && (voice.status === 'running' || voice.status === 'stopped') ? true : null,
         });
         return;
       }
@@ -1780,7 +1826,9 @@
     if (state.sources === null) return 'Unknown';
     var voice = OAIY.voiceService(state.sources);
     if (!voice) return 'Not installed';
-    return voice.status === 'running' ? 'Running' : voice.status.charAt(0).toUpperCase() + voice.status.slice(1);
+    var words = voiceState(voice).words;
+    // (stopped is how it rests between calls: OAIY starts it when one rings)
+    return words.charAt(0).toUpperCase() + words.slice(1) + (voice.status === 'stopped' ? ' · starts for calls' : '');
   }
 
   function renderSettings() {

@@ -499,15 +499,6 @@
     );
   }
 
-  /** OAIY Voice's state, live from the host's source list. */
-  function oaiyVoiceText() {
-    if (sources === undefined) return 'checking';
-    if (sources === null) return 'unknown — the source list could not be read';
-    var voice = OAIY.voiceService(sources);
-    if (!voice) return 'not installed on this computer';
-    return voice.status === 'running' ? 'running' : voice.status + ' — start it in OAIY Services';
-  }
-
   /** One section of the form, drawn as a dashboard card. */
   function section(title, inner, extraClass) {
     return (
@@ -524,7 +515,7 @@
     if (label === 'Voice on calls') return OAIY.voiceText(oaiyStatus);
     if (label === 'Speech') {
       var voice = sources ? OAIY.voiceService(sources) : null;
-      return voice ? 'OAIY Voice ' + voice.status : '';
+      return voice ? 'OAIY Voice ' + OAIY.voiceState(voice).words : '';
     }
     return '';
   }
@@ -534,13 +525,15 @@
     var route = OAIY.callRoute(baseline);
     var html = [];
     if (route === 'oaiy') {
+      // (a stopped OAIY Voice is no fault: OAIY starts it when a call rings)
       var voice = sources ? OAIY.voiceService(sources) : null;
-      var voiceDown = !!voice && voice.status !== 'running';
+      var vs = OAIY.voiceState(voice);
+      var voiceDown = !!voice && vs.down;
       html.push(
         '<p class="rcp-notice' + (voiceDown ? ' rcp-notice--warn' : ' rcp-notice--ok') + '" role="status">' +
           '<strong>Calls go to OAIY.</strong> Aokie streams each call to OAIY Desktop on this computer. ' +
           'OAIY Voice hears the caller and speaks the replies; the Front desk agent writes them.' +
-          (voiceDown ? ' OAIY Voice is ' + esc(voice.status) + ': start it in ' + U.navLink('services', 'Services') + '.' : '') +
+          (voiceDown ? ' OAIY Voice is ' + esc(vs.words) + ': see it in ' + U.navLink('services', 'Services') + '.' : '') +
           '</p>'
       );
     } else {
@@ -836,8 +829,16 @@
       // for advanced use, but Windows 11 25H2 removed the OS hands-free
       // service — native mode cannot carry call audio there, so the mode is
       // pinned to the dongle in the UI rather than offered as a choice that
-      // silently breaks calls.
-      hint('Phone connection: Aokie USB dongle.') +
+      // silently breaks calls. (A mode set to it outside this screen is said
+      // as it is: "Aokie USB dongle" read over a dongle that is not used.)
+      hint(
+        settings.transportMode === 'native'
+          ? 'Phone connection: this computer’s own Bluetooth (set outside this screen).' +
+            (ON_WINDOWS ? ' It carries no call audio on Windows 11 25H2 and later.' : '')
+          : settings.transportMode === 'auto'
+            ? 'Phone connection: the Aokie USB dongle when one is plugged in, else this computer’s own Bluetooth.'
+            : 'Phone connection: Aokie USB dongle.'
+      ) +
         // Dongle-only hardware knobs — meaningless on the native Windows
         // Bluetooth transport, so they hide (in place, order preserved)
         // unless the mode is dongle.

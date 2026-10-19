@@ -355,12 +355,22 @@
     );
   }
 
+  /** Draw a zone: nothing when it is unchanged, and the control in use
+   *  keeps focus when it is not (U.setHtml). */
   function setZone(id, html) {
     var el = root && root.querySelector('#' + id);
     if (!el) return;
-    if (el.__cmpHtml === html) return;
-    el.__cmpHtml = html;
-    el.innerHTML = html;
+    U.setHtml(el, html);
+  }
+
+  /** Focus `sel` in the tab once it is drawn again (an inline confirm opened or closed). */
+  function focusIn(sel) {
+    var el = root && root.querySelector ? root.querySelector(sel) : null;
+    if (el && typeof el.focus === 'function') el.focus();
+  }
+
+  function quoted(v) {
+    return String(v || '').replace(/["\\]/g, '\\$&');
   }
 
   function renderOffer() {
@@ -472,12 +482,12 @@
             '<button type="button" class="rcp-button is-small is-primary" data-act="cmp-approve-arm" data-id="' + esc(p.id) + '"' + (busy || approveArm === p.id ? ' disabled' : '') + '>Approve…</button>' +
             '</span>' +
             (approveArm === p.id
-              ? '<div class="rcp-confirm">' +
+              ? '<div class="rcp-confirm" role="group" aria-label="Approve this Companion app">' +
                 '<p><strong>Approve ' + esc(p.displayName) + '?</strong> Check the Companion shows this same fingerprint first:</p>' +
                 '<code class="rcp-code">' + esc(p.fingerprint) + '</code>' +
                 '<div class="rcp-actions">' +
                 '<button type="button" class="rcp-button is-primary" data-act="cmp-approve" data-id="' + esc(p.id) + '"' + (busy ? ' disabled' : '') + '>They match — approve</button>' +
-                '<button type="button" class="rcp-button" data-act="cmp-approve-cancel">Cancel</button>' +
+                '<button type="button" class="rcp-button" data-act="cmp-approve-cancel" data-id="' + esc(p.id) + '">Cancel</button>' +
                 '</div>' +
                 '</div>'
               : '') +
@@ -507,12 +517,12 @@
             '<button type="button" class="rcp-button is-small is-danger" data-act="cmp-revoke-arm" data-thumb="' + esc(thumb) + '"' + (busy || revokeArm === thumb ? ' disabled' : '') + '>Remove…</button>' +
             '</span>' +
             (revokeArm === thumb
-              ? '<div class="rcp-confirm is-danger">' +
+              ? '<div class="rcp-confirm is-danger" role="group" aria-label="Remove this Companion app">' +
                 '<p><strong>Remove ' + esc(m.displayName) + '?</strong> It is cut off at once, from a call too, ' +
                 'and can only connect again once it is paired and approved again.</p>' +
                 '<div class="rcp-actions">' +
                 '<button type="button" class="rcp-button is-danger" data-act="cmp-revoke" data-thumb="' + esc(thumb) + '"' + (busy ? ' disabled' : '') + '>Remove app</button>' +
-                '<button type="button" class="rcp-button" data-act="cmp-revoke-cancel">Cancel</button>' +
+                '<button type="button" class="rcp-button" data-act="cmp-revoke-cancel" data-thumb="' + esc(thumb) + '">Cancel</button>' +
                 '</div>' +
                 '</div>'
               : '') +
@@ -540,7 +550,7 @@
       '<button type="button" class="rcp-button is-danger" data-act="cmp-rotate-arm"' + (rotateDisabled || rotateOpen ? ' disabled' : '') + '>New key…</button>' +
       '</div>' +
       (rotateOpen
-        ? '<div class="rcp-confirm is-danger">' +
+        ? '<div class="rcp-confirm is-danger" role="group" aria-label="Make a new key for this computer">' +
           '<p><strong>Make a new key for this computer?</strong> Every approved Companion app is removed here, ' +
           'and each must be paired and approved again: the old key is not handed on.</p>' +
           '<p>Type <strong>ROTATE</strong> to confirm:</p>' +
@@ -555,6 +565,11 @@
           '</div>'
         : '');
     setZone('cmp-rotate', rotHtml);
+    // (the typed word is not in the markup: put back where the zone was drawn anew)
+    var typed = root.querySelector('#cmp-rotate-text');
+    if (typed && typed.value !== rotateText) typed.value = rotateText;
+    var rotateBtn = root.querySelector('[data-act="cmp-rotate"]');
+    if (rotateBtn) rotateBtn.disabled = !(rotateText.trim().toLowerCase() === 'rotate' && !busy);
   }
 
   // ---- wiring -------------------------------------------------------------
@@ -599,26 +614,33 @@
       else if (act === 'cmp-approve-arm') {
         approveArm = btn.getAttribute('data-id');
         renderDynamic();
+        // (focus to the confirm: the button pressed is disabled while it is open)
+        focusIn('[data-act="cmp-approve-cancel"]');
       } else if (act === 'cmp-approve') approve(btn.getAttribute('data-id'));
       else if (act === 'cmp-approve-cancel') {
         approveArm = null;
         renderDynamic();
+        focusIn('[data-act="cmp-approve-arm"][data-id="' + quoted(btn.getAttribute('data-id')) + '"]');
       } else if (act === 'cmp-revoke-arm') {
         revokeArm = btn.getAttribute('data-thumb');
         renderDynamic();
+        focusIn('[data-act="cmp-revoke-cancel"]');
       } else if (act === 'cmp-revoke') revoke(btn.getAttribute('data-thumb'));
       else if (act === 'cmp-revoke-cancel') {
         revokeArm = null;
         renderDynamic();
+        focusIn('[data-act="cmp-revoke-arm"][data-thumb="' + quoted(btn.getAttribute('data-thumb')) + '"]');
       } else if (act === 'cmp-rotate-arm') {
         rotateOpen = true;
         rotateText = '';
         renderDynamic();
+        focusIn('#cmp-rotate-text');
       } else if (act === 'cmp-rotate') rotate();
       else if (act === 'cmp-rotate-cancel') {
         rotateOpen = false;
         rotateText = '';
         renderDynamic();
+        focusIn('[data-act="cmp-rotate-arm"]');
       }
     });
   }

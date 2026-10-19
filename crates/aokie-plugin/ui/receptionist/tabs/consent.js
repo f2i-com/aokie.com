@@ -828,6 +828,9 @@
         wizardOpen = false;
         callWarned = false;
         render();
+        // (the form and its Close are gone: focus to the button that opens it again)
+        var toggle = root && root.querySelector ? root.querySelector('[data-act="cns-toggle"]') : null;
+        if (toggle && U.focusLost(root)) toggle.focus();
       } else if (act === 'cns-accept') accept();
     });
     el.addEventListener('change', function (e) {

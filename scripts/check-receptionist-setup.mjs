@@ -1080,6 +1080,26 @@ const normalPayloads = (listedFn, extra = {}) => ({
   assert.match(page.el('tab-dongle').innerHTML, /phones do not see it when pairing/);
 }
 
+{
+  // Review 2026-10-19 (0.0.4): on a Mac every controller is listed as "USB Bluetooth controller"; the RTL8822BU
+  // adapter (Wi-Fi and Bluetooth), whose firmware Aokie loads but the catalog does not list, is named by its chip
+  // and not called an unknown chipset.
+  const page = await openScreen({
+    setup: setupStub({ mode: 'setup', step: 'dongle', view: 'dongle' }),
+    payloads: {
+      'settings.get': { settings: {} },
+      'dongle.diagnostics': radioDown,
+      'dongle.list': {
+        connected: [{ vid: 0x0bda, pid: 0xb82c, vidHex: '0x0BDA', pidHex: '0xB82C', description: 'USB Bluetooth controller', matchesCatalog: false, driverBound: true }],
+        driverModel: 'none',
+      },
+    },
+  });
+  assert.match(page.el('tab-dongle').innerHTML, /Realtek RTL8822BU/);
+  assert.match(page.el('tab-dongle').innerHTML, /not in the catalog/);
+  assert.doesNotMatch(page.el('tab-dongle').innerHTML, /unknown chipset/);
+}
+
 // ---- small guards: the restart button, the consent form's call warning ----------------
 
 /** Run a tab's click listeners for `act` now, without waiting between (two presses in one go). */
