@@ -1630,6 +1630,19 @@ fn audio_moved_to_handset(reason: u8, call_up: bool) -> bool {
     call_up && reason == 0x13
 }
 
+/// A controller that reports a Hardware Error has reset itself: its links are gone, its scan and event settings with
+/// them, and a Realtek is back on its ROM, which no phone sees. The event was ignored, and Aokie went on reading a
+/// controller no phone could reach until the plugin restarted. Now, where its scan setting reads back off (Aokie never
+/// turns it off; a reset does), the run ends with an error and the supervisor reopens the dongle and sets it up again
+/// (its firmware loaded again where it is gone), as Linux resets a controller that reports one. The code it gave, for
+/// the event that is one.
+fn hardware_error_code(event: &hci::HciEvent) -> Option<u8> {
+    match event {
+        hci::HciEvent::Unknown { event_code: hci::EVENT_HARDWARE_ERROR, params } => Some(params.first().copied().unwrap_or(0)),
+        _ => None,
+    }
+}
+
 /// Before `run_runtime` returns for a reopen: tell the phone the link is
 /// going (so it reconnects at once instead of waiting out a supervision
 /// timeout) and release an armed SCO ring. Best effort — the stream may be
@@ -3405,6 +3418,27 @@ fn run_runtime(
                         continue;
                     }
                 };
+                if let Some(code) = hardware_error_code(&event) {
+                    match manager::read_scan_enable(&transport) {
+                        Ok(scan) if scan != 0 => {
+                            eprintln!(
+                                "[AokieRadio] the dongle's controller reported a hardware error (code {code:#04x}) but kept its settings (scan_enable {scan:#04x}): going on"
+                            );
+                            continue;
+                        }
+                        read => {
+                            let error = format!("the dongle's controller reported a hardware error (code {code:#04x}) and reset itself");
+                            eprintln!(
+                                "[AokieRadio] {error} ({}): closing the dongle to open it and set it up again",
+                                match read {
+                                    Ok(_) => "its scan setting is off".to_string(),
+                                    Err(e) => format!("its scan setting could not be read: {e}"),
+                                }
+                            );
+                            return Err(error);
+                        }
+                    }
+                }
                 // Review 1 #6: Aokie serves one phone at a time. A second
                 // phone's link accepted beside the first took over the ACL
                 // handle (the first phone's packets then read as corrupt) and
@@ -3862,8 +3896,17 @@ fn run_runtime(
                                 // without bothering the user. If it fails the
                                 // link keeps working — phone just won't
                                 // auto-page profiles, which is the same
-                                // dead-end we saw before this fix.
+                                // dead-end we saw before this fix. (Not where
+                                // the link policy refuses role switches, a
+                                // Realtek's: its links were lost to a switch,
+                                // and its page offered none.)
+                                let switch_allowed =
+                                    init_report.link_policy & hci::LINK_POLICY_ROLE_SWITCH != 0;
                                 match hci::switch_role_command(address, 0x01) {
+                                    Ok(_) if !switch_allowed => eprintln!(
+                                        "[AokieRadio] auto-reconnect: staying central on {}: this controller refuses role switches",
+                                        super::LogAddr(address)
+                                    ),
                                     Ok(cmd) => match transport.write_command(&cmd) {
                                         Ok(()) => eprintln!(
                                             "[AokieRadio] auto-reconnect: \
@@ -7758,6 +7801,19 @@ mod tests {
         for other in [0x08, 0x15, 0x16, 0x22, 0x3b] {
             assert!(!audio_moved_to_handset(other, true), "reason 0x{other:02x}");
         }
+    }
+
+    /// A controller's Hardware Error is told from the events the parser does not know (a vendor's 0xff), and its code
+    /// kept; the run loop then reads the scan setting back to see whether it reset itself.
+    #[test]
+    fn a_hardware_error_is_told_from_a_vendor_event() {
+        let event = hci::parse_typed_event(&[0x10, 0x01, 0x03]).unwrap();
+        assert_eq!(hardware_error_code(&event), Some(0x03));
+        let vendor = hci::parse_typed_event(&[0xff, 0x02, 0x34, 0x01]).unwrap();
+        assert_eq!(hardware_error_code(&vendor), None);
+        let disconnected = hci::HciEvent::DisconnectionComplete { status: 0, connection_handle: 0x000b, reason: 0x08 };
+        assert_eq!(hardware_error_code(&disconnected), None);
+        assert_eq!(hci::read_scan_enable_command(), [0x19, 0x0c, 0x00]);
     }
 
     /// Review 1 #6: one phone at a time. A second phone waits while another

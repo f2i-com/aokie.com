@@ -839,6 +839,14 @@ pub fn write_scan_enable(transport: &AokieHciTransport, scan_enable: u8) -> Resu
     )
 }
 
+/// The controller's scan setting (HCI Read Scan Enable). Aokie writes connectable, or connectable and discoverable,
+/// never off: off read back is a controller that reset itself.
+pub fn read_scan_enable(transport: &AokieHciTransport) -> Result<u8, String> {
+    let params = transport.command_return_params(&hci::read_scan_enable_command(), hci::OPCODE_READ_SCAN_ENABLE)?;
+    hci::expect_status_ok(&params, "Read Scan Enable")?;
+    params.get(1).copied().ok_or_else(|| "Read Scan Enable returned no setting".to_string())
+}
+
 /// PAIR-001: how the pairing handshake steps are answered. Groups the
 /// AOK-BT-001 window gate with the two authentication policies the audit
 /// added so every call site states its full posture explicitly.

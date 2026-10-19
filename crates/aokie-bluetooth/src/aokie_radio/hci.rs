@@ -50,6 +50,7 @@ pub const OPCODE_SET_EVENT_MASK: u16 = 0x0c01;
 pub const OPCODE_WRITE_LOCAL_NAME: u16 = 0x0c13;
 pub const OPCODE_WRITE_PAGE_TIMEOUT: u16 = 0x0c18;
 pub const OPCODE_WRITE_SCAN_ENABLE: u16 = 0x0c1a;
+pub const OPCODE_READ_SCAN_ENABLE: u16 = 0x0c19;
 pub const OPCODE_WRITE_CLASS_OF_DEVICE: u16 = 0x0c24;
 pub const OPCODE_WRITE_VOICE_SETTING: u16 = 0x0c26;
 pub const OPCODE_WRITE_EXTENDED_INQUIRY_RESPONSE: u16 = 0x0c52;
@@ -108,6 +109,8 @@ pub const EVENT_ENCRYPTION_CHANGE: u8 = 0x08;
 pub const EVENT_REMOTE_NAME_REQUEST_COMPLETE: u8 = 0x07;
 pub const EVENT_COMMAND_COMPLETE: u8 = 0x0e;
 pub const EVENT_COMMAND_STATUS: u8 = 0x0f;
+/// Hardware Error (Core Spec v5.4 Vol 4 Part E §7.7.16): the controller reset itself (parsed as `Unknown`).
+pub const EVENT_HARDWARE_ERROR: u8 = 0x10;
 pub const EVENT_PIN_CODE_REQUEST: u8 = 0x16;
 pub const EVENT_LINK_KEY_REQUEST: u8 = 0x17;
 pub const EVENT_LINK_KEY_NOTIFICATION: u8 = 0x18;
@@ -413,6 +416,10 @@ pub fn read_local_supported_features_command() -> [u8; 3] {
 
 pub fn read_buffer_size_command() -> [u8; 3] {
     command_no_params(OPCODE_READ_BUFFER_SIZE)
+}
+
+pub fn read_scan_enable_command() -> [u8; 3] {
+    command_no_params(OPCODE_READ_SCAN_ENABLE)
 }
 
 pub fn set_event_mask_command(mask: u64) -> [u8; 11] {

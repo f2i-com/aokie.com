@@ -366,7 +366,7 @@ impl AokieHciTransport {
         let device = find_device(bus, address)?;
         let handle = device
             .open()
-            .map_err(|e| format!("libusb open {}: {}{}", path, fmt_err(e), held_hint(e)))?;
+            .map_err(|e| format!("libusb open {}: {}{}", path, fmt_err(e), held_hint(e, false)))?;
 
         // Walk the descriptors once: which interface is HCI (commands,
         // events, ACL), which carries voice, and what each of the voice
@@ -1251,7 +1251,7 @@ fn claim(handle: &rusb::DeviceHandle<GlobalContext>, interface: u8) -> Result<bo
             "libusb claim_interface({}): {}{}",
             interface,
             fmt_err(e),
-            held_hint(e)
+            held_hint(e, was_held)
         ));
     }
     Ok(was_held)
@@ -1442,11 +1442,20 @@ const SYSTEM_HOLDS_IT: &str = "macOS's own Bluetooth is using the dongle, and ma
 const SYSTEM_HOLDS_IT: &str = "system Bluetooth (BlueZ) is using the dongle. \
      Stop bluetoothd or install the udev rule (see Linux port docs).";
 
-/// [`SYSTEM_HOLDS_IT`] after an error that means "someone else has it"
-/// (no access, or busy); nothing after any other error.
-fn held_hint(e: rusb::Error) -> String {
+/// Said first where no system driver was seen on the interface: the one that
+/// has the dongle may be another program. (A diagnostic run while Aokie held
+/// the dongle was told that macOS's own Bluetooth had it.)
+const ANOTHER_PROGRAM_MAY: &str = "another program may have it open, and only one can use the dongle at a time: \
+     another copy of Aokie, or Aokie's diagnostic tool while Aokie runs. If none is running: ";
+
+/// What to say after an error that means "someone else has it" (no access,
+/// or busy): [`SYSTEM_HOLDS_IT`], after [`ANOTHER_PROGRAM_MAY`] unless a
+/// system driver was seen holding the interface (`system_driver_seen`).
+/// Nothing after any other error.
+fn held_hint(e: rusb::Error, system_driver_seen: bool) -> String {
     match e {
-        rusb::Error::Access | rusb::Error::Busy => format!(" — {}", SYSTEM_HOLDS_IT),
+        rusb::Error::Access | rusb::Error::Busy if system_driver_seen => format!(" — {}", SYSTEM_HOLDS_IT),
+        rusb::Error::Access | rusb::Error::Busy => format!(" — {}{}", ANOTHER_PROGRAM_MAY, SYSTEM_HOLDS_IT),
         _ => String::new(),
     }
 }
@@ -1694,5 +1703,18 @@ mod tests {
         assert!(is_timeout_error(&fmt_err(rusb::Error::Timeout)));
         // ... and a write the dongle did not take is a failure.
         assert!(!is_timeout_error(&fmt_write_err(rusb::Error::Timeout)));
+    }
+
+    /// A dongle someone else has: with no system driver seen on it, another
+    /// program (another Aokie, the diagnostic tool) is named first; with one
+    /// seen, the system's Bluetooth alone. Another error says neither.
+    #[test]
+    fn a_dongle_held_elsewhere_names_who_may_have_it() {
+        let unseen = held_hint(rusb::Error::Access, false);
+        assert!(unseen.contains("another copy of Aokie"), "{unseen}");
+        assert!(unseen.ends_with(SYSTEM_HOLDS_IT), "{unseen}");
+        let seen = held_hint(rusb::Error::Busy, true);
+        assert_eq!(seen, format!(" — {}", SYSTEM_HOLDS_IT));
+        assert_eq!(held_hint(rusb::Error::Pipe, false), "");
     }
 }
