@@ -77,6 +77,17 @@ and the controller runs its ROM, as before. `aokie-radio-diag init` loads it too
 with "Aokie AI Assistant" (on the ROM it never listed it), and a test call through it had
 clear audio, as the tester heard it (2026-10-12). Texts and contacts not yet tried on it.
 
+The Bluetooth half of an RTL8822BU Wi-Fi and Bluetooth adapter (`0bda:b82c`, sold as
+"Bluetooth 5.0 Wi-Fi" adapters and showing as "802.11ac NIC") is loaded the same way: its
+ROM reports Realtek, subversion `0x8822`, HCI revision `0x000b` and HCI version 7, and its
+files are `rtl8822b_fw.bin` (project 8, patches for ROM versions 0 to 2) and
+`rtl8822b_config.bin`, pinned and bundled beside the RTL8761B's. Checked on a Mac
+(2026-10-19): ROM version 2, 81 pieces, after which it reports HCI version 8 and the
+firmware's `0x705c` / `0xab6b`; the adapter's Wi-Fi has no driver on a Mac and is left
+alone. It is not in the catalog: Linux offers it only with the unknown-dongle opt-in, and
+Windows' driver package does not bind it (it is one USB device with the Wi-Fi beside the
+Bluetooth, which a WinUSB bind of the whole device would take away).
+
 ## Phones
 
 HFP (call control + audio), MAP (SMS) and PBAP (contacts) behaviour varies by

@@ -1,6 +1,7 @@
 //! Realtek controllers run their ROM until their firmware is loaded into them, at every start: an RTL8761B dongle
-//! (`0bda:8771`, many TP-Link and ASUS dongles) on its ROM alone takes Aokie's name, class and scan settings and then
-//! is not seen by a phone at all ("I can't seem to see Aokie AI Assistant when pairing the phone"). Windows' own
+//! (`0bda:8771`, many TP-Link and ASUS dongles), or the Bluetooth half of an RTL8822BU Wi-Fi and Bluetooth adapter
+//! (`0bda:b82c`, "802.11ac NIC"), on its ROM alone takes Aokie's name, class and scan settings and then is not seen
+//! by a phone at all ("I can't seem to see Aokie AI Assistant when pairing the phone"). Windows' own
 //! driver did not start one either: Realtek's driver loads the firmware, and Aokie replaces that driver. This is the
 //! loader Linux's `drivers/bluetooth/btrtl.c` is, ported for the chips listed in [`CHIPS`]: the controller's ROM
 //! version read (`0xfc6d`), the patch for it taken from Realtek's firmware file (its "Realtech" container), the
@@ -8,7 +9,8 @@
 //! pieces of 252 bytes (`0xfc20`). It lives in the controller's RAM: an HCI reset keeps it, a replug clears it.
 //!
 //! The files are Realtek's, as linux-firmware redistributes them (`rtl_bt/rtl8761bu_fw.bin` and
-//! `rtl_bt/rtl8761bu_config.bin`, under `LICENCE.rtlwifi_firmware.txt`): looked for in [`firmware_dirs`]. Without
+//! `rtl_bt/rtl8761bu_config.bin`, `rtl_bt/rtl8822b_fw.bin` and `rtl_bt/rtl8822b_config.bin`, under
+//! `LICENCE.rtlwifi_firmware.txt`): looked for in [`firmware_dirs`]. Without
 //! them the controller runs its ROM as before, and the log says what is missing.
 
 use std::path::PathBuf;
@@ -44,14 +46,25 @@ pub struct RtlChip {
 }
 
 /// The chips whose firmware is loaded here, as btrtl.c's `ic_id_table` has them (on USB). Others run as they did.
-pub const CHIPS: &[RtlChip] = &[RtlChip {
-    name: "RTL8761BU",
-    lmp_subversion: 0x8761,
-    hci_revision: 0x000b,
-    hci_version: 0x0a,
-    firmware: "rtl8761bu_fw.bin",
-    config: "rtl8761bu_config.bin",
-}];
+pub const CHIPS: &[RtlChip] = &[
+    RtlChip {
+        name: "RTL8761BU",
+        lmp_subversion: 0x8761,
+        hci_revision: 0x000b,
+        hci_version: 0x0a,
+        firmware: "rtl8761bu_fw.bin",
+        config: "rtl8761bu_config.bin",
+    },
+    // (the Bluetooth half of a Wi-Fi and Bluetooth adapter; its ROM says Bluetooth 4.1, its firmware more)
+    RtlChip {
+        name: "RTL8822BU",
+        lmp_subversion: 0x8822,
+        hci_revision: 0x000b,
+        hci_version: 0x07,
+        firmware: "rtl8822b_fw.bin",
+        config: "rtl8822b_config.bin",
+    },
+];
 
 /// The project ids a "Realtech" container's trailer names, and the ROM's LMP subversion each is for (btrtl.c's
 /// `project_id_to_lmp_subver`).
@@ -412,6 +425,9 @@ mod tests {
         assert!(rom_chip(&LocalVersion { lmp_pal_subversion: 0xdfc6, ..rom }).is_none());
         assert!(rom_chip(&LocalVersion { manufacturer_name: 0x000f, ..rom }).is_none());
         assert!(rom_chip(&LocalVersion { hci_revision: 0x000a, ..rom }).is_none());
+        // an RTL8822BU adapter's Bluetooth on its ROM, as one answered (Bluetooth 4.1, revision 0x000b)
+        let rtl8822b = LocalVersion { hci_version: 0x07, hci_revision: 0x000b, lmp_pal_version: 0x07, manufacturer_name: 93, lmp_pal_subversion: 0x8822 };
+        assert_eq!(rom_chip(&rtl8822b).map(|c| (c.name, c.firmware, c.config)), Some(("RTL8822BU", "rtl8822b_fw.bin", "rtl8822b_config.bin")));
     }
 
     /// Realtek's own file, where it is at hand (`AOKIE_FIRMWARE_DIR`): its project is the RTL8761B's, and its ROM
@@ -428,5 +444,19 @@ mod tests {
             }
         }
         panic!("no patch for ROM version 0 or 1 in Realtek's file");
+    }
+
+    /// Realtek's RTL8822B file, where it is at hand (`AOKIE_FIRMWARE_DIR`): its project is the 0x8822's (8), it is
+    /// not the RTL8761B's, and it has a patch for each of ROM versions 0 to 2.
+    #[test]
+    fn realteks_rtl8822b_file_where_it_is_given() {
+        let Some(dir) = std::env::var_os("AOKIE_FIRMWARE_DIR") else { return };
+        let Ok(fw) = std::fs::read(PathBuf::from(dir).join("rtl8822b_fw.bin")) else { return };
+        assert_eq!(project_id(&fw), Ok(8));
+        assert!(patch_for(&fw, 0x8761, 1).unwrap_err().contains("0x8822 controller"));
+        for rom in [0u8, 1, 2] {
+            let patch = patch_for(&fw, 0x8822, rom).unwrap();
+            assert_eq!(&patch[patch.len() - 4..], &fw[8..12], "ROM version {rom}");
+        }
     }
 }

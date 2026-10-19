@@ -200,9 +200,9 @@ if linked_libraries "$out/aokie-plugin" | grep -i -e onnxruntime -e sherpa; then
   echo "the plugin links a speech library above: Aokie has no speech of its own, and the bundle carries none"; exit 1
 fi
 
-# Realtek's RTL8761B (USB) firmware, its config and their licence (pinned, as scripts/fetch-realtek-firmware.ps1
-# pins them): Aokie loads them into such a dongle at each start (realtek.rs), which a phone does not see on its ROM
-# alone. Linux has them in /lib/firmware/rtl_bt already where linux-firmware is installed; a Mac has nowhere else.
+# Realtek's RTL8761B (USB) and RTL8822B (the Bluetooth of RTL8822BU Wi-Fi and Bluetooth adapters) firmware, their
+# configs and their licence (pinned, as scripts/fetch-realtek-firmware.ps1 pins them): Aokie loads them into such a
+# dongle at each start (realtek.rs), which a phone does not see on its ROM alone. Linux has them in /lib/firmware/rtl_bt already where linux-firmware is installed; a Mac has nowhere else.
 # AOKIE_FETCH_REALTEK=0: none (refused above for a strict bundle, which must carry them).
 if [ "$fetch_realtek" = 1 ]; then
   rtl_commit=afabaf773c4c2e2c841429933a6a084a5af4d14d
@@ -210,6 +210,8 @@ if [ "$fetch_realtek" = 1 ]; then
   for entry in \
     rtl_bt/rtl8761bu_fw.bin=1d7a9597349ad89344fa16c1913d3e39e9a12e966e417ca16871bc79bbe59edb \
     rtl_bt/rtl8761bu_config.bin=6c28a3f07c6a30ed208c4b64862a23f02b7d93543ea980edd24df16bab45095f \
+    rtl_bt/rtl8822b_fw.bin=eecef2c3b2ff03c3a41292a93a25eca6f4ec38eb4a7491a3651b530be89a04fc \
+    rtl_bt/rtl8822b_config.bin=ea082136d5285655372e3805cd50d961bd7d42085c6fc1058a115a7e844df9c1 \
     LICENSES/LICENCE.rtlwifi_firmware.txt=a61351665b4f264f6c631364f85b907d8f8f41f8b369533ef4021765f9f3b62e; do
     path="${entry%%=*}"; sum="${entry#*=}"; dest="$out/firmware/rtl_bt/$(basename "$path")"
     if curl -fsSL -o "$dest" "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/$rtl_commit/$path"; then
@@ -217,7 +219,7 @@ if [ "$fetch_realtek" = 1 ]; then
       [ "$got" = "$sum" ] || { rm -f "$dest"; echo "$path is not the pinned file (sha256 $got): removed"; exit 1; }
     else
       rm -f "$dest"
-      echo "Realtek's $path could not be fetched (no network?): an RTL8761B dongle runs its ROM, which phones do not see"
+      echo "Realtek's $path could not be fetched (no network?): a Realtek dongle runs its ROM, which phones do not see"
       [ "$strict" = 1 ] && { echo "AOKIE_BUNDLE_STRICT=1: a bundle without it is not laid out"; exit 1; }
     fi
   done
@@ -243,7 +245,7 @@ if [ -n "$libusb_config" ]; then
   required="$required third-party/libusb-$libusb_version/README.md third-party/libusb-$libusb_version/libusb-$libusb_version.tar.bz2"
 fi
 if [ "$fetch_realtek" = 1 ] && { [ "$strict" = 1 ] || [ -d "$out/firmware/rtl_bt" ]; }; then
-  for f in rtl8761bu_fw.bin rtl8761bu_config.bin LICENCE.rtlwifi_firmware.txt; do
+  for f in rtl8761bu_fw.bin rtl8761bu_config.bin rtl8822b_fw.bin rtl8822b_config.bin LICENCE.rtlwifi_firmware.txt; do
     if [ "$strict" = 1 ] || [ -f "$out/firmware/rtl_bt/$f" ]; then required="$required firmware/rtl_bt/$f"; fi
   done
 fi

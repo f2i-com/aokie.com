@@ -73,6 +73,18 @@ fn main() {
             let tail = p.local_address.rsplit(':').take(2).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join(":");
             println!("{path}: opened, reset and answering: {:?}", p.version);
             println!("{path}: address ..:{tail}, buffers {:?}", p.buffer_size);
+            // A Realtek controller on its ROM: its firmware loaded as the radio loads it at each start, and asked again.
+            if let Some(chip) = aokie_bluetooth::aokie_radio::realtek::rom_chip(&p.version) {
+                println!("{path}: a Realtek {} on its ROM: loading its firmware as the radio does", chip.name);
+                match radio::AokieHciTransport::open(&path).and_then(|t| t.reset().map(|_| t)) {
+                    Ok(t) => match aokie_bluetooth::aokie_radio::realtek::load_firmware(&t, &p.version) {
+                        Ok(Some(v)) => println!("{path}: firmware loaded, now answering: {v:?}"),
+                        Ok(None) => println!("{path}: its firmware files were not found: {:?}", aokie_bluetooth::aokie_radio::realtek::firmware_status()),
+                        Err(e) => println!("{path}: the controller refused its firmware: {e}"),
+                    },
+                    Err(e) => println!("{path}: it could not be opened again: {e}"),
+                }
+            }
         }
         Err(e) => {
             println!("{path}: it could not be opened: {e}");

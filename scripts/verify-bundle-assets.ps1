@@ -38,12 +38,14 @@ foreach ($definition in $manifest.serviceDefinitions) {
 }
 
 # Beside the manifest's files: the helper the WinUSB install elevates (found next to the plugin's program, and pinned
-# into it by hash), Realtek's RTL8761B firmware the radio loads at each start (firmware/rtl_bt, where realtek.rs looks
+# into it by hash), Realtek's RTL8761B and RTL8822B firmware the radio loads at each start (firmware/rtl_bt, where realtek.rs looks
 # beside the program), and in a production bundle the driver package the helper installs.
 $required = @(
     'aokie-driver-helper.exe',
     'firmware/rtl_bt/rtl8761bu_fw.bin',
     'firmware/rtl_bt/rtl8761bu_config.bin',
+    'firmware/rtl_bt/rtl8822b_fw.bin',
+    'firmware/rtl_bt/rtl8822b_config.bin',
     'firmware/rtl_bt/LICENCE.rtlwifi_firmware.txt'
 )
 if ($DriverPackage) {
