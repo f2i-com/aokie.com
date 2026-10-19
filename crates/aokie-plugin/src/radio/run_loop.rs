@@ -1717,12 +1717,10 @@ pub(super) fn run_loop(
             }
         }
 
-        // A call left ringing for the owner that they answered on the phone:
-        // theirs (CallSession::receptionist_owns), said once.
+        // A call the owner answered on the phone (left ringing for them, or
+        // not answered here): theirs (CallSession::receptionist_owns), said once.
         if let Some(s) = tracker.current().filter(|s| s.owner_took) {
-            let mut left = status.left_to_owner.lock().unwrap();
-            if left.as_ref().is_some_and(|(id, took)| *id == s.id && !*took) {
-                *left = Some((s.id.clone(), true));
+            if status.note_owner_took(&s.id) {
                 eprintln!(
                     "[aokie-plugin] the owner answered call {} on the phone — the receptionist stays out of it",
                     s.id

@@ -46,10 +46,12 @@ pub struct RadioStatus {
     /// ISO-8601 instant the current call started RINGING (not answered) —
     /// the Live Call screen's timer runs from here.
     pub call_started_at: Mutex<Option<String>>,
-    /// The call the allowed list left ringing for the owner, and whether the
-    /// owner then took it on the phone: what `call.current` tells the
-    /// Overview, to say whose call it is. Cleared when the owner hands it to
-    /// the receptionist; read against the current call's id.
+    /// The call left ringing for the owner (the allowed list, lapsed
+    /// consent), and whether the owner took it on the phone, as they take any
+    /// call they answer there (auto-answer off, or before Aokie answered):
+    /// what `call.current` tells the Overview, to say whose call it is.
+    /// Cleared when the owner hands it to the receptionist; read against the
+    /// current call's id.
     pub left_to_owner: Mutex<Option<(String, bool)>>,
     /// Devices seen connected during this radio session (the durable link
     /// keys live in the aokie pairing store; this is the live view).
@@ -245,6 +247,20 @@ impl RadioStatus {
     pub fn consent_expired(&self) -> bool {
         let expires = self.consent_expires_at.load(Ordering::Relaxed);
         expires != 0 && chrono::Utc::now().timestamp() >= expires
+    }
+
+    /// The owner answered `call_id` on the phone (`CallSession::owner_took`):
+    /// `left_to_owner` says "taken" for it, whether it was left ringing for
+    /// them or just not answered here. Only that was said for a call left
+    /// ringing, and the Overview called an ordinary call the owner picked up
+    /// the receptionist's. True the first time, for the log.
+    pub fn note_owner_took(&self, call_id: &str) -> bool {
+        let mut left = self.left_to_owner.lock().unwrap();
+        if left.as_ref().is_some_and(|(id, took)| id == call_id && *took) {
+            return false;
+        }
+        *left = Some((call_id.to_string(), true));
+        true
     }
 }
 

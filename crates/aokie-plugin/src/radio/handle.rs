@@ -469,8 +469,8 @@ impl RadioHandle {
             "inbound"
         }
     }
-    /// Whether the allowed list left `call_id` ringing for the owner
-    /// ("ringing"), and the owner took it on the phone ("taken").
+    /// Whether `call_id` was left ringing for the owner ("ringing"), and
+    /// whether the owner took it on the phone, left ringing or not ("taken").
     pub fn left_to_owner(&self, call_id: &str) -> Option<&'static str> {
         match self.status.left_to_owner.lock().unwrap().as_ref() {
             Some((id, took)) if id == call_id => Some(if *took { "taken" } else { "ringing" }),
@@ -803,6 +803,21 @@ mod tests {
             address: address.to_string(),
             name: listed_as.to_string(),
         });
+    }
+
+    #[test]
+    fn a_call_the_owner_picked_up_on_the_phone_is_theirs_left_ringing_or_not() {
+        let (handle, _controls) = RadioHandle::test_handle();
+        // Not left ringing (auto-answer off): taken all the same, said once.
+        assert!(handle.status.note_owner_took("call_1"));
+        assert!(!handle.status.note_owner_took("call_1"));
+        assert_eq!(handle.left_to_owner("call_1"), Some("taken"));
+        // Left ringing by the allowed list, then picked up.
+        *handle.status.left_to_owner.lock().unwrap() = Some(("call_2".to_string(), false));
+        assert_eq!(handle.left_to_owner("call_2"), Some("ringing"));
+        assert!(handle.status.note_owner_took("call_2"));
+        assert_eq!(handle.left_to_owner("call_2"), Some("taken"));
+        assert_eq!(handle.left_to_owner("call_1"), None, "read against the current call");
     }
 
     #[test]
