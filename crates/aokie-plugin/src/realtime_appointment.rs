@@ -526,7 +526,28 @@ pub fn validate_with_readback(
         .ok_or_else(|| "appointment request arguments must be an object".to_string())?;
     const KEYS: [&str; 5] = ["callerName", "service", "date", "time", "agreementPhrase"];
     if object.len() != KEYS.len() || !KEYS.iter().all(|key| object.contains_key(*key)) {
-        return Err("appointment request contains unsupported fields".into());
+        // Said field by field: OAIY passes on what its model wrote, and a model
+        // told only that something is wrong guesses at what (a `phone` or a
+        // `status` it added, a field it left out) and asks the caller again.
+        let missing: Vec<&str> = KEYS.iter().copied().filter(|key| !object.contains_key(*key)).collect();
+        let mut unsupported: Vec<String> = object
+            .keys()
+            .filter(|key| !KEYS.contains(&key.as_str()))
+            .take(5)
+            .map(|key| key.chars().take(40).filter(|c| !c.is_control()).collect())
+            .collect();
+        unsupported.sort();
+        let mut wrong = Vec::new();
+        if !missing.is_empty() {
+            wrong.push(format!("missing {}", missing.join(", ")));
+        }
+        if !unsupported.is_empty() {
+            wrong.push(format!("not supported: {}", unsupported.join(", ")));
+        }
+        return Err(format!(
+            "appointment request must have exactly callerName, service, date, time and agreementPhrase ({}): call this tool again with those five alone",
+            wrong.join("; ")
+        ));
     }
 
     let caller_name = bounded_plain(object.get("callerName"), "caller name", 120)?;
@@ -538,8 +559,11 @@ pub fn validate_with_readback(
         return Err("a real caller name is required".into());
     }
     let service = bounded_plain(object.get("service"), "service", 160)?;
-    let date = bounded_plain(object.get("date"), "date", 10)?;
-    let time = bounded_plain(object.get("time"), "time", 5)?;
+    // Read with room to spare, so that "10:00 AM" or "20 July 2026" is told
+    // the form a date and a time take, not only that it is invalid; what is
+    // kept is the parsed value in that form.
+    let date = bounded_plain(object.get("date"), "date", 40)?;
+    let time = bounded_plain(object.get("time"), "time", 40)?;
     let agreement = bounded_plain(object.get("agreementPhrase"), "agreement phrase", 500)?;
 
     let parsed_date = NaiveDate::parse_from_str(&date, "%Y-%m-%d")
@@ -549,6 +573,8 @@ pub fn validate_with_readback(
     }
     let parsed_time = NaiveTime::parse_from_str(&time, "%H:%M")
         .map_err(|_| "time must be a real 24-hour HH:MM time".to_string())?;
+    let date = parsed_date.format("%Y-%m-%d").to_string();
+    let time = parsed_time.format("%H:%M").to_string();
 
     let (agreement_turn, latest_text) =
         latest_caller_turn.ok_or_else(|| "no final caller agreement is available".to_string())?;
@@ -695,7 +721,7 @@ mod tests {
         assert!(validate_spoken_date("Monday at 4pm", monday + Duration::days(7), monday).is_err());
     }
 
-    fn lance_request() -> Value {
+    fn sam_request() -> Value {
         json!({
             "callerName": "Sam",
             "service": "Lawn mowing",
@@ -708,7 +734,7 @@ mod tests {
     #[test]
     fn exact_live_call_language_is_a_bounded_request() {
         let request = validate(
-            &lance_request(),
+            &sam_request(),
             "call_5685374790b241a1a48dd8549c0c6a4c",
             Some((6, "I'll be Wednesday at 10 o'clock.")),
             &[
@@ -752,7 +778,7 @@ mod tests {
     #[test]
     fn stable_business_identity_dedupes_provider_retries() {
         let first = validate(
-            &lance_request(),
+            &sam_request(),
             "call_one",
             Some((6, "I'll be Wednesday at 10 o'clock.")),
             &["Please make an appointment.".into()],
@@ -760,7 +786,7 @@ mod tests {
         )
         .unwrap();
         let second = validate(
-            &lance_request(),
+            &sam_request(),
             "call_one",
             Some((9, "I'll be Wednesday at 10 o'clock.")),
             &["Please make an appointment.".into()],
@@ -773,7 +799,7 @@ mod tests {
     #[test]
     fn mismatch_uncertainty_and_missing_intent_fail_closed() {
         let mismatch = validate(
-            &lance_request(),
+            &sam_request(),
             "call_one",
             Some((6, "Thursday would be better.")),
             &["Please make an appointment.".into()],
@@ -781,7 +807,7 @@ mod tests {
         );
         assert!(mismatch.is_err());
 
-        let mut uncertain = lance_request();
+        let mut uncertain = sam_request();
         uncertain["agreementPhrase"] = json!("Maybe Wednesday at 10.");
         assert!(validate(
             &uncertain,
@@ -793,7 +819,7 @@ mod tests {
         .is_err());
 
         assert!(validate(
-            &lance_request(),
+            &sam_request(),
             "call_one",
             Some((6, "I'll be Wednesday at 10 o'clock.")),
             &["Is Wednesday at ten available?".into()],
@@ -801,7 +827,7 @@ mod tests {
         )
         .is_err());
 
-        let mut availability = lance_request();
+        let mut availability = sam_request();
         availability["agreementPhrase"] = json!("Is Wednesday at 10 available");
         assert!(validate(
             &availability,
@@ -812,7 +838,7 @@ mod tests {
         )
         .is_err());
 
-        let mut direct_request = lance_request();
+        let mut direct_request = sam_request();
         direct_request["agreementPhrase"] = json!("Could you book me Wednesday at 10?");
         assert!(validate(
             &direct_request,
@@ -1101,7 +1127,7 @@ mod tests {
     #[test]
     fn invalid_or_remote_dates_and_extra_fields_are_rejected() {
         assert!(validate(
-            &lance_request(),
+            &sam_request(),
             "",
             Some((6, "I'll be Wednesday at 10 o'clock.")),
             &["Please make an appointment.".into()],
@@ -1110,7 +1136,7 @@ mod tests {
         .is_err());
 
         for date in ["2026-02-30", "2026-07-19", "2029-01-01"] {
-            let mut request = lance_request();
+            let mut request = sam_request();
             request["date"] = json!(date);
             assert!(validate(
                 &request,
@@ -1122,7 +1148,7 @@ mod tests {
             .is_err());
         }
 
-        let mut extra = lance_request();
+        let mut extra = sam_request();
         extra["status"] = json!("confirmed");
         assert!(validate(
             &extra,
@@ -1133,7 +1159,7 @@ mod tests {
         )
         .is_err());
 
-        let mut wrong_weekday = lance_request();
+        let mut wrong_weekday = sam_request();
         wrong_weekday["date"] = json!("2026-07-23");
         assert!(validate(
             &wrong_weekday,
@@ -1144,7 +1170,7 @@ mod tests {
         )
         .is_err());
 
-        let mut wrong_time = lance_request();
+        let mut wrong_time = sam_request();
         wrong_time["time"] = json!("11:00");
         assert!(validate(
             &wrong_time,
@@ -1154,6 +1180,59 @@ mod tests {
             day(),
         )
         .is_err());
+    }
+
+    /// OAIY passes on the arguments its model wrote: a refusal of their shape
+    /// names the fields, and a date or time in another form is told the form,
+    /// so the model can put it right without asking the caller again.
+    #[test]
+    fn a_refused_shape_or_form_says_what_to_send() {
+        let refusal = |request: &Value| {
+            validate(
+                request,
+                "call_one",
+                Some((6, "I'll be Wednesday at 10 o'clock.")),
+                &["Please make an appointment.".into()],
+                day(),
+            )
+            .unwrap_err()
+        };
+        let mut extra = sam_request();
+        extra["phone"] = json!("0491 570 156");
+        extra["status"] = json!("confirmed");
+        let said = refusal(&extra);
+        assert!(said.contains("not supported: phone, status"), "{said}");
+        assert!(said.contains("callerName, service, date, time and agreementPhrase"), "{said}");
+        assert!(!said.contains("0491"), "a value is never repeated: {said}");
+
+        let mut missing = sam_request();
+        missing.as_object_mut().unwrap().remove("agreementPhrase");
+        let said = refusal(&missing);
+        assert!(said.contains("missing agreementPhrase"), "{said}");
+        assert!(!said.contains("not supported"), "{said}");
+
+        let mut twelve_hour = sam_request();
+        twelve_hour["time"] = json!("10:00 AM");
+        assert_eq!(refusal(&twelve_hour), "time must be a real 24-hour HH:MM time");
+        let mut spelled = sam_request();
+        spelled["date"] = json!("Wednesday 22 July 2026");
+        assert_eq!(refusal(&spelled), "date must be a real YYYY-MM-DD date");
+
+        // A time is kept in one form, however the hour was written.
+        let said = "Wednesday at 9 o'clock please.";
+        let mut short_hour = sam_request();
+        short_hour["time"] = json!("9:00");
+        short_hour["agreementPhrase"] = json!(said);
+        let mut padded = short_hour.clone();
+        padded["time"] = json!("09:00");
+        let heard = ["Please make an appointment Wednesday at 9 o'clock.".to_string()];
+        let latest = Some((6, said));
+        let short = validate(&short_hour, "call_one", latest, &heard, day());
+        let full = validate(&padded, "call_one", latest, &heard, day()).expect("09:00 is booked");
+        assert_eq!(full.time, "09:00");
+        if let Ok(short) = short {
+            assert_eq!((short.time.as_str(), short.request_id), ("09:00", full.request_id));
+        }
     }
 
     #[test]
