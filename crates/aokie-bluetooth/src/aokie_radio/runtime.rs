@@ -1995,6 +1995,8 @@ fn run_runtime(
     // `awaiting_encryption` = auth done, Encryption_Change pending. SDP
     // starts only once the link is encrypted.
     let mut manual_connect_auth: Option<ManualConnectAuth> = None;
+    // The phones that refused our stored key when paged (RefusedKeys): not paged again until paired again.
+    let mut refused_keys = RefusedKeys::default();
     let mut hfp_connect_runtime: Option<HfpConnectRuntime> = None;
     let mut outbound_connect_session = false;
     // Phase 4e: a single MapRuntime slot for sequential MAS operations
@@ -2901,7 +2903,7 @@ fn run_runtime(
                 eprintln!("[AokieRadio] transport recovery: the phone link is back");
                 recovery_reconnect_done = true;
             } else if Instant::now() >= *due && manual_connect_pending.is_none() {
-                if *pages >= RECOVERY_RECONNECT_PAGES || !pairing_store.contains(addr) {
+                if *pages >= RECOVERY_RECONNECT_PAGES || !pairing_store.contains(addr) || refused_keys.contains(addr) {
                     eprintln!(
                         "[AokieRadio] transport recovery: {} did not come back after {} page(s) \
                          - leaving the reconnect to the phone",
@@ -3207,6 +3209,7 @@ fn run_runtime(
                     // AOK-BT-001: forget a bonded device on its owner thread, then
                     // refresh the snapshot so listPaired reflects it immediately.
                     let result = pairing_store.remove(&address);
+                    refused_keys.clear(&address);
                     if matches!(result, Ok(true)) {
                         if let Ok(mut snap) = status.bonded_devices.write() {
                             *snap = pairing_store.list_devices();
@@ -3277,6 +3280,8 @@ fn run_runtime(
                         }
                     } else if manual_connect_pending.is_some() {
                         Err("a reconnect attempt is already in progress".to_string())
+                    } else if let Some(refusal) = refused_keys.page_refusal(&address) {
+                        Err(refusal)
                     } else {
                         match hci::create_connection_command_for(&address, init_report.link_policy & hci::LINK_POLICY_ROLE_SWITCH != 0) {
                             Ok(cmd) => match transport.write_command(&cmd) {
@@ -3474,6 +3479,10 @@ fn run_runtime(
                     }
                 }
                 let bonds_before = pairing_store.len();
+                // A new key: the phone is paired again, and paged again.
+                if let hci::HciEvent::LinkKeyNotification { address, .. } = &event {
+                    refused_keys.clear(address);
+                }
                 match manager::handle_hci_event_with_policy(
                     &transport,
                     &mut pairing_store,
@@ -3989,6 +3998,7 @@ fn run_runtime(
                                 "[AokieRadio] phone.connect: authentication with {} FAILED status 0x{:02x}",
                                 super::LogAddr(&auth.address), astatus
                             );
+                            refused_keys.refused(&auth.address);
                             let _ = event_tx.send(RuntimeEvent::Error(format!(
                                 "phone.connect: {} rejected our stored pairing (authentication failure 0x{:02x}) — forget Aokie on the phone and pair again",
                                 auth.address, astatus
@@ -5077,6 +5087,38 @@ fn another_phone_holds_the_link(
     active_acl_handle.is_some()
         && !connected_remote.is_empty()
         && !connected_remote.eq_ignore_ascii_case(address)
+}
+
+/// The phones that refused our stored key when we paged them in this run (authentication failed: the phone no
+/// longer has the bond). Paging one again cannot succeed, and each try ended in one more refusal, one more error for
+/// the owner and one more prompt on the phone: until it is paired again (a new key) or forgotten, a page to it is
+/// refused here instead, with what to do. A restart of the radio tries it once more.
+#[derive(Debug, Default)]
+struct RefusedKeys(std::collections::HashSet<String>);
+
+impl RefusedKeys {
+    fn refused(&mut self, address: &str) {
+        self.0.insert(address.to_ascii_uppercase());
+    }
+
+    /// A new key for it, or it was forgotten.
+    fn clear(&mut self, address: &str) {
+        self.0.remove(&address.to_ascii_uppercase());
+    }
+
+    fn contains(&self, address: &str) -> bool {
+        self.0.contains(&address.to_ascii_uppercase())
+    }
+
+    /// Why a page to `address` is not sent, while it is one.
+    fn page_refusal(&self, address: &str) -> Option<String> {
+        self.contains(address).then(|| {
+            format!(
+                "{} refused Aokie's stored pairing when it was last paged — forget Aokie on the phone and pair again (it is not paged until then)",
+                address
+            )
+        })
+    }
 }
 
 fn forward_hci_event(
@@ -7826,6 +7868,44 @@ mod tests {
         assert!(!another_phone_holds_the_link(Some(0x0b), a, &a.to_lowercase()));
         assert!(!another_phone_holds_the_link(None, a, b), "nobody connected");
         assert!(!another_phone_holds_the_link(Some(0x0b), "", b), "no address known");
+    }
+
+    /// A phone that refused our stored key is not paged again in this run until it has a new key or is forgotten;
+    /// any other phone is paged as before. The address is matched as the store matches it, in any case.
+    #[test]
+    fn a_phone_that_refused_our_key_is_not_paged_again_until_paired_again() {
+        let phone = "AA:BB:CC:00:00:01";
+        let mut refused = RefusedKeys::default();
+        assert_eq!(refused.page_refusal(phone), None);
+        refused.refused(&phone.to_lowercase());
+        let why = refused.page_refusal(phone).expect("refused");
+        assert!(why.contains("pair again"), "{why}");
+        assert!(refused.contains(&phone.to_lowercase()));
+        assert_eq!(refused.page_refusal("AA:BB:CC:00:00:02"), None, "another phone");
+        refused.clear(phone);
+        assert_eq!(refused.page_refusal(phone), None, "a new key (or a Forget) clears it");
+    }
+
+    /// The run loop records the refusal where the phone's authentication fails, clears it where a new key comes and
+    /// where the phone is forgotten, and asks it before a page is sent (a Reconnect, the start's auto-connect) and
+    /// before the transport recovery's page.
+    #[test]
+    fn the_run_loop_keeps_and_asks_the_refused_keys() {
+        let source = include_str!("runtime.rs");
+        let start = source.find("\nfn run_runtime(").expect("run_runtime");
+        let body = &source[start + 1..];
+        let body = &body[..body[1..].find("\nfn ").expect("the next function") + 1];
+        let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("not found: {needle}"));
+        assert!(at("authentication with {} FAILED") < at("refused_keys.refused(&auth.address);"));
+        assert!(at("refused_keys.refused(&auth.address);") < at("rejected our stored pairing"));
+        let link_key = at("if let hci::HciEvent::LinkKeyNotification { address, .. } = &event {\n                    refused_keys.clear(address);");
+        assert!(link_key < at("manager::handle_hci_event_with_policy("), "cleared before the key is stored");
+        assert!(at("let result = pairing_store.remove(&address);\n                    refused_keys.clear(&address);") > 0);
+        let connect = at("Ok(ControlCommand::Connect { address, reply }) => {");
+        let refusal = connect + body[connect..].find("refused_keys.page_refusal(&address)").expect("asked in Connect");
+        let page = connect + body[connect..].find("hci::create_connection_command_for(&address").expect("the page");
+        assert!(refusal < page, "asked before the page is sent");
+        assert!(body.contains("!pairing_store.contains(addr) || refused_keys.contains(addr)"), "the recovery page asks too");
     }
 
     /// Review 1 #17: the codec comes from the link's air mode, not the

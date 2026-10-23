@@ -488,7 +488,8 @@ impl AokieHciTransport {
     }
 
     /// Nothing to do here. The WinUSB counterpart drops what Windows has
-    /// buffered for a dead ACL handle and leaves its queued read alone;
+    /// buffered for a dead ACL handle (only while no read of its own is
+    /// queued: then nothing is held back) and leaves its queued read alone;
     /// with libusb the controller's bytes go straight into the queued
     /// transfer, which must be left alone for the same reason as there (a
     /// fast-reconnecting phone's first packet may already be in it).

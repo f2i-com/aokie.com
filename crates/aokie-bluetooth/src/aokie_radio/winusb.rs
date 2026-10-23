@@ -1674,10 +1674,34 @@ impl AokieHciTransport {
     ///     desyncs us from the device's toggle state and stalls the
     ///     next bulk transfer. FlushPipe just drops the kernel ring
     ///     contents without touching transfer state.
+    ///   * Never while our read is queued on the pipe, which is nearly
+    ///     always (the runtime keeps one out between polls). The
+    ///     controller's bytes go into that read, so WinUSB holds none back
+    ///     to drop, and the read is left alone as libusb's counterpart
+    ///     leaves its own (a fast-reconnecting phone's first packet may be
+    ///     in it). FlushPipe is synchronous, and by every sign it waited for
+    ///     that read, which with the pipe's timeout at never ends only when
+    ///     ACL data next comes (on a link that just went down, never): a
+    ///     phone that refused our stored key left the radio thread in a
+    ///     kernel wait from the disconnect that followed, a few seconds after
+    ///     each start, and every Forget, page and text after it went
+    ///     unanswered until the plugin restarted (2026-10-23).
     pub fn flush_acl_in_pipe(&self) -> Result<(), String> {
         let Some(endpoint) = self.pipes.acl_in else {
             return Ok(());
         };
+        // (a lock that cannot be read is taken as a read queued: no flush)
+        let read_queued = self
+            .acl_reader
+            .lock()
+            .map(|reader| reader.as_ref().is_some_and(|queued| queued.in_flight))
+            .unwrap_or(true);
+        if read_queued {
+            eprintln!(
+                "[AokieRadio] HCI ACL in post-disconnect flush skipped: a read is queued on the pipe, so nothing is held back to drop"
+            );
+            return Ok(());
+        }
         let handle = self.pipe_handle(endpoint.slot)?;
         unsafe {
             if WinUsb_FlushPipe(handle, endpoint.info.id) == 0 {
@@ -2939,6 +2963,22 @@ mod tests {
         assert!(crate::aokie_radio::manager::is_timeout_error(
             &queued_read_timeout("HCI ACL in")
         ));
+    }
+
+    /// The post-disconnect flush leaves the pipe alone while our read is queued on it (FlushPipe waited for that
+    /// read, which on a link that went down never ends, and the radio thread with it), and flushes as before only
+    /// when none is: the read's state is asked before FlushPipe is called.
+    #[test]
+    fn the_post_disconnect_flush_waits_for_no_queued_read() {
+        let source = include_str!("winusb.rs");
+        let start = source.find("pub fn flush_acl_in_pipe(&self)").expect("flush_acl_in_pipe");
+        let body = &source[start..];
+        let body = &body[..body.find("\n    pub fn ").expect("the next function")];
+        let asked = body.find(".is_some_and(|queued| queued.in_flight)").expect("the queued read is asked");
+        let skipped = body.find("if read_queued {").expect("a queued read skips the flush");
+        let flush = body.find("WinUsb_FlushPipe(").expect("the flush");
+        assert!(asked < skipped && skipped < flush, "the read is asked before FlushPipe");
+        assert!(!body.contains("WinUsb_AbortPipe") && !body.contains("cancel("), "the queued read is not cancelled");
     }
 
     #[test]
