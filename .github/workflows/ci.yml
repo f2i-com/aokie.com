@@ -542,7 +542,7 @@ jobs:
           Remove-Item verify-extracted -Recurse -Force
 
       - name: Upload bundle artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: aokie-plugin-windows
           path: bundle/*
@@ -705,7 +705,7 @@ jobs:
           Remove-Item verify-extracted -Recurse -Force
 
       - name: Upload bundle artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: aokie-plugin-windows-managed-beta
           path: bundle/*
@@ -807,7 +807,7 @@ jobs:
         run: tar -cf aokie-plugin-macos-arm64-built.tar bundle macos-minimum.txt
 
       - name: Upload the built bundle
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: aokie-plugin-macos-arm64-built
           path: aokie-plugin-macos-arm64-built.tar
@@ -920,7 +920,7 @@ jobs:
         run: tar -cf aokie-plugin-macos-arm64-signed.tar bundle macos-minimum.txt signing.env
 
       - name: Upload the signed bundle
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: aokie-plugin-macos-arm64-signed
           path: aokie-plugin-macos-arm64-signed.tar
@@ -1060,7 +1060,7 @@ jobs:
           echo "$AOKIE_CODE_SIGNING $AOKIE_NOTARISED" > macos-signing.txt
 
       - name: Upload bundle artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: aokie-plugin-macos-arm64
           path: |
@@ -1249,7 +1249,7 @@ jobs:
           python3 scripts/virtual-dongle/plugin_check.py --no-dongle "$PWD/verify-extracted/aokie-plugin"
 
       - name: Upload bundle artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: aokie-plugin-linux-x86_64
           path: |
