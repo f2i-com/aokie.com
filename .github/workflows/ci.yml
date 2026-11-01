@@ -60,7 +60,7 @@ jobs:
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07
 
       - name: Cargo cache
-        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
 
       # The WHOLE shipping workspace (audit AOK-CI-001): core, bluetooth,
       # audio, dongle AND the plugin — the
@@ -84,7 +84,7 @@ jobs:
           components: clippy
 
       - name: Cargo cache
-        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
 
       # The voice build compiles a distinct cfg surface (the realtime lane to
       # OAIY, AEC, the call loop) that the default build never touches. Audit
@@ -111,7 +111,7 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
 
       - name: Check plugin (voice,managed-beta-driver)
         run: cargo check --locked -p aokie-plugin --features voice,managed-beta-driver
@@ -157,7 +157,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
 
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets
@@ -285,7 +285,7 @@ jobs:
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07
 
       - name: Cargo cache
-        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
 
       # TRUST-001: a PUBLIC TAG RELEASE without the Authenticode cert or the package key is a hard failure — never
       # an "unsigned flavour"; said here, before anything is built. Only whether each secret is set reaches this
@@ -589,7 +589,7 @@ jobs:
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07
 
       - name: Cargo cache
-        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
 
       # A managed-beta bundle is built and published only from a dispatch on a branch or from a tag whose name says
       # managed-beta: a dispatch on a production tag that asks for managed-beta stops here, so a pre-release can never
