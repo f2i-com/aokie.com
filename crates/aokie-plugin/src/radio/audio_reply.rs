@@ -277,6 +277,11 @@ pub(super) fn pump_audio_and_reply(
                     Some(barge_rms), Some(&mut probe), ctx.pace.base(), None, None, None);
                 note_tts_outcome(status, &out);
                 if out.barged || out.cancelled { bt.flush_tx_audio(); }
+                // A hang-up or reject the probe caught during the acknowledgement is carried out now: it went with
+                // the probe, and the operator had "accepted" and then neither call.ended nor control_failed.
+                if let Some(action) = probe.action.take() {
+                    perform_cancel_action(action, bt, &mut *tracker, outbox, sink);
+                }
                 if !out.captured_speech.is_empty() {
                     if let Some(id) = spec_utterance.take() { stale_specs.push(id); }
                     stt_buf.extend(crate::voice::to_f32_16k(&out.captured_speech, sr as u32));

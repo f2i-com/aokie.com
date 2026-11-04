@@ -437,6 +437,7 @@ pub(super) fn emit_transcript_settlements(
     all_durable
 }
 
+/// What a control refused for another call says ([`emit_control_refused`]).
 #[cfg(aokie_radio)]
 pub(super) const ANOTHER_CALL: &str =
     "the call it was for is no longer the one on the line, so nothing was sent to the phone";
