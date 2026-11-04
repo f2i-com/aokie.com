@@ -38,7 +38,7 @@ pub(crate) fn bonded_devices() -> Vec<(String, Option<String>)> {
         Ok(s) => s,
         Err(_) => return Vec::new(),
     };
-    let infos = match DeviceInformation::FindAllAsyncAqsFilter(&sel).and_then(|op| op.get()) {
+    let infos = match DeviceInformation::FindAllAsyncAqsFilter(&sel).and_then(|op| op.join()) {
         Ok(d) => d,
         Err(_) => return Vec::new(),
     };
@@ -49,7 +49,7 @@ pub(crate) fn bonded_devices() -> Vec<(String, Option<String>)> {
             .Id()
             .ok()
             .and_then(|id| BluetoothDevice::FromIdAsync(&id).ok())
-            .and_then(|op| op.get().ok())
+            .and_then(|op| op.join().ok())
             .map(|dev| dev.BluetoothAddress().unwrap_or(0))
             .unwrap_or(0);
         if address != 0 {
@@ -66,12 +66,12 @@ pub(crate) fn unpair(address: &str) -> Result<bool, String> {
     let sel =
         BluetoothDevice::GetDeviceSelectorFromPairingState(true).map_err(|e| e.to_string())?;
     let infos = DeviceInformation::FindAllAsyncAqsFilter(&sel)
-        .and_then(|op| op.get())
+        .and_then(|op| op.join())
         .map_err(|e| e.to_string())?;
     for info in infos {
         let id = info.Id().map_err(|e| e.to_string())?;
         let addr = BluetoothDevice::FromIdAsync(&id)
-            .and_then(|op| op.get())
+            .and_then(|op| op.join())
             .map(|dev| dev.BluetoothAddress().unwrap_or(0))
             .unwrap_or(0);
         if addr == wanted {
@@ -80,7 +80,7 @@ pub(crate) fn unpair(address: &str) -> Result<bool, String> {
                 .map_err(|e| e.to_string())?
                 .UnpairAsync()
                 .map_err(|e| e.to_string())?
-                .get()
+                .join()
                 .map_err(|e| e.to_string())?
                 .Status()
                 .map_err(|e| e.to_string())?;

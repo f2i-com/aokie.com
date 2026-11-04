@@ -38,7 +38,7 @@ fn probe_adapters() {
     println!("\n--- Bluetooth adapters ---");
     use windows::Devices::Bluetooth::BluetoothAdapter;
     match BluetoothAdapter::GetDefaultAsync() {
-        Ok(op) => match op.get() {
+        Ok(op) => match op.join() {
             Ok(adapter) => {
                 let addr = adapter.BluetoothAddress().unwrap_or(0);
                 let radio = adapter.IsLowEnergySupported().unwrap_or(false);
@@ -66,7 +66,7 @@ fn probe_adapters() {
     use windows::Devices::Enumeration::DeviceInformation;
     let sel = BluetoothAdapter::GetDeviceSelector().unwrap_or_default();
     match DeviceInformation::FindAllAsyncAqsFilter(&sel) {
-        Ok(op) => match op.get() {
+        Ok(op) => match op.join() {
             Ok(devs) => {
                 let n = devs.Size().unwrap_or(0);
                 println!("[ok] {n} Bluetooth adapter device(s) enumerated");
@@ -91,7 +91,7 @@ fn probe_paired_devices() {
     use windows::Devices::Enumeration::DeviceInformation;
     let sel = BluetoothDevice::GetDeviceSelectorFromPairingState(true).unwrap_or_default();
     let devs = match DeviceInformation::FindAllAsyncAqsFilter(&sel) {
-        Ok(op) => match op.get() {
+        Ok(op) => match op.join() {
             Ok(d) => d,
             Err(e) => {
                 println!("[warn] paired-device enumeration: {}", hr(&e));
@@ -110,7 +110,7 @@ fn probe_paired_devices() {
         let name = d.Name().unwrap_or_default();
         println!("     - {name} | {id}");
         if let Ok(op) = BluetoothDevice::FromIdAsync(&id) {
-            if let Ok(dev) = op.get() {
+            if let Ok(dev) = op.join() {
                 let addr = dev.BluetoothAddress().unwrap_or(0);
                 println!(
                     "       address {:012X} connected={:?}",
@@ -118,7 +118,7 @@ fn probe_paired_devices() {
                     dev.ConnectionStatus().map(|s| s.0).unwrap_or(-1)
                 );
                 if let Ok(sop) = dev.GetRfcommServicesAsync() {
-                    if let Ok(services) = sop.get() {
+                    if let Ok(services) = sop.join() {
                         if let Ok(list) = services.Services() {
                             let mut found = Vec::new();
                             for s in list {
@@ -140,7 +140,7 @@ fn probe_paired_devices() {
                 use windows::Devices::Bluetooth::Rfcomm::RfcommServiceId;
                 if let Ok(sid) = RfcommServiceId::FromShortId(crate::MAP_MAS_SHORT_UUID as u32) {
                     match dev.GetRfcommServicesForIdAsync(&sid) {
-                        Ok(op) => match op.get() {
+                        Ok(op) => match op.join() {
                             Ok(res) => {
                                 let cnt =
                                     res.Services().map(|l| l.Size().unwrap_or(0)).unwrap_or(0);
@@ -169,7 +169,7 @@ fn probe_calls_api() {
     use windows::ApplicationModel::Calls::{PhoneCallManager, PhoneLineTransportDevice};
     // 1. The store → line watcher (restricted capability check).
     match PhoneCallManager::RequestStoreAsync() {
-        Ok(op) => match op.get() {
+        Ok(op) => match op.join() {
             Ok(store) => {
                 println!("[ok] PhoneCallStore acquired");
                 match store.RequestLineWatcher() {
@@ -188,7 +188,7 @@ fn probe_calls_api() {
                     ),
                 }
             }
-            Err(e) => println!("[FAIL] PhoneCallStore.get(): {}", hr(&e)),
+            Err(e) => println!("[FAIL] PhoneCallStore.join(): {}", hr(&e)),
         },
         Err(e) => println!("[FAIL] PhoneCallManager::RequestStoreAsync: {}", hr(&e)),
     }

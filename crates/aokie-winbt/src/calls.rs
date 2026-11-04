@@ -6,7 +6,7 @@
 //! consumes, so the plugin's radio module runs unchanged on either transport.
 //!
 //! Threading model: `start()` runs on the crate's MTA worker thread (blocking
-//! `.get()` is fine there). Watcher/`StatusChanged` handlers fire on arbitrary
+//! `.join()` is fine there). Watcher/`StatusChanged` handlers fire on arbitrary
 //! COM threads, so they do NOTHING but push an `EngineCmd` into a channel —
 //! never a COM call, never a lock. One poll thread drains the channel and owns
 //! all state mutation + event emission behind a single `Mutex`, so event order
@@ -350,7 +350,7 @@ impl CallsEngine {
         // probe (plan §6) proved works from this unpackaged process.
         let store = PhoneCallManager::RequestStoreAsync()
             .map_err(|e| hr("native calls: PhoneCallManager::RequestStoreAsync", &e))?
-            .get()
+            .join()
             .map_err(|e| hr("native calls: acquiring the phone call store", &e))?;
         let watcher = store
             .RequestLineWatcher()
@@ -841,7 +841,7 @@ fn on_line_added(st: &mut EngineState, id: &windows::core::GUID) {
         refresh_line_calls(st, &key);
         return;
     }
-    let line = match PhoneLine::FromIdAsync(*id).and_then(|op| op.get()) {
+    let line = match PhoneLine::FromIdAsync(*id).and_then(|op| op.join()) {
         Ok(line) => line,
         Err(e) => {
             st.emit(BluetoothEvent::Error(hr(
@@ -881,7 +881,7 @@ fn on_line_added(st: &mut EngineState, id: &windows::core::GUID) {
         let mut name = display_name;
         if !transport_device_id.is_empty() {
             match BluetoothDevice::FromIdAsync(&HSTRING::from(transport_device_id.as_str()))
-                .and_then(|op| op.get())
+                .and_then(|op| op.join())
             {
                 Ok(dev) => {
                     let addr = dev.BluetoothAddress().unwrap_or(0);
@@ -907,7 +907,7 @@ fn on_line_added(st: &mut EngineState, id: &windows::core::GUID) {
         // The adapter address only needs to go out once per engine run
         // (Initialized is the plugin's "radio is up" marker).
         if !st.initialized_sent {
-            if let Ok(adapter) = BluetoothAdapter::GetDefaultAsync().and_then(|op| op.get()) {
+            if let Ok(adapter) = BluetoothAdapter::GetDefaultAsync().and_then(|op| op.join()) {
                 let local = adapter.BluetoothAddress().unwrap_or(0);
                 if local != 0 {
                     let local = format_address(local);
@@ -1272,13 +1272,13 @@ fn resolve_number(st: &mut EngineState, key: &str) -> Option<String> {
     if !raw_id.is_empty() {
         if let Ok(entry) = store
             .GetEntryAsync(&HSTRING::from(raw_id.as_str()))
-            .and_then(|op| op.get())
+            .and_then(|op| op.join())
         {
             return history_entry_number(&entry);
         }
     }
     let reader = store.GetEntryReader().ok()?;
-    let batch = reader.ReadBatchAsync().and_then(|op| op.get()).ok()?;
+    let batch = reader.ReadBatchAsync().and_then(|op| op.join()).ok()?;
     let now = winrt_ticks_now();
     let mut recent = Vec::new();
     for entry in batch {
@@ -1315,7 +1315,7 @@ fn ensure_history_store(st: &mut EngineState) -> Option<PhoneCallHistoryStore> {
         PhoneCallHistoryStoreAccessType::AppEntriesReadWrite,
     ] {
         if let Ok(store) =
-            PhoneCallHistoryManager::RequestStoreAsync(access).and_then(|op| op.get())
+            PhoneCallHistoryManager::RequestStoreAsync(access).and_then(|op| op.join())
         {
             st.history = Some(store.clone());
             return Some(store);

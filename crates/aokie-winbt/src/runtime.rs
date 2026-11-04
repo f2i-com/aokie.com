@@ -118,7 +118,7 @@ impl TxAudio {
 /// `auto` transport probe). Cheap and side-effect free.
 pub fn adapter_present() -> bool {
     windows::Devices::Bluetooth::BluetoothAdapter::GetDefaultAsync()
-        .and_then(|op| op.get())
+        .and_then(|op| op.join())
         .is_ok()
 }
 

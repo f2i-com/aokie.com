@@ -66,11 +66,11 @@ macro_rules! bounded {
         let limit: Duration = $limit;
         let deadline = Instant::now() + limit;
         loop {
-            // AsyncStatus::Started is 0; anything else is over, and `get`
+            // AsyncStatus::Started is 0; anything else is over, and `join`
             // returns its result (or its error) at once.
             match op.Status() {
                 Ok(status) if status.0 == 0 => {}
-                _ => break op.get().map_err(|e| format!("{}: {}", $what, hr(&e))),
+                _ => break op.join().map_err(|e| format!("{}: {}", $what, hr(&e))),
             }
             if Instant::now() >= deadline {
                 let _ = op.Cancel();
