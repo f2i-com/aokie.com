@@ -96,10 +96,18 @@ pub fn client_for(
         builder = builder.connect_timeout(connect);
     }
 
-    let host = url
-        .host_str()
-        .ok_or_else(|| "endpoint URL has no host".to_string())?;
-    if let Ok(ip) = host.parse::<IpAddr>() {
+    // An IP literal is checked here: it has no DNS to resolve and nothing to pin.
+    // `host_str()` gives an IPv6 literal with its brackets ("[fd00::5]"), which
+    // never parsed as an address, so `http://[fd00::5]/…` and
+    // `http://[::ffff:169.254.169.254]/…` went through unchecked; `host()` gives
+    // the address itself.
+    let literal = match url.host() {
+        Some(url::Host::Ipv4(ip)) => Some(IpAddr::V4(ip)),
+        Some(url::Host::Ipv6(ip)) => Some(IpAddr::V6(ip)),
+        Some(url::Host::Domain(_)) => None,
+        None => return Err("endpoint URL has no host".to_string()),
+    };
+    if let Some(ip) = literal {
         if !ip.is_loopback() && !ip_is_public_unicast(ip) {
             return Err(format!(
                 "endpoint IP {ip} is private, link-local, metadata, or otherwise non-public"
@@ -227,6 +235,27 @@ mod tests {
         ] {
             assert!(!is_formlogic_gateway(not_gateway), "{not_gateway}");
         }
+    }
+
+    // Review 11: an IPv6 literal was never checked (its host_str has brackets).
+    #[test]
+    fn a_non_public_ipv6_literal_gets_no_client() {
+        for bad in [
+            "http://[fd00::5]:11434/v1",
+            "http://[fe80::1]/v1",
+            "http://[::ffff:169.254.169.254]/latest",
+            "http://[::ffff:10.0.0.7]:8080/v1",
+        ] {
+            let refused = client_for(bad, Duration::from_secs(5), None);
+            assert!(
+                refused.as_ref().is_err_and(|e| e.contains("non-public")),
+                "{bad}: {:?}",
+                refused.map(|_| ())
+            );
+        }
+        // Loopback stays allowed (on-device use), in either family.
+        assert!(client_for("http://[::1]:11434/v1", Duration::from_secs(5), None).is_ok());
+        assert!(client_for("http://127.0.0.1:11434/v1", Duration::from_secs(5), None).is_ok());
     }
 
     #[test]

@@ -444,6 +444,23 @@ pub(super) fn emit_transcript_settlements(
 /// action and the operation id from the accepted result — so a flow/UI can
 /// correlate "my command didn't happen" instead of trusting a premature verb.
 #[cfg(aokie_radio)]
+pub(super) const ANOTHER_CALL: &str =
+    "the call it was for is no longer the one on the line, so nothing was sent to the phone";
+
+/// Whether a call control the connector accepted for `accepted_for`
+/// (`RadioControl::Answer`, `Reject`, `Hangup`) would now act on another call,
+/// or on none: the call ended and the switchboard brought a waiting or parked
+/// caller forward before the radio thread got to the control. Such a control is
+/// refused with [`ANOTHER_CALL`], never sent to the phone.
+#[cfg(aokie_radio)]
+pub(super) fn accepted_for_another_call(
+    accepted_for: Option<&str>,
+    tracker: &crate::call_session::SessionTracker,
+) -> bool {
+    accepted_for.is_some_and(|id| tracker.call_id() != Some(id))
+}
+
+#[cfg(aokie_radio)]
 pub(super) fn emit_control_failed(
     outbox: OutboxRef<'_>,
     sink: &mut dyn Sink,

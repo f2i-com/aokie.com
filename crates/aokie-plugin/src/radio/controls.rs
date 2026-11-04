@@ -109,7 +109,24 @@ pub(super) fn service_controls(
             None => control_rx.try_recv(),
         };
         match next {
-            Ok(RadioControl::Answer { op })
+            // A control for a call that is no longer the one on the line would
+            // answer, reject or cut off whoever the switchboard brought forward.
+            Ok(RadioControl::Answer { op, call_id })
+                if accepted_for_another_call(call_id.as_deref(), &*tracker) =>
+            {
+                emit_control_failed(outbox, sink, tracker, "call.answer", op.as_deref(), ANOTHER_CALL);
+            }
+            Ok(RadioControl::Reject { op, call_id })
+                if accepted_for_another_call(call_id.as_deref(), &*tracker) =>
+            {
+                emit_control_failed(outbox, sink, tracker, "call.reject", op.as_deref(), ANOTHER_CALL);
+            }
+            Ok(RadioControl::Hangup { op, call_id })
+                if accepted_for_another_call(call_id.as_deref(), &*tracker) =>
+            {
+                emit_control_failed(outbox, sink, tracker, "call.hangup", op.as_deref(), ANOTHER_CALL);
+            }
+            Ok(RadioControl::Answer { op, .. })
                 if status.consent_expired() && tracker.current().is_some_and(|s| !s.is_active()) =>
             {
                 // Review 3 #6: past the consent grant's expiry the
@@ -123,7 +140,7 @@ pub(super) fn service_controls(
                     "consent has expired — re-consent in the Consent tab before the receptionist takes calls; the call keeps ringing on the phone",
                 );
             }
-            Ok(RadioControl::Answer { op }) => {
+            Ok(RadioControl::Answer { op, .. }) => {
                 // A call left ringing for the owner is the receptionist's
                 // once they answer it here.
                 tracker.hand_to_receptionist();
@@ -147,7 +164,7 @@ pub(super) fn service_controls(
                     );
                 }
             }
-            Ok(RadioControl::Reject { op }) => {
+            Ok(RadioControl::Reject { op, .. }) => {
                 // Record WHY before the phone acts, so the eventual
                 // CallTerminated reads outcome "rejected", never "missed"
                 // (audit AK-001/AK-01).
@@ -164,7 +181,7 @@ pub(super) fn service_controls(
                     );
                 }
             }
-            Ok(RadioControl::Hangup { op }) => {
+            Ok(RadioControl::Hangup { op, .. }) => {
                 tracker.note_intent(crate::call_session::TerminationIntent::OperatorHangup);
                 if let Err(e) = bt.hangup() {
                     eprintln!("[aokie-plugin] radio hangup failed: {e}");

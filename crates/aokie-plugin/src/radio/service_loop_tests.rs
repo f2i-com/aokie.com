@@ -1762,3 +1762,58 @@ fn an_item_oaiy_cut_is_not_played_out() {
     assert_eq!(lane.output_pacer.active_item(), Some("item_1"), "plays out");
     assert_eq!(lane.completed_transcript.as_ref().map(|(_, said)| said.as_str()), Some(text));
 }
+
+/// Review 11: a hang-up or reject the connector accepted for one call, caught
+/// mid-speech after that call ended and the switchboard brought another caller
+/// forward, is refused (`control_failed`, naming its operation): the phone is
+/// not told, so the caller now on the line is not cut off. For the call on the
+/// line it is carried out as before.
+#[test]
+fn a_cancel_accepted_for_another_call_is_refused_not_sent_to_the_phone() {
+    let mut bt = FakeBackend {
+        rate: 16_000,
+        call_audio: true,
+        hangups: std::cell::Cell::new(0),
+    };
+    let mut tracker = crate::call_session::SessionTracker::new();
+    tracker.ring("call_b".into(), aokie_core::events::now_iso8601());
+    let mut sink = crate::event_bridge::VecSink::default();
+
+    perform_cancel_action(
+        CancelAction::Hangup {
+            op: Some("op_a".into()),
+            call_id: Some("call_a".into()),
+        },
+        &mut bt,
+        &mut tracker,
+        None,
+        &mut sink,
+    );
+    assert_eq!(bt.hangups.get(), 0, "the caller now on the line is not cut off");
+    let events: Vec<Value> = sink
+        .lines
+        .iter()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(
+        events.iter().any(|v| v["params"]["event"]["data"]["code"] == json!("control_failed")
+            && v["params"]["event"]["data"]["operationId"] == json!("op_a")),
+        "{events:?}"
+    );
+
+    perform_cancel_action(
+        CancelAction::Hangup {
+            op: Some("op_b".into()),
+            call_id: Some("call_b".into()),
+        },
+        &mut bt,
+        &mut tracker,
+        None,
+        &mut sink,
+    );
+    assert_eq!(bt.hangups.get(), 1, "the call it was for is hung up");
+    assert!(
+        !accepted_for_another_call(None, &tracker),
+        "a control accepted with no call current is the phone's to judge"
+    );
+}

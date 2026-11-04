@@ -1832,6 +1832,7 @@ fn control_probe_catches_urgent_actions_and_parks_the_rest() {
     tx.send(RadioControl::StopPairing).unwrap();
     tx.send(RadioControl::Hangup {
         op: Some("op_1".into()),
+        call_id: Some("call_a".into()),
     })
     .unwrap();
     tx.send(RadioControl::StartPairing { seconds: 30 }).unwrap();
@@ -1840,7 +1841,8 @@ fn control_probe_catches_urgent_actions_and_parks_the_rest() {
     assert_eq!(
         probe.action,
         Some(CancelAction::Hangup {
-            op: Some("op_1".into())
+            op: Some("op_1".into()),
+            call_id: Some("call_a".into()),
         })
     );
     // Sticky once set, and the pre-hangup control was parked in order.
@@ -1852,9 +1854,9 @@ fn control_probe_catches_urgent_actions_and_parks_the_rest() {
     let mut parked = std::collections::VecDeque::new();
     let mut probe = ControlProbe::new(&rx, &mut parked);
     // The StartPairing sent above is still queued — it parks first.
-    tx.send(RadioControl::Reject { op: None }).unwrap();
+    tx.send(RadioControl::Reject { op: None, call_id: None }).unwrap();
     assert!(probe.poll());
-    assert_eq!(probe.action, Some(CancelAction::Reject { op: None }));
+    assert_eq!(probe.action, Some(CancelAction::Reject { op: None, call_id: None }));
     drop(probe);
     assert!(matches!(
         parked.front(),

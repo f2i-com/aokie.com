@@ -18,8 +18,8 @@ use super::*;
 #[cfg(feature = "voice")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum CancelAction {
-    Hangup { op: Option<String> },
-    Reject { op: Option<String> },
+    Hangup { op: Option<String>, call_id: Option<String> },
+    Reject { op: Option<String>, call_id: Option<String> },
 }
 
 /// Control-channel probe threaded through speech playback so a hangup/reject
@@ -55,12 +55,14 @@ impl<'a> ControlProbe<'a> {
         }
         while let Ok(c) = self.rx.try_recv() {
             match c {
-                RadioControl::Hangup { op } => {
-                    self.action = Some(CancelAction::Hangup { op });
+                // Which call it was for is checked where it is carried out
+                // (`perform_cancel_action`, which has the tracker).
+                RadioControl::Hangup { op, call_id } => {
+                    self.action = Some(CancelAction::Hangup { op, call_id });
                     return true;
                 }
-                RadioControl::Reject { op } => {
-                    self.action = Some(CancelAction::Reject { op });
+                RadioControl::Reject { op, call_id } => {
+                    self.action = Some(CancelAction::Reject { op, call_id });
                     return true;
                 }
                 other => self.parked.push_back(other),

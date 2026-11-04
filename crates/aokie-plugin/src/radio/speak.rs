@@ -823,16 +823,24 @@ pub(super) fn perform_cancel_action(
     outbox: OutboxRef<'_>,
     sink: &mut dyn Sink,
 ) {
+    let (verb, op, call_id) = match &action {
+        CancelAction::Hangup { op, call_id } => ("call.hangup", op, call_id),
+        CancelAction::Reject { op, call_id } => ("call.reject", op, call_id),
+    };
+    if accepted_for_another_call(call_id.as_deref(), tracker) {
+        emit_control_failed(outbox, sink, tracker, verb, op.as_deref(), ANOTHER_CALL);
+        return;
+    }
     bt.flush_tx_audio();
     match action {
-        CancelAction::Hangup { op } => {
+        CancelAction::Hangup { op, .. } => {
             tracker.note_intent(crate::call_session::TerminationIntent::OperatorHangup);
             if let Err(e) = bt.hangup() {
                 eprintln!("[aokie-plugin] mid-playback hangup failed: {e}");
                 emit_control_failed(outbox, sink, tracker, "call.hangup", op.as_deref(), &e);
             }
         }
-        CancelAction::Reject { op } => {
+        CancelAction::Reject { op, .. } => {
             tracker.note_intent(crate::call_session::TerminationIntent::OperatorReject);
             if let Err(e) = bt.reject_call() {
                 eprintln!("[aokie-plugin] mid-playback reject failed: {e}");

@@ -1683,11 +1683,10 @@ impl Plugin {
                 .and_then(Value::as_i64)
                 .unwrap_or(DEFAULT_MAX_DAILY_TEXTS)
                 .clamp(1, 2000) as u32;
-            let today = aokie_core::events::today_local_ymd();
-            let used = match self.store.config.sms_ledger.as_ref() {
-                Some(l) if l.date == today => l.count,
-                _ => 0,
-            };
+            let (used, today) = daily_use(
+                self.store.config.sms_ledger.as_ref(),
+                &aokie_core::events::today_local_ymd(),
+            );
             if used >= max_daily {
                 return Err(CmdError::failed(format!(
                     "sms.send refused: daily text cap reached ({used}/{max_daily} today) — raise maxDailyTexts or try tomorrow"
@@ -3488,7 +3487,11 @@ impl Plugin {
                 let obj = expect_fields(payload, &["callId"])?;
                 let call_id = optional_str(&obj, "callId")?;
                 if let Some(radio) = self.radio.as_ref() {
-                    check_call_id(call_id.as_deref(), radio.current_call_id().as_deref())?;
+                    // The call checked is the call the radio is told it is for:
+                    // it refuses the control if another call is on the line by
+                    // the time it gets to it (`RadioControl::Answer`).
+                    let current = radio.current_call_id();
+                    check_call_id(call_id.as_deref(), current.as_deref())?;
                     // AOK-CTRL-001: the result reports ACCEPTANCE, never the
                     // final verb — the phone hasn't acted yet. The authoritative
                     // confirmation is the `aokie.call.answered` event (or a
@@ -3498,6 +3501,7 @@ impl Plugin {
                     radio
                         .send(crate::radio::RadioControl::Answer {
                             op: Some(op.clone()),
+                            call_id: current.clone(),
                         })
                         .map_err(CmdError::failed)?;
                     return Ok(json!({
@@ -3505,7 +3509,7 @@ impl Plugin {
                         "queued": true,
                         "operationId": op,
                         "via": "radio",
-                        "callId": radio.current_call_id(),
+                        "callId": current,
                     }));
                 }
                 self.require_radio_or_dev("call.answer")?;
@@ -3538,13 +3542,15 @@ impl Plugin {
                 let obj = expect_fields(payload, &["callId"])?;
                 let call_id = optional_str(&obj, "callId")?;
                 if let Some(radio) = self.radio.as_ref() {
-                    check_call_id(call_id.as_deref(), radio.current_call_id().as_deref())?;
+                    let current = radio.current_call_id();
+                    check_call_id(call_id.as_deref(), current.as_deref())?;
                     // AOK-CTRL-001: acceptance only — `aokie.call.ended`
                     // (outcome "rejected") is the authoritative confirmation.
                     let op = operation_id();
                     radio
                         .send(crate::radio::RadioControl::Reject {
                             op: Some(op.clone()),
+                            call_id: current.clone(),
                         })
                         .map_err(CmdError::failed)?;
                     return Ok(json!({
@@ -3552,7 +3558,7 @@ impl Plugin {
                         "queued": true,
                         "operationId": op,
                         "via": "radio",
-                        "callId": radio.current_call_id(),
+                        "callId": current,
                     }));
                 }
                 self.require_radio_or_dev("call.reject")?;
@@ -3582,13 +3588,15 @@ impl Plugin {
                 let obj = expect_fields(payload, &["callId"])?;
                 let call_id = optional_str(&obj, "callId")?;
                 if let Some(radio) = self.radio.as_ref() {
-                    check_call_id(call_id.as_deref(), radio.current_call_id().as_deref())?;
+                    let current = radio.current_call_id();
+                    check_call_id(call_id.as_deref(), current.as_deref())?;
                     // AOK-CTRL-001: acceptance only — `aokie.call.ended` is the
                     // authoritative confirmation the call actually ended.
                     let op = operation_id();
                     radio
                         .send(crate::radio::RadioControl::Hangup {
                             op: Some(op.clone()),
+                            call_id: current.clone(),
                         })
                         .map_err(CmdError::failed)?;
                     return Ok(json!({
@@ -3596,7 +3604,7 @@ impl Plugin {
                         "queued": true,
                         "operationId": op,
                         "via": "radio",
-                        "callId": radio.current_call_id(),
+                        "callId": current,
                     }));
                 }
                 self.require_radio_or_dev("call.hangup")?;
@@ -3847,11 +3855,10 @@ impl Plugin {
                     )));
                 }
                 let max_daily = int_setting("maxDailyDials", 20).max(1) as u32;
-                let today = aokie_core::events::today_local_ymd();
-                let used = match self.store.config.dial_ledger.as_ref() {
-                    Some(l) if l.date == today => l.count,
-                    _ => 0,
-                };
+                let (used, today) = daily_use(
+                    self.store.config.dial_ledger.as_ref(),
+                    &aokie_core::events::today_local_ymd(),
+                );
                 if used >= max_daily {
                     return Err(CmdError::failed(format!(
                         "daily dial cap reached ({used}/{max_daily} today) — raise maxDailyDials or try tomorrow"
@@ -5208,6 +5215,27 @@ fn check_in_response_to(provided: Option<u64>, last_caller_turn: u32) -> Result<
     Ok(())
 }
 
+/// Today's use of a daily cap (`maxDailyDials`, `maxDailyTexts`), and the day the
+/// ledger is kept under. The ledger's day still counts when the local date is
+/// earlier than it (a clock put back, a time zone further west): equality alone
+/// gave a fresh allowance then, and another at the next midnight. A ledger more
+/// than a day ahead (a clock that was wrong and has been put right, or a damaged
+/// file) is not honoured, so it cannot hold the cap shut for days.
+fn daily_use(ledger: Option<&crate::config::DialLedger>, today: &str) -> (u32, String) {
+    let held = ledger.filter(|l| {
+        let (Ok(day), Ok(now)) = (
+            chrono::NaiveDate::parse_from_str(&l.date, "%Y-%m-%d"),
+            chrono::NaiveDate::parse_from_str(today, "%Y-%m-%d"),
+        ) else {
+            return l.date == today;
+        };
+        day >= now && day <= now + chrono::Days::new(1)
+    });
+    match held {
+        Some(l) => (l.count, l.date.clone()),
+        None => (0, today.to_owned()),
+    }
+}
 fn check_call_id(provided: Option<&str>, current: Option<&str>) -> Result<(), CmdError> {
     match (provided, current) {
         (None, _) => Ok(()),
@@ -9419,8 +9447,10 @@ mod tests {
             "the final verb must wait for the phone's confirmation event: {data}"
         );
         match control_rx.try_recv().unwrap() {
-            crate::radio::RadioControl::Answer { op: sent } => {
-                assert_eq!(sent.as_deref(), Some(op.as_str()))
+            crate::radio::RadioControl::Answer { op: sent, call_id } => {
+                assert_eq!(sent.as_deref(), Some(op.as_str()));
+                // The call it was checked against goes with it, for the radio to check again.
+                assert_eq!(call_id.as_deref(), Some("call_live1"));
             }
             _ => panic!("expected the Answer control"),
         }
@@ -9432,7 +9462,7 @@ mod tests {
         assert!(data.get("ended").is_none(), "{data}");
         assert!(matches!(
             control_rx.try_recv().unwrap(),
-            crate::radio::RadioControl::Hangup { op: Some(_) }
+            crate::radio::RadioControl::Hangup { op: Some(_), call_id: Some(ref id) } if id == "call_live1"
         ));
 
         let data = plugin
@@ -9442,7 +9472,7 @@ mod tests {
         assert!(data.get("rejected").is_none(), "{data}");
         assert!(matches!(
             control_rx.try_recv().unwrap(),
-            crate::radio::RadioControl::Reject { op: Some(_) }
+            crate::radio::RadioControl::Reject { op: Some(_), call_id: Some(ref id) } if id == "call_live1"
         ));
 
         // operatorSpeak: voice builds accept (queued, op id) unless the agent
@@ -12197,5 +12227,29 @@ mod tests {
             .unwrap();
         assert_eq!(data["status"], json!("pairing"));
         assert_eq!(data["simulated"], json!(true));
+    }
+}
+
+#[cfg(test)]
+mod daily_use_tests {
+    use super::daily_use;
+    use crate::config::DialLedger;
+
+    fn ledger(date: &str, count: u32) -> DialLedger {
+        DialLedger { date: date.into(), count }
+    }
+
+    // Review 11: a date that went backwards gave a fresh allowance.
+    #[test]
+    fn the_cap_holds_when_the_local_date_goes_back_and_resets_when_it_passes() {
+        assert_eq!(daily_use(None, "2026-11-04"), (0, "2026-11-04".into()));
+        assert_eq!(daily_use(Some(&ledger("2026-11-04", 20)), "2026-11-04"), (20, "2026-11-04".into()));
+        // The clock put back, or a time zone further west: still the ledger's day.
+        assert_eq!(daily_use(Some(&ledger("2026-11-05", 20)), "2026-11-04"), (20, "2026-11-05".into()));
+        // A new day.
+        assert_eq!(daily_use(Some(&ledger("2026-11-03", 20)), "2026-11-04"), (0, "2026-11-04".into()));
+        // More than a day ahead, or unreadable: not honoured.
+        assert_eq!(daily_use(Some(&ledger("2027-01-01", 20)), "2026-11-04"), (0, "2026-11-04".into()));
+        assert_eq!(daily_use(Some(&ledger("not a date", 20)), "2026-11-04"), (0, "2026-11-04".into()));
     }
 }

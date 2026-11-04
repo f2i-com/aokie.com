@@ -36,14 +36,24 @@ pub enum RadioControl {
     /// connector when it ACCEPTED the command, so the radio can attribute an
     /// asynchronous failure (`aokie.hardware.error` code `control_failed`) to
     /// the exact request. `None` = internally-generated (no caller waiting).
+    ///
+    /// `call_id` is the call that was current when the connector accepted it.
+    /// The radio thread handles the phone's events before its controls, so by
+    /// the time it gets to one the call may have ended and the switchboard
+    /// brought a waiting or parked caller forward: a control for another call
+    /// than the one now on the line is refused (`control_failed`), never sent
+    /// to the phone. `None` = no call was current (the phone decides).
     Answer {
         op: Option<String>,
+        call_id: Option<String>,
     },
     Reject {
         op: Option<String>,
+        call_id: Option<String>,
     },
     Hangup {
         op: Option<String>,
+        call_id: Option<String>,
     },
     /// Protocol-v2 caller ending. Unlike the public connector hangup, this
     /// command carries the complete takeover/physical fence and is checked

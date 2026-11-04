@@ -339,7 +339,19 @@ pub(super) fn run_reply_rounds(
             // everything else parks for the main control loop.
             while let Ok(ctl) = control_rx.try_recv() {
                 match ctl {
-                    RadioControl::Hangup { op } => {
+                    // Accepted for a call that is no longer this one: refused,
+                    // and this reply goes on.
+                    RadioControl::Hangup { op, call_id }
+                        if accepted_for_another_call(call_id.as_deref(), &*tracker) =>
+                    {
+                        emit_control_failed(outbox, sink, tracker, "call.hangup", op.as_deref(), ANOTHER_CALL);
+                    }
+                    RadioControl::Reject { op, call_id }
+                        if accepted_for_another_call(call_id.as_deref(), &*tracker) =>
+                    {
+                        emit_control_failed(outbox, sink, tracker, "call.reject", op.as_deref(), ANOTHER_CALL);
+                    }
+                    RadioControl::Hangup { op, .. } => {
                         tracker.note_intent(
                         crate::call_session::TerminationIntent::OperatorHangup,
                     );
@@ -357,7 +369,7 @@ pub(super) fn run_reply_rounds(
                         }
                         operator_ended = true; // record only what played, not "caller interrupted"
                     }
-                    RadioControl::Reject { op } => {
+                    RadioControl::Reject { op, .. } => {
                         tracker.note_intent(
                         crate::call_session::TerminationIntent::OperatorReject,
                     );
