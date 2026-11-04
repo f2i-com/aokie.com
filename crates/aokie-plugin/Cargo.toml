@@ -43,7 +43,7 @@ chrono = { workspace = true }
 # CONSENT-001: verify the Desktop-issued signature on consent grants (the
 # verify key arrives via the parent process env; grants that don't verify
 # never satisfy the consent gate).
-ed25519-dalek = { version = "2", features = ["signature"] }
+ed25519-dalek = { version = "3", features = ["signature"] }
 base64 = "0.23"
 regex = "1"
 # Same major as the legacy app (aokie-desktop pins 0.31) so the two

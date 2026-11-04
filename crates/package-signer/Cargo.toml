@@ -6,7 +6,7 @@ rust-version = "1.88"
 description = "First-party Ed25519 package-manifest signing for Aokie release bundles (TRUST-001)"
 
 [dependencies]
-ed25519-dalek = { version = "2", features = ["signature", "rand_core"] }
+ed25519-dalek = { version = "3", features = ["signature", "rand_core"] }
 base64 = "0.23"
 sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
