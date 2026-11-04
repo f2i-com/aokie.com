@@ -13,7 +13,21 @@ read_secret() {
     exit 78
   fi
 
+  # The secret is the file's text without its trailing line break, CR and LF
+  # alike, as examples/mint_credentials.py reads it: $(...) drops trailing LFs
+  # only, so a file saved with CRLF kept its CR here, and every admission an
+  # issuer signed with the text alone was refused.
+  cr="$(printf '\r')"
   value="$(cat "$file")"
+  while :; do
+    case "$value" in
+      *"$cr") value="${value%"$cr"}" ;;
+      *"
+") value="${value%"
+"}" ;;
+      *) break ;;
+    esac
+  done
   length="${#value}"
   if [ "$length" -lt 32 ] || [ "$length" -gt 4096 ]; then
     echo "aokie-realtime: $label secret must contain 32..4096 bytes" >&2

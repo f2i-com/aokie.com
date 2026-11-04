@@ -83,6 +83,12 @@ cp /etc/coturn/turnserver.base.conf "$runtime"
   else
     # Prevent valid TURN users from using this server to reach loopback,
     # link-local, RFC1918/CGNAT, documentation, multicast or ULA networks.
+    # coturn takes only IP or IP-IP here and ABORTS at start on an entry it
+    # cannot parse, so every address must be a valid literal: selfhost-smoke.yml
+    # starts this branch too. ::-::ffff:ffff:ffff covers the unspecified and
+    # loopback addresses and the IPv4-compatible and IPv4-mapped ranges; the
+    # 64:ff9b ranges are NAT64 prefixes (RFC 6052, RFC 8215) that a NAT64
+    # gateway beside this host would carry to any IPv4 address, private too.
     printf '%s\n' \
       'denied-peer-ip=0.0.0.0-0.255.255.255' \
       'denied-peer-ip=10.0.0.0-10.255.255.255' \
@@ -97,7 +103,9 @@ cp /etc/coturn/turnserver.base.conf "$runtime"
       'denied-peer-ip=198.51.100.0-198.51.100.255' \
       'denied-peer-ip=203.0.113.0-203.0.113.255' \
       'denied-peer-ip=224.0.0.0-255.255.255.255' \
-      'denied-peer-ip=::-::ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff' \
+      'denied-peer-ip=::-::ffff:ffff:ffff' \
+      'denied-peer-ip=64:ff9b::-64:ff9b::ffff:ffff' \
+      'denied-peer-ip=64:ff9b:1::-64:ff9b:1:ffff:ffff:ffff:ffff:ffff' \
       'denied-peer-ip=100::-1ff:ffff:ffff:ffff:ffff:ffff:ffff:ffff' \
       'denied-peer-ip=2001:db8::-2001:db8:ffff:ffff:ffff:ffff:ffff:ffff' \
       'denied-peer-ip=fc00::-fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff' \

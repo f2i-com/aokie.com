@@ -62,6 +62,11 @@ const MAX_USED_ENDPOINT_JTIS: usize = 65_536;
 const MAX_USED_ENDPOINT_JTIS_PER_APP: usize = 4_096;
 const MAX_ASSISTANCE_TTL: u64 = 300;
 const END_CALLER_CONFIRM_TTL: u64 = 12;
+// A microphone request waits this long for the Desktop's confirmation. The
+// Desktop sends none when the request crossed a fence it has since moved past,
+// or when its own mute failed; without an end, one such request refused every
+// later one from that phone ("microphone_request_pending") until a restart.
+const MICROPHONE_CONFIRM_TTL: u64 = 10;
 const END_CALLER_HISTORY_CAPACITY: usize = 128;
 const PLUGIN_RECONNECT_GRACE: Duration = Duration::from_secs(5);
 const PLUGIN_INBOUND_TIMEOUT: Duration = Duration::from_secs(40);
@@ -893,6 +898,7 @@ struct PendingMicrophoneMute {
     remote_revision: u64,
     fence: u64,
     muted: bool,
+    requested_at: u64,
 }
 
 struct EndCallerChallengeRecord {
@@ -1734,7 +1740,11 @@ async fn register_mobile(
         .is_some_and(|current| {
             current.session_nonce == hello.session_nonce
                 && current.endpoint_key.thumbprint == *incoming_key_thumbprint
-                && current.grants == admission.scopes
+                // The same grants, in whatever order the issuer lists them (the
+                // README asks only that they be unique): a renewal that lists
+                // them in another order is not a new session.
+                && current.grants.iter().collect::<HashSet<_>>()
+                    == admission.scopes.iter().collect::<HashSet<_>>()
         });
     if !rolling_admission_refresh {
         recover_device(
@@ -3223,6 +3233,13 @@ async fn handle_microphone_mute(
             Some(&frame.request_id),
         );
     }
+    // A request the Desktop never answered, or whose lease has gone (revoked,
+    // or rolled to a new jti by a heartbeat), no longer holds the phone's turn.
+    let leases = &app.leases;
+    app.pending_microphone_mutes.retain(|_, pending| {
+        now < pending.requested_at.saturating_add(MICROPHONE_CONFIRM_TTL)
+            && leases.contains_key(&pending.lease_jti)
+    });
     if let Some(pending) = app.pending_microphone_mutes.get(&frame.request_id) {
         if pending.device_id == admission.subject_id
             && pending.fingerprint == request_fingerprint
@@ -3291,6 +3308,7 @@ async fn handle_microphone_mute(
             remote_revision: frame.remote_revision,
             fence: claims.fence,
             muted: frame.muted,
+            requested_at: now,
         },
     );
     Ok(())
@@ -3330,10 +3348,14 @@ async fn handle_microphone_mute_status(
             "plugin microphone status crossed its exact request fence",
         ));
     }
-    let lease = app
-        .leases
-        .get(&frame.lease_jti)
-        .ok_or_else(|| GatewayError::nonfatal("stale_lease", "microphone lease is gone"))?;
+    let Some(lease) = app.leases.get(&frame.lease_jti) else {
+        // Its lease is gone: the request is over, and must not hold the phone's turn.
+        app.pending_microphone_mutes.remove(&frame.request_id);
+        return Err(GatewayError::nonfatal(
+            "stale_lease",
+            "microphone lease is gone",
+        ));
+    };
     if lease.claims.device_id != frame.device_id
         || lease.claims.lease_id != frame.lease_id
         || lease.claims.rtc_session_id != frame.rtc_session_id
@@ -5037,13 +5059,17 @@ fn revoke_one(
         record.claims.phase,
         record.claims.fence,
         record.claims.jti,
-        reason
+        // A phone's own revoke names its reason: escaped, so a line break in it
+        // cannot write a line of its own into this log.
+        reason.escape_debug()
     );
     if let Some(opportunity_id) = record.offer_opportunity_id.as_deref() {
         app.mobile_offer_winners.remove(opportunity_id);
     }
     app.end_caller_challenges
         .retain(|_, challenge| challenge.lease_jti != jti);
+    app.pending_microphone_mutes
+        .retain(|_, pending| pending.lease_jti != jti);
     if app
         .end_caller_operation
         .as_ref()
@@ -6418,6 +6444,17 @@ mod tests {
 
     #[tokio::test]
     async fn overlapping_mobile_admission_refresh_preserves_active_takeover() {
+        mobile_admission_refresh_preserves_active_takeover(false).await;
+    }
+
+    // An issuer may list the same grants in another order on a renewal (the
+    // README asks only that they be unique): still the same session.
+    #[tokio::test]
+    async fn a_refresh_that_lists_the_same_grants_in_another_order_preserves_active_takeover() {
+        mobile_admission_refresh_preserves_active_takeover(true).await;
+    }
+
+    async fn mobile_admission_refresh_preserves_active_takeover(reorder_grants: bool) {
         let gateway = gateway();
         let (mut app, _plugin_rx, _old_mobile_rx) = app_with_peers();
         let mut old_fenced = app
@@ -6478,7 +6515,10 @@ mod tests {
                 },
             },
         );
-        let scopes = app.mobiles["device_a"].grants.clone();
+        let mut scopes = app.mobiles["device_a"].grants.clone();
+        if reorder_grants {
+            scopes.reverse();
+        }
         gateway
             .inner
             .v2
@@ -8552,5 +8592,79 @@ mod tests {
             Some("confirmation_stale" | "stale_lease")
         ));
         assert_no_end_execute(&mut plugin_rx);
+    }
+
+    // The Desktop sends no confirmation for a microphone request that crossed a
+    // fence it has moved past (or whose mute failed). One such request used to
+    // refuse every later one from that phone, on this call and the next, until
+    // the gateway restarted.
+    #[tokio::test]
+    async fn an_unanswered_microphone_request_ends_after_its_wait_and_with_its_lease() {
+        // A frame that should come within a second, or a failure (not a hang).
+        async fn next_json(rx: &mut mpsc::Receiver<Message>) -> Value {
+            tokio::time::timeout(Duration::from_secs(1), text_json(rx))
+                .await
+                .expect("a frame within a second")
+        }        let (gateway, token, mut plugin_rx, mut mobile_rx) = active_end_caller_gateway().await;
+        let mobile = admission("device_a");
+        let mute = |request: &str, muted: bool| MobileMicrophoneMuteFrame {
+            kind: "microphone_mute".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: "app_a".into(),
+            request_id: request.into(),
+            idempotency_key: format!("key-{request}"),
+            lease_token: token.clone(),
+            rtc_session_id: "rtc_end".into(),
+            call_id: "call_a".into(),
+            call_epoch: 7,
+            owner_epoch: 3,
+            switchboard_revision: 11,
+            remote_revision: 13,
+            fence: 9,
+            muted,
+        };
+        handle_microphone_mute(&gateway, &mobile, "mobile_conn", mute("mute_1", true))
+            .await
+            .unwrap();
+        assert_eq!(next_json(&mut plugin_rx).await["kind"], "plugin_microphone_mute");
+
+        // While the first waits for its answer, a second is refused.
+        handle_microphone_mute(&gateway, &mobile, "mobile_conn", mute("mute_2", false))
+            .await
+            .unwrap();
+        assert_eq!(next_json(&mut mobile_rx).await["code"], "microphone_request_pending");
+
+        // No answer within the wait: the next request goes to the Desktop.
+        {
+            let mut apps = gateway.inner.v2.apps.lock().await;
+            let pending = apps
+                .get_mut("app_a")
+                .unwrap()
+                .pending_microphone_mutes
+                .get_mut("mute_1")
+                .unwrap();
+            pending.requested_at = pending.requested_at.saturating_sub(MICROPHONE_CONFIRM_TTL);
+        }
+        handle_microphone_mute(&gateway, &mobile, "mobile_conn", mute("mute_3", false))
+            .await
+            .unwrap();
+        let routed = next_json(&mut plugin_rx).await;
+        assert_eq!(routed["kind"], "plugin_microphone_mute");
+        assert_eq!(routed["requestId"], "mute_3");
+
+        // And when the call's authority goes, so does a request still waiting.
+        let idle = PluginIdleFrame {
+            kind: "plugin_idle".into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: "app_a".into(),
+            event_id: "idle_1".into(),
+        };
+        handle_idle(&gateway, &plugin_admission(), "plugin_conn", idle)
+            .await
+            .unwrap();
+        let apps = gateway.inner.v2.apps.lock().await;
+        let app = apps.get("app_a").unwrap();
+        assert!(app.leases.is_empty());
+        assert!(app.pending_microphone_mutes.is_empty());
     }
 }

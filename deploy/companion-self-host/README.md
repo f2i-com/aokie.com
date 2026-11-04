@@ -126,8 +126,10 @@ ports beyond loopback or set `TURN_ALLOW_PRIVATE_PEERS=1` in public.
 
 ## Admission issuer contract
 
-The trusted FormLogic/custom auth service reads the same bytes as
-`secrets/admission-hmac.txt`, after it authenticates the requester and verifies
+The trusted FormLogic/custom auth service uses the same secret as the gateway:
+the text of `secrets/admission-hmac.txt` without its trailing line break (CR
+and LF), as `examples/mint_credentials.py` reads it and the gateway's
+entrypoint does. It does so after it authenticates the requester and verifies
 that the device/desktop is authorized for that app. It creates compact UTF-8
 JSON with exact camel-case identity and peer-policy claims (shown formatted
 below for readability). A mobile admission binds its endpoint holder to one
@@ -201,7 +203,9 @@ same fields. Grant `consult` only when both deployed endpoints support it.
 
 ## Expiring TURN REST credentials
 
-The trusted issuer also reads the same bytes as `secrets/turn-rest.txt`. After
+The trusted issuer also uses the text of `secrets/turn-rest.txt` without its
+trailing line break, as coturn's entrypoint does (that entrypoint refuses a
+file saved with CRLF). After
 authorization it chooses an expiry that outlasts the longest call it expects:
 12 hours is the reference default and 24 hours the maximum the Aokie endpoints
 accept. coturn checks the timestamp in the username on every authenticated

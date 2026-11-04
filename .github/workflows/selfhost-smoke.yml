@@ -8,7 +8,8 @@ name: Self-host smoke
 #
 # Scope: the container lock fitting its crates (scripts/check-container-lock.sh),
 # template rendering acceptance, compose config validation (both
-# profiles), image build with --pull, local-profile boot to HEALTHY (the
+# profiles), coturn started with the public profile's deny list,
+# image build with --pull, local-profile boot to HEALTHY (the
 # coturn healthcheck performs a real STUN transaction), gateway /version,
 # container-lock cargo audit, teardown. The full WebSocket handshake +
 # forced-relay TURN allocation remains the labelled manual step
@@ -41,11 +42,42 @@ jobs:
         run: sh render-test.sh
 
       - name: Temporary secrets
+        # As the README's setup: Docker mounts a file secret with its host owner and mode, and each container reads
+        # its own as an unprivileged user (gateway 65532, coturn's nobody 65534). Left as the runner's 0600 files,
+        # both entrypoints stop with "secret is not readable" and the boot below never turns healthy.
         run: |
           umask 077
           openssl rand -hex 32 > secrets/admission-hmac.txt
           openssl rand -hex 32 > secrets/lease-hmac.txt
           openssl rand -hex 32 > secrets/turn-rest.txt
+          sudo chown 65532:65532 secrets/admission-hmac.txt secrets/lease-hmac.txt
+          sudo chown 65534:65534 secrets/turn-rest.txt
+          sudo chmod 0400 secrets/admission-hmac.txt secrets/lease-hmac.txt secrets/turn-rest.txt
+
+      - name: coturn starts with the public profile's deny list
+        # The local profile below allows private peers, so it never renders the public deny list; coturn aborts at
+        # start on an entry it cannot parse (an invalid IPv6 bound kept the public profile down from July to November
+        # 2026). Start the pinned image with the public branch and ask it for a STUN answer.
+        run: |
+          image="$(sed -n 's/^ *image: \(coturn\/coturn:.*\)$/\1/p' compose.yaml | head -n 1)"
+          [ -n "$image" ] || { echo "no coturn image in compose.yaml"; exit 1; }
+          docker run -d --name coturn-public-check --read-only \
+            --tmpfs /tmp:size=16m,mode=1777 --tmpfs /var/lib/coturn:size=16m,mode=0700 --tmpfs /var/run:size=4m,mode=0755 \
+            -e TURN_SECRET_FILE=/run/secrets/turn_rest -e TURN_REALM=turn.example.com \
+            -e TURN_EXTERNAL_IPV4=203.0.113.10 -e TURN_ALLOW_PRIVATE_PEERS=0 \
+            -v "$PWD/coturn-entrypoint.sh:/opt/aokie/coturn-entrypoint.sh:ro" \
+            -v "$PWD/coturn.base.conf:/etc/coturn/turnserver.base.conf:ro" \
+            -v "$PWD/secrets/turn-rest.txt:/run/secrets/turn_rest:ro" \
+            --entrypoint /bin/sh "$image" /opt/aokie/coturn-entrypoint.sh
+          ok=0
+          for attempt in $(seq 1 20); do
+            if docker exec coturn-public-check turnutils_stunclient -p 3478 -t 1000 127.0.0.1 > /dev/null 2>&1; then ok=1; break; fi
+            [ "$(docker inspect -f '{{.State.Running}}' coturn-public-check)" = true ] || break
+            sleep 1
+          done
+          docker logs coturn-public-check 2>&1 | grep -E 'ERROR|Abort' || true
+          docker rm -f coturn-public-check > /dev/null
+          [ "$ok" = 1 ] || { echo "coturn did not start with the public deny list"; exit 1; }
 
       - name: Compose config — public profile
         run: |
