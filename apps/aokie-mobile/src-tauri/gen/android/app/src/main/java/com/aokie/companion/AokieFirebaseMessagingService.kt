@@ -193,13 +193,18 @@ internal object AokiePushRegistration {
 
   fun tokenPresent(context: Context): Boolean = AokieSecureStore.contains(context, FCM_TOKEN_KEY)
 
+  // The marker is the one Rust writes once the server has the endpoint
+  // (push_registration.rs, registration_marker): "v2:" and a digest of the token
+  // together with the server, profile, app and sign-in, which this side cannot
+  // work out again. This compared it with a digest of the token alone, so a
+  // phone that had registered always read "registration required". A marker is
+  // deleted whenever the token changes (onNewToken, refresh), so one that is
+  // here was written for this token. A bare digest is an earlier build's
+  // marker: Rust registers that phone again, so it is not current.
   fun registrationCurrent(context: Context): Boolean {
-    val token = AokieSecureStore.get(context, FCM_TOKEN_KEY) ?: return false
+    if (AokieSecureStore.get(context, FCM_TOKEN_KEY) == null) return false
     val registered = AokieSecureStore.get(context, FCM_REGISTRATION_KEY) ?: return false
-    val digest = java.security.MessageDigest.getInstance("SHA-256")
-      .digest(token.toByteArray(Charsets.UTF_8))
-      .joinToString(separator = "") { byte -> "%02x".format(byte.toInt() and 0xff) }
-    return registered == digest
+    return registered.startsWith("v2:")
   }
 
   fun invalidate(context: Context): Int {

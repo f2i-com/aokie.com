@@ -53,6 +53,7 @@ import {
 import AokieCompanion from "./features/shell/AokieCompanion";
 import V2WorkspaceShell, { type CompanionAvailabilityValue } from "./features/live/V2WorkspaceShell";
 import DesktopPairingDialog from "./features/pairing/DesktopPairingDialog";
+import { settlePeerTrust } from "./features/pairing/peerTrustDecision";
 import { createCommand, MAX_ASSISTANCE_ANSWER_CHARACTERS, MAX_V2_ASSISTANCE_ANSWER_BYTES, truncateToUtf8Bytes, utf8ByteLength } from "./protocol/codec";
 import type { CallSnapshot, CommandEnvelope, CommandPayloads, CommandType } from "./protocol/types";
 import { shouldClearAssistanceDraft } from "./state/assistanceDraft";
@@ -1229,16 +1230,26 @@ function App() {
         <DesktopPeerTrustDialog
           challenge={desktopPeerTrust}
           onDecision={async (approved) => {
-            const challenge = desktopPeerTrust;
-            await bridge.confirmDesktopPeerTrust(challenge, approved);
-            setDesktopPeerTrust(null);
-            const retry = peerTrustRetryConfig.current;
-            peerTrustRetryConfig.current = null;
-            if (approved && retry) await connect(retry);
+            await settlePeerTrust(
+              {
+                confirm: (challenge, answer) => bridge.confirmDesktopPeerTrust(challenge, answer),
+                disconnect: disconnectToSetup,
+                clear: () => {
+                  setDesktopPeerTrust(null);
+                  peerTrustRetryConfig.current = null;
+                },
+                reconnect: connect,
+              },
+              desktopPeerTrust,
+              approved,
+              peerTrustRetryConfig.current,
+            );
           }}
+          // An expired comparison ends the connection too: its retries would
+          // otherwise raise the next one by themselves. "Start the connection
+          // again" (the dialog's words) asks for a fresh challenge.
           onExpired={() => {
-            setDesktopPeerTrust(null);
-            peerTrustRetryConfig.current = null;
+            void disconnectToSetup();
           }}
         />
       )}

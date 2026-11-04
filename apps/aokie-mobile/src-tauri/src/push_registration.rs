@@ -371,6 +371,13 @@ mod tests {
         // the marker reveals neither the token nor the binding.
         assert_ne!(marker, fingerprint);
         assert!(!marker.contains("oauth_device_1") && !marker.contains(&fingerprint));
+        // Android's diagnostics read this marker by its form (they cannot work out
+        // the binding): a registered phone must read "registered" there.
+        assert!(marker.starts_with("v2:"));
+        let kotlin = include_str!(
+            "../gen/android/app/src/main/java/com/aokie/companion/AokieFirebaseMessagingService.kt"
+        );
+        assert!(kotlin.contains("return registered.startsWith(\"v2:\")"));
     }
 
     #[test]
