@@ -60,7 +60,7 @@ jobs:
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07
 
       - name: Cargo cache
-        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
 
       # The WHOLE shipping workspace (audit AOK-CI-001): core, bluetooth,
       # audio, dongle AND the plugin — the
@@ -84,7 +84,7 @@ jobs:
           components: clippy
 
       - name: Cargo cache
-        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
 
       # The voice build compiles a distinct cfg surface (the realtime lane to
       # OAIY, AEC, the call loop) that the default build never touches. Audit
@@ -111,7 +111,7 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
 
       - name: Check plugin (voice,managed-beta-driver)
         run: cargo check --locked -p aokie-plugin --features voice,managed-beta-driver
@@ -157,7 +157,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
 
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets
@@ -248,7 +248,7 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07
-      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2
         with:
           tool: cargo-audit
       # Accepted transitive advisories are listed with rationale in
@@ -285,7 +285,7 @@ jobs:
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07
 
       - name: Cargo cache
-        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
 
       # TRUST-001: a PUBLIC TAG RELEASE without the Authenticode cert or the package key is a hard failure — never
       # an "unsigned flavour"; said here, before anything is built. Only whether each secret is set reaches this
@@ -542,7 +542,7 @@ jobs:
           Remove-Item verify-extracted -Recurse -Force
 
       - name: Upload bundle artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: aokie-plugin-windows
           path: bundle/*
@@ -589,7 +589,7 @@ jobs:
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07
 
       - name: Cargo cache
-        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
 
       # A managed-beta bundle is built and published only from a dispatch on a branch or from a tag whose name says
       # managed-beta: a dispatch on a production tag that asks for managed-beta stops here, so a pre-release can never
@@ -705,7 +705,7 @@ jobs:
           Remove-Item verify-extracted -Recurse -Force
 
       - name: Upload bundle artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: aokie-plugin-windows-managed-beta
           path: bundle/*
@@ -807,7 +807,7 @@ jobs:
         run: tar -cf aokie-plugin-macos-arm64-built.tar bundle macos-minimum.txt
 
       - name: Upload the built bundle
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: aokie-plugin-macos-arm64-built
           path: aokie-plugin-macos-arm64-built.tar
@@ -920,7 +920,7 @@ jobs:
         run: tar -cf aokie-plugin-macos-arm64-signed.tar bundle macos-minimum.txt signing.env
 
       - name: Upload the signed bundle
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: aokie-plugin-macos-arm64-signed
           path: aokie-plugin-macos-arm64-signed.tar
@@ -1060,7 +1060,7 @@ jobs:
           echo "$AOKIE_CODE_SIGNING $AOKIE_NOTARISED" > macos-signing.txt
 
       - name: Upload bundle artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: aokie-plugin-macos-arm64
           path: |
@@ -1249,7 +1249,7 @@ jobs:
           python3 scripts/virtual-dongle/plugin_check.py --no-dongle "$PWD/verify-extracted/aokie-plugin"
 
       - name: Upload bundle artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: aokie-plugin-linux-x86_64
           path: |
