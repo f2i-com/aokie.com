@@ -32,18 +32,35 @@ pub(super) struct ControlProbe<'a> {
     pub(super) rx: &'a std::sync::mpsc::Receiver<RadioControl>,
     pub(super) parked: &'a mut std::collections::VecDeque<RadioControl>,
     pub(super) action: Option<CancelAction>,
+    /// The call on the line while this speech plays (`None`: not known).
+    line: Option<String>,
 }
 
 #[cfg(feature = "voice")]
 impl<'a> ControlProbe<'a> {
+    /// `line`: the call this speech is said on (`tracker.call_id()`).
     pub(super) fn new(
         rx: &'a std::sync::mpsc::Receiver<RadioControl>,
         parked: &'a mut std::collections::VecDeque<RadioControl>,
+        line: Option<&str>,
     ) -> Self {
         Self {
             rx,
             parked,
             action: None,
+            line: line.map(str::to_owned),
+        }
+    }
+
+    /// Whether a hang-up or reject accepted for `accepted_for` is for the call
+    /// this speech is said on. One accepted for another call (it ended, and the
+    /// switchboard brought this caller forward) must not stop this caller's
+    /// speech, nor be taken by the speech's caller for the operator ending the
+    /// call: it is parked, and the control loop refuses it (`control_failed`).
+    fn for_this_line(&self, accepted_for: Option<&str>) -> bool {
+        match (accepted_for, self.line.as_deref()) {
+            (Some(accepted), Some(line)) => accepted == line,
+            _ => true,
         }
     }
 
@@ -55,13 +72,11 @@ impl<'a> ControlProbe<'a> {
         }
         while let Ok(c) = self.rx.try_recv() {
             match c {
-                // Which call it was for is checked where it is carried out
-                // (`perform_cancel_action`, which has the tracker).
-                RadioControl::Hangup { op, call_id } => {
+                RadioControl::Hangup { op, call_id } if self.for_this_line(call_id.as_deref()) => {
                     self.action = Some(CancelAction::Hangup { op, call_id });
                     return true;
                 }
-                RadioControl::Reject { op, call_id } => {
+                RadioControl::Reject { op, call_id } if self.for_this_line(call_id.as_deref()) => {
                     self.action = Some(CancelAction::Reject { op, call_id });
                     return true;
                 }
@@ -70,6 +85,21 @@ impl<'a> ControlProbe<'a> {
         }
         false
     }
+}
+
+/// A hang-up or reject a probe caught during a line whose speaker has nothing
+/// to abandon for it (a hold or resume line): put back with the parked controls,
+/// so the control loop carries it out next, in order. Thrown away, the operator
+/// heard "accepted" and then neither `call.ended` nor `control_failed`.
+#[cfg(feature = "voice")]
+pub(super) fn requeue_cancel(
+    action: CancelAction,
+    parked: &mut std::collections::VecDeque<RadioControl>,
+) {
+    parked.push_back(match action {
+        CancelAction::Hangup { op, call_id } => RadioControl::Hangup { op, call_id },
+        CancelAction::Reject { op, call_id } => RadioControl::Reject { op, call_id },
+    });
 }
 
 /// Result of speaking a phrase: how long the audio will play out, whether the

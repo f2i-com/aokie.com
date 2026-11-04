@@ -701,7 +701,7 @@ pub(super) fn speak_announcement(
     voice: LineVoice<'_>,
     call_id: &str,
 ) -> Option<CancelAction> {
-    let mut probe = ControlProbe::new(control_rx, pending_controls);
+    let mut probe = ControlProbe::new(control_rx, pending_controls, Some(call_id).filter(|id| *id != "radio"));
     let _ = say_fixed_line(
         bt,
         synth,
@@ -828,7 +828,7 @@ pub(super) fn perform_cancel_action(
         CancelAction::Reject { op, call_id } => ("call.reject", op, call_id),
     };
     if accepted_for_another_call(call_id.as_deref(), tracker) {
-        emit_control_failed(outbox, sink, tracker, verb, op.as_deref(), ANOTHER_CALL);
+        emit_control_refused(outbox, sink, call_id.as_deref(), verb, op.as_deref());
         return;
     }
     bt.flush_tx_audio();

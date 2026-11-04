@@ -397,7 +397,7 @@ pub(super) fn process_flushed_turn(
                         let sr = bt.get_sample_rate();
                         if sr > 0 {
                             let mut probe =
-                                ControlProbe::new(&control_rx, &mut *pending_controls);
+                                ControlProbe::new(&control_rx, &mut *pending_controls, tracker.call_id());
                             let (aec_ref, brms) = if barge_in {
                                 (aec.as_mut(), Some(barge_rms))
                             } else {
@@ -501,7 +501,7 @@ pub(super) fn process_flushed_turn(
                             if sr > 0 {
                                 let replay_text = ctx.last_bot_speech.clone();
                                 let mut probe =
-                                    ControlProbe::new(&control_rx, &mut *pending_controls);
+                                    ControlProbe::new(&control_rx, &mut *pending_controls, tracker.call_id());
                                 let (aec_ref, brms) = if barge_in {
                                     (aec.as_mut(), Some(barge_rms))
                                 } else {

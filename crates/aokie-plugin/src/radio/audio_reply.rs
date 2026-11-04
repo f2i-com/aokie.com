@@ -272,7 +272,7 @@ pub(super) fn pump_audio_and_reply(
             if sr > 0 {
                 ensure_overlap_capture(aec, true, sr);
                 let started = Instant::now();
-                let mut probe = ControlProbe::new(control_rx, pending_controls);
+                let mut probe = ControlProbe::new(control_rx, pending_controls, tracker.call_id());
                 let out = tts_speak(bt, synth, "Mm-hm.", sr, aec.as_mut(),
                     Some(barge_rms), Some(&mut probe), ctx.pace.base(), None, None, None);
                 note_tts_outcome(status, &out);
@@ -765,7 +765,7 @@ pub(super) fn pump_audio_and_reply(
                         "[aokie-plugin] max-silence: no activity for {}s — checking in with the caller",
                         silence_window.as_secs()
                     );
-                    let mut probe = ControlProbe::new(&control_rx, &mut *pending_controls);
+                    let mut probe = ControlProbe::new(&control_rx, &mut *pending_controls, tracker.call_id());
                     let (aec_ref, brms) = if barge_in {
                         (aec.as_mut(), Some(barge_rms))
                     } else {
@@ -858,7 +858,7 @@ pub(super) fn pump_audio_and_reply(
                     eprintln!(
                         "[aokie-plugin] max-silence: still nothing after the check-in — saying goodbye and ending the call"
                     );
-                    let mut probe = ControlProbe::new(&control_rx, &mut *pending_controls);
+                    let mut probe = ControlProbe::new(&control_rx, &mut *pending_controls, tracker.call_id());
                     let gb_t0 = Instant::now();
                     let out = tts_speak(
                         bt,

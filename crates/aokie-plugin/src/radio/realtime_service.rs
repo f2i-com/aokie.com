@@ -3003,7 +3003,7 @@ pub(super) fn service_realtime_failures(
             let mut apologized_with: Option<&'static str> = None;
             if oaiy_apology.is_some() || can_speak {
                 let started = Instant::now();
-                let mut probe = ControlProbe::new(&control_rx, &mut *pending_controls);
+                let mut probe = ControlProbe::new(&control_rx, &mut *pending_controls, tracker.call_id());
                 if let Some(config) = oaiy_apology {
                     eprintln!(
                         "[aokie-plugin] OAIY's voice failed mid-call ({cause}) — trying the apology in OAIY's speak mode, then hangup"

@@ -252,7 +252,7 @@ pub(super) fn play_tone_and_greet(
                 own_tts: screen_tts_ready,
             };
             if screened_call_needs_tts(screen_msg) && screen_voice.can_speak() {
-                let mut probe = ControlProbe::new(&control_rx, &mut *pending_controls);
+                let mut probe = ControlProbe::new(&control_rx, &mut *pending_controls, tracker.call_id());
                 let spoken = say_fixed_line(
                     bt,
                     &synth,
@@ -376,7 +376,7 @@ pub(super) fn play_tone_and_greet(
                 // through the same span planner as every other speech
                 // origin (pacing + digit handling + the probe lane, so a
                 // spoken "wait" cuts even the greeting).
-                let mut probe = ControlProbe::new(&control_rx, &mut *pending_controls);
+                let mut probe = ControlProbe::new(&control_rx, &mut *pending_controls, tracker.call_id());
                 let mut lane =
                     SttProbeLane::new(&stt_tx, &probe_result_rx, voice_call_gen, &status);
                 lane.set_bot_context(text.to_string());

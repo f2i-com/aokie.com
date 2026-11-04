@@ -347,7 +347,7 @@ pub(super) fn service_assistance(
             };
             if let Some(line) = line.filter(|_| bt.get_sample_rate() > 0) {
                 let sr_now = bt.get_sample_rate();
-                let mut probe = ControlProbe::new(&control_rx, &mut *pending_controls);
+                let mut probe = ControlProbe::new(&control_rx, &mut *pending_controls, tracker.call_id());
                 let (aec_ref, brms) = if barge_in {
                     (aec.as_mut(), Some(barge_rms))
                 } else {

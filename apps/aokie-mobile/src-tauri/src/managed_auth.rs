@@ -439,6 +439,16 @@ impl ManagedAuthState {
                 // token makes the old endpoint dead whatever the server does;
                 // the push watcher registers the new token with the new server.
                 let _ = crate::android_runtime::invalidate_push_token(app).await;
+            } else {
+                // The token stays, but its registration was the old server's:
+                // without its marker the phone's diagnostics read "registration
+                // required" (not "registered") until the push watcher has
+                // registered it with the new server.
+                let _ = crate::android_runtime::secure_store_delete(
+                    app,
+                    crate::push_registration::ANDROID_FCM_REGISTRATION_KEY,
+                )
+                .await;
             }
         }
         if previous.refresh_account != current_refresh_account {

@@ -344,12 +344,12 @@ pub(super) fn run_reply_rounds(
                     RadioControl::Hangup { op, call_id }
                         if accepted_for_another_call(call_id.as_deref(), &*tracker) =>
                     {
-                        emit_control_failed(outbox, sink, tracker, "call.hangup", op.as_deref(), ANOTHER_CALL);
+                        emit_control_refused(outbox, sink, call_id.as_deref(), "call.hangup", op.as_deref());
                     }
                     RadioControl::Reject { op, call_id }
                         if accepted_for_another_call(call_id.as_deref(), &*tracker) =>
                     {
-                        emit_control_failed(outbox, sink, tracker, "call.reject", op.as_deref(), ANOTHER_CALL);
+                        emit_control_refused(outbox, sink, call_id.as_deref(), "call.reject", op.as_deref());
                     }
                     RadioControl::Hangup { op, .. } => {
                         tracker.note_intent(
@@ -497,6 +497,7 @@ pub(super) fn run_reply_rounds(
                     let mut probe = ControlProbe::new(
                         &control_rx,
                         &mut *pending_controls,
+                        tracker.call_id(),
                     );
                     let (aec_ref, brms) = if barge_in {
                         (aec.as_mut(), Some(barge_rms))
@@ -1902,7 +1903,7 @@ pub(super) fn run_reply_rounds(
             {
                 let sr_now = bt.get_sample_rate();
                 let mut probe =
-                    ControlProbe::new(&control_rx, &mut *pending_controls);
+                    ControlProbe::new(&control_rx, &mut *pending_controls, tracker.call_id());
                 let (aec_ref, brms) = if barge_in {
                     (aec.as_mut(), Some(barge_rms))
                 } else {
@@ -2039,7 +2040,7 @@ pub(super) fn run_reply_rounds(
                 );
                 let sr_now = bt.get_sample_rate();
                 let mut fprobe =
-                    ControlProbe::new(&control_rx, &mut *pending_controls);
+                    ControlProbe::new(&control_rx, &mut *pending_controls, tracker.call_id());
                 let (aec_ref, brms) = if barge_in {
                     (aec.as_mut(), Some(barge_rms))
                 } else {
@@ -2112,6 +2113,7 @@ pub(super) fn run_reply_rounds(
                     let mut sprobe = ControlProbe::new(
                         &control_rx,
                         &mut *pending_controls,
+                        tracker.call_id(),
                     );
                     let (aec_s, brms_s) = if barge_in {
                         (aec.as_mut(), Some(barge_rms))
@@ -2179,7 +2181,7 @@ pub(super) fn run_reply_rounds(
         {
             let sr_now = bt.get_sample_rate();
             let mut hprobe =
-                ControlProbe::new(&control_rx, &mut *pending_controls);
+                ControlProbe::new(&control_rx, &mut *pending_controls, tracker.call_id());
             let (aec_ref, brms) = if barge_in {
                 (aec.as_mut(), Some(barge_rms))
             } else {

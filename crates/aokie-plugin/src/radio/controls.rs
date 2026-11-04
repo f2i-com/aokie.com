@@ -114,17 +114,17 @@ pub(super) fn service_controls(
             Ok(RadioControl::Answer { op, call_id })
                 if accepted_for_another_call(call_id.as_deref(), &*tracker) =>
             {
-                emit_control_failed(outbox, sink, tracker, "call.answer", op.as_deref(), ANOTHER_CALL);
+                emit_control_refused(outbox, sink, call_id.as_deref(), "call.answer", op.as_deref());
             }
             Ok(RadioControl::Reject { op, call_id })
                 if accepted_for_another_call(call_id.as_deref(), &*tracker) =>
             {
-                emit_control_failed(outbox, sink, tracker, "call.reject", op.as_deref(), ANOTHER_CALL);
+                emit_control_refused(outbox, sink, call_id.as_deref(), "call.reject", op.as_deref());
             }
             Ok(RadioControl::Hangup { op, call_id })
                 if accepted_for_another_call(call_id.as_deref(), &*tracker) =>
             {
-                emit_control_failed(outbox, sink, tracker, "call.hangup", op.as_deref(), ANOTHER_CALL);
+                emit_control_refused(outbox, sink, call_id.as_deref(), "call.hangup", op.as_deref());
             }
             Ok(RadioControl::Answer { op, .. })
                 if status.consent_expired() && tracker.current().is_some_and(|s| !s.is_active()) =>
@@ -703,7 +703,7 @@ pub(super) fn service_controls(
                     // validated + clamped identically, digit runs slow down
                     // identically: the coordinator doesn't care where the
                     // words came from.
-                    let mut probe = ControlProbe::new(&control_rx, &mut *pending_controls);
+                    let mut probe = ControlProbe::new(&control_rx, &mut *pending_controls, tracker.call_id());
                     let op_started = Instant::now();
                     let planned = speak_planned(
                         bt,

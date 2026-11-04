@@ -1094,7 +1094,7 @@ pub(super) fn run_loop(
                 let sr = bt.get_sample_rate();
                 if sr > 0 {
                     resume_line_for = None;
-                    let _ = speak_announcement(
+                    if let Some(action) = speak_announcement(
                         bt,
                         &synth,
                         HOLD_PRIMARY_RESUME_LINE,
@@ -1105,7 +1105,10 @@ pub(super) fn run_loop(
                         &mut pending_controls,
                         line_voice,
                         id.as_str(),
-                    );
+                    ) {
+                        // (caught during the line: carried out next by the control loop, not dropped)
+                        requeue_cancel(action, &mut pending_controls);
+                    }
                     emit_turn(
                         outbox,
                         sink,

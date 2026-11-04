@@ -198,9 +198,10 @@ internal object AokiePushRegistration {
   // together with the server, profile, app and sign-in, which this side cannot
   // work out again. This compared it with a digest of the token alone, so a
   // phone that had registered always read "registration required". A marker is
-  // deleted whenever the token changes (onNewToken, refresh), so one that is
-  // here was written for this token. A bare digest is an earlier build's
-  // marker: Rust registers that phone again, so it is not current.
+  // deleted whenever the token changes (onNewToken, refresh), and when a sign-in
+  // to another server retires the old one (managed_auth.rs), so one that is here
+  // was written for this token and this sign-in. A bare digest is an earlier
+  // build's marker: Rust registers that phone again, so it is not current.
   fun registrationCurrent(context: Context): Boolean {
     if (AokieSecureStore.get(context, FCM_TOKEN_KEY) == null) return false
     val registered = AokieSecureStore.get(context, FCM_REGISTRATION_KEY) ?: return false

@@ -291,7 +291,7 @@ pub(super) fn reconcile_switchboard(
                             let sr_c = bt.get_sample_rate();
                             let hold_line = second_caller_hold_line(1);
                             if sr_c > 0 {
-                                let _ = speak_announcement(
+                                if let Some(action) = speak_announcement(
                                     bt,
                                     &synth,
                                     &hold_line,
@@ -302,7 +302,10 @@ pub(super) fn reconcile_switchboard(
                                     &mut *pending_controls,
                                     line_voice,
                                     tracker.call_id().unwrap_or("radio"),
-                                );
+                                ) {
+                                    // (caught during the line: carried out next by the control loop, not dropped)
+                                    requeue_cancel(action, &mut *pending_controls);
+                                }
                                 emit_turn(
                                     outbox,
                                     sink,

@@ -1825,7 +1825,7 @@ fn playout_drain_wait_is_remaining_playout_bounded() {
 fn control_probe_catches_urgent_actions_and_parks_the_rest() {
     let (tx, rx) = std::sync::mpsc::channel::<RadioControl>();
     let mut parked = std::collections::VecDeque::new();
-    let mut probe = ControlProbe::new(&rx, &mut parked);
+    let mut probe = ControlProbe::new(&rx, &mut parked, None);
 
     assert!(!probe.poll(), "no controls yet");
 
@@ -1852,7 +1852,7 @@ fn control_probe_catches_urgent_actions_and_parks_the_rest() {
 
     // Reject is urgent too.
     let mut parked = std::collections::VecDeque::new();
-    let mut probe = ControlProbe::new(&rx, &mut parked);
+    let mut probe = ControlProbe::new(&rx, &mut parked, None);
     // The StartPairing sent above is still queued — it parks first.
     tx.send(RadioControl::Reject { op: None, call_id: None }).unwrap();
     assert!(probe.poll());
@@ -1862,6 +1862,55 @@ fn control_probe_catches_urgent_actions_and_parks_the_rest() {
         parked.front(),
         Some(RadioControl::StartPairing { seconds: 30 })
     ));
+}
+
+/// Review 11: a hang-up or reject accepted for another call (the one before the
+/// switchboard brought this caller forward) does not stop this caller's speech,
+/// nor reads as the operator ending this call: it parks, and the control loop
+/// refuses it. One for this call still stops the speech. One caught during a
+/// hold or resume line is handed back, not dropped.
+#[cfg(feature = "voice")]
+#[test]
+fn control_probe_parks_a_cancel_for_another_call_and_a_caught_one_is_handed_back() {
+    let (tx, rx) = std::sync::mpsc::channel::<RadioControl>();
+    let mut parked = std::collections::VecDeque::new();
+    let mut probe = ControlProbe::new(&rx, &mut parked, Some("call_b"));
+    tx.send(RadioControl::Hangup {
+        op: Some("op_a".into()),
+        call_id: Some("call_a".into()),
+    })
+    .unwrap();
+    tx.send(RadioControl::Reject {
+        op: None,
+        call_id: Some("call_a".into()),
+    })
+    .unwrap();
+    assert!(!probe.poll(), "another call's hang-up and reject do not stop this speech");
+    tx.send(RadioControl::Hangup {
+        op: Some("op_b".into()),
+        call_id: Some("call_b".into()),
+    })
+    .unwrap();
+    assert!(probe.poll(), "this call's hang-up does");
+    assert_eq!(
+        probe.action,
+        Some(CancelAction::Hangup {
+            op: Some("op_b".into()),
+            call_id: Some("call_b".into()),
+        })
+    );
+    drop(probe);
+    assert_eq!(parked.len(), 2, "the other call's two are parked for the control loop");
+    assert!(matches!(parked.front(), Some(RadioControl::Hangup { call_id: Some(id), .. }) if id == "call_a"));
+
+    requeue_cancel(
+        CancelAction::Reject {
+            op: Some("op_c".into()),
+            call_id: Some("call_b".into()),
+        },
+        &mut parked,
+    );
+    assert!(matches!(parked.back(), Some(RadioControl::Reject { op: Some(op), .. }) if op == "op_c"));
 }
 
 /// VOICE-001: the dead-air decision — the fail-safe (apologise + hang up)

@@ -437,12 +437,6 @@ pub(super) fn emit_transcript_settlements(
     all_durable
 }
 
-/// AOK-CTRL-001: the authoritative FAILURE record for an accepted call
-/// control. The connector's command result only ever says `accepted/queued`
-/// (the enqueue succeeded); when the radio later fails to act on the phone,
-/// this emits `aokie.hardware.error` carrying `code: "control_failed"`, the
-/// action and the operation id from the accepted result — so a flow/UI can
-/// correlate "my command didn't happen" instead of trusting a premature verb.
 #[cfg(aokie_radio)]
 pub(super) const ANOTHER_CALL: &str =
     "the call it was for is no longer the one on the line, so nothing was sent to the phone";
@@ -451,7 +445,7 @@ pub(super) const ANOTHER_CALL: &str =
 /// (`RadioControl::Answer`, `Reject`, `Hangup`) would now act on another call,
 /// or on none: the call ended and the switchboard brought a waiting or parked
 /// caller forward before the radio thread got to the control. Such a control is
-/// refused with [`ANOTHER_CALL`], never sent to the phone.
+/// refused with [`emit_control_refused`], never sent to the phone.
 #[cfg(aokie_radio)]
 pub(super) fn accepted_for_another_call(
     accepted_for: Option<&str>,
@@ -460,6 +454,26 @@ pub(super) fn accepted_for_another_call(
     accepted_for.is_some_and(|id| tracker.call_id() != Some(id))
 }
 
+/// The `control_failed` record of a control refused because the call it was
+/// accepted for is no longer on the line: filed under that call (the one the
+/// operator acted on), not under the call now there.
+#[cfg(aokie_radio)]
+pub(super) fn emit_control_refused(
+    outbox: OutboxRef<'_>,
+    sink: &mut dyn Sink,
+    accepted_for: Option<&str>,
+    action: &str,
+    op: Option<&str>,
+) {
+    emit_control_failed_for(outbox, sink, accepted_for.unwrap_or("radio"), action, op, ANOTHER_CALL);
+}
+
+/// AOK-CTRL-001: the authoritative FAILURE record for an accepted call
+/// control. The connector's command result only ever says `accepted/queued`
+/// (the enqueue succeeded); when the radio later fails to act on the phone,
+/// this emits `aokie.hardware.error` carrying `code: "control_failed"`, the
+/// action and the operation id from the accepted result — so a flow/UI can
+/// correlate "my command didn't happen" instead of trusting a premature verb.
 #[cfg(aokie_radio)]
 pub(super) fn emit_control_failed(
     outbox: OutboxRef<'_>,
@@ -469,14 +483,25 @@ pub(super) fn emit_control_failed(
     op: Option<&str>,
     error: &str,
 ) {
+    emit_control_failed_for(outbox, sink, tracker.call_id().unwrap_or("radio"), action, op, error);
+}
+
+#[cfg(aokie_radio)]
+fn emit_control_failed_for(
+    outbox: OutboxRef<'_>,
+    sink: &mut dyn Sink,
+    corr: &str,
+    action: &str,
+    op: Option<&str>,
+    error: &str,
+) {
     use aokie_core::events::{aokie_event_occurrence, occurrence_id};
-    let corr = tracker.call_id().unwrap_or("radio").to_string();
     emit(
         outbox,
         sink,
         aokie_event_occurrence(
             crate::contract::events::HARDWARE_ERROR,
-            &corr,
+            corr,
             &occurrence_id(),
             json!({
                 "message": format!("{action} failed on the radio: {error}"),
