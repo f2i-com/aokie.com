@@ -28,8 +28,14 @@ Keep these dependency groups aligned:
   still brings the network security config the debug override in
   `gen/android/app/src/debug/res/xml/` stands in for.
 - The self-hosted gateway has a separate lockfile in
-  `deploy/companion-self-host/container-workspace`. Refresh and test that
-  two-crate workspace when its dependencies change.
+  `deploy/companion-self-host/container-workspace`, and no bot updates it: Dependabot
+  needs a `Cargo.toml` in that folder, which only becomes a workspace inside the image.
+  After a root `Cargo.lock` update (Dependabot's monthly cargo PR, a security fix), make it
+  again from the root lock's versions with
+  `AOKIE_CONTAINER_LOCK_UPDATE=root sh scripts/check-container-lock.sh`, and audit it with
+  `cargo audit -f deploy/companion-self-host/container-workspace/Cargo.lock` (CI's
+  supply-chain job and `check-release.ps1 -Audit` do both audits). The check says which of
+  its versions the root lock does not have. Then build the image (`selfhost-smoke.yml`).
 
 The GLib 0.18 GTK compatibility backport and its Linux release-mode regression
 test are documented in [vendor/README.md](../vendor/README.md). Do not replace

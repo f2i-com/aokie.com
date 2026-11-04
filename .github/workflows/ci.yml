@@ -254,6 +254,8 @@ jobs:
       # Accepted transitive advisories are listed with rationale in
       # .cargo/audit.toml; every NEW advisory still fails the job.
       - run: cargo audit
+      # The self-host image's own lock, which no bot updates (.github/dependabot.yml).
+      - run: cargo audit -f deploy/companion-self-host/container-workspace/Cargo.lock
 
   # Audit PKG-001 + TRUST-001 + DIST-001: the RELEASE bundle — helper built
   # first so its post-build SHA-256 can be pinned into the plugin (the

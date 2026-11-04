@@ -1,10 +1,19 @@
-# Audit AK-20: every production lockfile in this repo is covered by update
-# automation — the root Cargo workspace, the self-host container's DISTINCT
-# lock (deploy/companion-self-host/container-workspace, which the root
-# workspace tests never exercise), the Companion npm app, and the workflow
-# action pins. Monthly + grouped keeps PR volume low while the account's
-# Actions budget is constrained; security advisories are raised immediately
-# and ungrouped by Dependabot regardless of the schedule.
+# Audit AK-20: the root Cargo workspace, the Companion npm app and the
+# workflow action pins are updated here. Monthly + grouped keeps PR volume low
+# while the account's Actions budget is constrained. Advisories reach the
+# repository as Dependabot alerts; whether Dependabot also opens security-update
+# PRs for them is a repository setting, not this file.
+#
+# The self-host container's own lock (deploy/companion-self-host/container-workspace)
+# is not, and cannot be, listed: Dependabot needs a Cargo.toml in that folder,
+# and the folder holds Cargo.container.toml, which only becomes a workspace inside
+# the image (the Dockerfile copies the two crates beside it). An entry for it
+# failed every scan with "Cargo.toml not found" (2026-07-23 to 2026-11-01) and
+# never opened a PR. That lock is instead audited by ci.yml's supply-chain job
+# and check-release.ps1 -Audit, checked by scripts/check-container-lock.sh, and
+# made again from the root lock's versions with
+# AOKIE_CONTAINER_LOCK_UPDATE=root sh scripts/check-container-lock.sh
+# after a root lock update.
 version: 2
 updates:
   # Root Rust workspace (plugin, bluetooth, dongle, realtime…).
@@ -15,18 +24,6 @@ updates:
     open-pull-requests-limit: 3
     groups:
       workspace-minor-patch:
-        update-types: [minor, patch]
-
-  # Self-host gateway container — its own lockfile, deliberately distinct
-  # from the root workspace (the Dockerfile builds this mini-workspace).
-  # Intentional divergence from the root lock shows up as separate PRs here.
-  - package-ecosystem: cargo
-    directory: /deploy/companion-self-host/container-workspace
-    schedule:
-      interval: monthly
-    open-pull-requests-limit: 3
-    groups:
-      container-minor-patch:
         update-types: [minor, patch]
 
   # Companion React/TypeScript app.

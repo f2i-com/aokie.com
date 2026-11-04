@@ -85,6 +85,10 @@ if ($Companion) {
 # -- Supply chain - opt-in (network) --
 if ($Audit) {
     Invoke-Gate 'cargo audit (RustSec)' $repo { cargo audit }
+    # The self-host image's own lock, which no bot updates (.github/dependabot.yml).
+    Invoke-Gate 'cargo audit (RustSec): self-host container lock' $repo {
+        cargo audit -f deploy/companion-self-host/container-workspace/Cargo.lock
+    }
 } else {
     Write-Host "(skipped: cargo audit - pass -Audit to include)" -ForegroundColor Yellow
 }

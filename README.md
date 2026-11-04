@@ -334,6 +334,7 @@ cargo test -p aokie-protocol -p aokie-mobile
 cd apps/aokie-mobile; npm ci; npm test; npm run build; cd ../..
 cargo clippy --workspace --all-targets
 cargo audit
+cargo audit -f deploy/companion-self-host/container-workspace/Cargo.lock
 ```
 
 The two `node` checks run the receptionist screen, in normal mode and as a setup-wizard
