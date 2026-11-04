@@ -6,8 +6,8 @@
 [advisories]
 # zip 0.6.6's RUSTSEC-2026-0367/-0368/-0369 (2026-10-19) were accepted here
 # for a day: webrtc-sys-build 0.3.19, libwebrtc's build helper, unpacks with
-# it. The helper is now patched onto zip 9 (vendor/README.md), so nothing is
-# ignored again.
+# it. The helper was then patched onto zip 9, and from 0.3.21 (libwebrtc
+# 0.3.55) it asks for zip 9 itself, so nothing is ignored again.
 ignore = []
 # Unmaintained crates (backoff, instant, paste, rustls-pemfile) surface as
 # non-failing warnings — left visible so they are not forgotten.
