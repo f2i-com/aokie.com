@@ -108,6 +108,30 @@ IPv6 address, and every relay port is routed without port translation. Set
 the IPv6 port declarations and AAAA records rather than advertising a broken
 path.
 
+### Updating
+
+The gateway's image keeps its name from one version to the next, and
+`docker compose up -d` builds it only when it is missing, so after a `git pull`
+alone the old gateway goes on running. Build it again, then recreate the
+containers, so each also reads the scripts and settings it mounts from this
+folder as they now are:
+
+```sh
+git pull
+docker compose --env-file .env config --quiet
+docker compose --env-file .env build --pull gateway
+docker compose --env-file .env up -d --force-recreate
+docker compose --env-file .env ps
+```
+
+Recreating coturn ends the calls relayed through it, so update between calls.
+Then check the secrets' owners and modes against the list under Public
+deployment: a later version may read a file as another user. `/version` names
+the protocol the gateway speaks, not Aokie's release. To see that the gateway
+runs the image just built, `docker compose --env-file .env images gateway`
+gives its image ID, and `docker image inspect --format '{{.Created}}'` with that
+ID says when it was built.
+
 ## Loopback development without public DNS
 
 The local file publishes only loopback `ws://127.0.0.1:18788/v2/realtime` and
